@@ -1,0 +1,26 @@
+# Core Deep Learning Framework
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# Transformers & Vision Models
+transformers>=4.36.0
+qwen-vl-utils>=0.0.14
+
+# Object Detection
+ultralytics>=8.1.0
+
+# Image Processing
+opencv-python>=4.8.0
+pillow>=10.1.0
+numpy>=1.24.0
+
+# Visualization
+matplotlib>=3.8.0
+
+# Utilities
+requests>=2.31.0
+
+# Model Optimization
+accelerate>=0.25.0
+bitsandbytes>=0.41.0  # INT8/INT4 quantization
