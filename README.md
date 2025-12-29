@@ -14,10 +14,9 @@ The hierarchical approach avoids running expensive VLM inference on every detect
 
 ## Architecture
 
-```
-                      <img width="670" height="823" alt="image" src="https://github.com/user-attachments/assets/81d30065-eaf9-461d-bddb-ee7183e1b14b" />
+ <img width="670" height="823" alt="image" src="https://github.com/user-attachments/assets/81d30065-eaf9-461d-bddb-ee7183e1b14b" />
 
-```
+
 
 ## Project Structure
 
