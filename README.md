@@ -1,7 +1,8 @@
 # Hierarchical Vision Analysis Pipeline
 
 A multi-stage object detection and analysis system that combines YOLO for fast detection with a Vision-Language Model (VLM) for detailed scene understanding.
-
+## Demo
+https://youtu.be/xvKNw0Qv5gY
 ## What It Does
 
 Given an image, the pipeline:
@@ -14,38 +15,8 @@ The hierarchical approach avoids running expensive VLM inference on every detect
 ## Architecture
 
 ```
-                          Input Image
-                               |
-                               v
-                    +--------------------+
-                    |   YOLO Detection   |
-                    |   (yolo11l.pt)     |
-                    +--------------------+
-                               |
-                    List of detections
-                               |
-                               v
-                    +--------------------+
-                    |   Class Router     |
-                    +--------------------+
-                         /    |    \
-                        /     |     \
-                       v      v      v
-              +--------+  +--------+  +--------+
-              | SKIP   |  | LOW    |  | FULL   |
-              | (car,  |  | CONF   |  | VLM    |
-              | dog..) |  | (<0.3) |  | (>0.3) |
-              +--------+  +--------+  +--------+
-                  |           |            |
-                  v           v            v
-              No VLM      Minimal      Qwen2.5-VL
-              (fast)      analysis     analysis
-                               \          /
-                                \        /
-                                 v      v
-                          +---------------+
-                          |    Results    |
-                          +---------------+
+                      <img width="670" height="823" alt="image" src="https://github.com/user-attachments/assets/81d30065-eaf9-461d-bddb-ee7183e1b14b" />
+
 ```
 
 ## Project Structure
