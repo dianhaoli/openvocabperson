@@ -588,7 +588,7 @@
             
             <div class="results-grid" id="resultsGrid">
                 <div class="empty-state">
-                    <div class="empty-icon">🖼️</div>
+                    <div class="empty-icon"></div>
                     <p>Upload an image to start analysis</p>
                 </div>
             </div>
@@ -718,7 +718,7 @@
             resultsGrid.innerHTML = '';
             resultsStats.style.display = 'none';
             
-            addLog('info', '🚀', 'Starting analysis...');
+            addLog('info', 'Starting analysis...');
             
             const formData = new FormData();
             formData.append('file', selectedFile);
@@ -754,7 +754,7 @@
                     }
                 }
             } catch (error) {
-                addLog('error', '❌', `Error: ${error.message}`);
+                addLog('error', `Error: ${error.message}`);
             }
             
             isAnalyzing = false;
@@ -769,11 +769,11 @@
             
             switch (type) {
                 case 'detection_complete':
-                    addLog('success', '🔍', `Detected ${data.num_detections} objects`);
+                    addLog('success', `Detected ${data.num_detections} objects`);
                     break;
                     
                 case 'routing_complete':
-                    addLog('info', '🔀', `Routing: ${data.vlm_full} VLM, ${data.yolo_only} skip, ${data.low_confidence} low conf`);
+                    addLog('info', `Routing: ${data.vlm_full} VLM, ${data.yolo_only} skip, ${data.low_confidence} low conf`);
                     break;
                     
                 case 'crop_analyzed':
@@ -781,9 +781,9 @@
                     const idx = data.index ?? '?';
                     if (data.analysis) {
                         const preview = data.analysis.substring(0, 40) + (data.analysis.length > 40 ? '...' : '');
-                        addLog('success', '✅', `Crop ${idx}: ${preview}`);
+                        addLog('success', `Crop ${idx}: ${preview}`);
                     } else {
-                        addLog('warning', '⏭️', `Crop ${idx}: ${data.reason || 'skipped'}`);
+                        addLog('warning', `Crop ${idx}: ${data.reason || 'skipped'}`);
                     }
                     break;
                     
@@ -793,7 +793,7 @@
                     break;
                     
                 case 'error':
-                    addLog('error', '❌', event.message);
+                    addLog('error', event.message);
                     break;
             }
         }

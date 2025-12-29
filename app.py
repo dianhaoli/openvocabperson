@@ -52,7 +52,7 @@ async def lifespan(app: FastAPI):
     """Initialize pipeline on startup, cleanup on shutdown."""
     global pipeline
     
-    print("🚀 Starting Hierarchical Vision Analysis API...")
+    print("Starting Vision Analysis API...")
     
     # Create pipeline with optimized settings
     config = PipelineConfig(
@@ -64,16 +64,16 @@ async def lifespan(app: FastAPI):
     pipeline = HierarchicalPipeline(config)
     
     # Load models (this takes time)
-    print("📦 Loading models (this may take a minute)...")
+    print("Loading models (this may take a minute)...")
     await pipeline.initialize()
-    print("✅ API ready!")
+    print("API ready!")
     
     yield
     
     # Cleanup
     if pipeline:
         pipeline.cleanup()
-    print("👋 API shutdown complete.")
+    print("API shutdown complete.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

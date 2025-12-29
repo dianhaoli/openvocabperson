@@ -22,7 +22,7 @@ from pipeline import HierarchicalPipeline, PipelineConfig, create_pipeline, ANAL
 def demo_sync(image_path: str):
     """Demonstrate synchronous analysis mode."""
     print("\n" + "=" * 70)
-    print("🔄 SYNCHRONOUS MODE DEMO")
+    print("SYNCHRONOUS MODE DEMO")
     print("=" * 70)
     
     # Create pipeline with accuracy-focused settings
