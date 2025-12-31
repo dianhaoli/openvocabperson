@@ -139,6 +139,8 @@ class StreamEvent:
     """Event yielded during async streaming."""
     event_type: str  # "detection_complete", "crop_analyzed", "batch_complete", "complete"
     data: dict = field(default_factory=dict)
+    # REFACTOR: Include full result for single-pass streaming (avoids running analysis twice)
+    result: Optional['AnalysisResult'] = None  # Full result with crop image for crop_analyzed events
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -204,7 +206,16 @@ class HierarchicalPipeline:
         print("   ✓ YOLO loaded")
         
         # ── Determine Device ──
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # FIX: Add MPS (Metal Performance Shaders) support for Apple Silicon Macs.
+        # Previously only checked for CUDA, falling back to CPU even when MPS was available.
+        # This caused a device mismatch: model loaded on MPS via device_map="auto",
+        # but inputs sent to CPU, resulting in slow inference and warnings.
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
         print(f"   Device: {self.device}")
         
         # ── Load VLM with Optimizations ──
@@ -637,24 +648,29 @@ class HierarchicalPipeline:
         )
         
         # Yield immediate results for non-VLM crops
+        # REFACTOR: Include full result object for single-pass streaming
         for crop_info in routed[ProcessingStage.YOLO_ONLY]:
+            result = AnalysisResult(
+                crop_info=crop_info,
+                stage=ProcessingStage.YOLO_ONLY,
+                reason=f"Skipped: not priority class",
+            )
             yield StreamEvent(
                 event_type="crop_analyzed",
-                data=AnalysisResult(
-                    crop_info=crop_info,
-                    stage=ProcessingStage.YOLO_ONLY,
-                    reason=f"Skipped: not priority class",
-                ).to_dict(),
+                data=result.to_dict(),
+                result=result,  # Include full result with crop image
             )
         
         for crop_info in routed[ProcessingStage.LOW_CONFIDENCE]:
+            result = AnalysisResult(
+                crop_info=crop_info,
+                stage=ProcessingStage.LOW_CONFIDENCE,
+                reason=f"Low confidence ({crop_info.detection.confidence:.2f})",
+            )
             yield StreamEvent(
                 event_type="crop_analyzed",
-                data=AnalysisResult(
-                    crop_info=crop_info,
-                    stage=ProcessingStage.LOW_CONFIDENCE,
-                    reason=f"Low confidence ({crop_info.detection.confidence:.2f})",
-                ).to_dict(),
+                data=result.to_dict(),
+                result=result,  # Include full result with crop image
             )
         
         # Stage 3: VLM analysis (stream as completed)
@@ -670,6 +686,7 @@ class HierarchicalPipeline:
                 )
                 
                 # Yield each result in the batch
+                # REFACTOR: Include full result object for single-pass streaming
                 for crop_info, analysis in zip(batch, analyses):
                     result = AnalysisResult(
                         crop_info=crop_info,
@@ -680,6 +697,7 @@ class HierarchicalPipeline:
                     yield StreamEvent(
                         event_type="crop_analyzed",
                         data=result.to_dict(),
+                        result=result,  # Include full result with crop image
                     )
         
         yield StreamEvent(event_type="complete", data={})
