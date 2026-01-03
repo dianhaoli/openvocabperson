@@ -43,7 +43,7 @@ def demo_sync(image_path: str):
     # Print results
     pipeline.print_results(results)
     
-    print(f"\n⏱️  Total analysis time: {elapsed:.2f}s")
+    print(f"\nTotal analysis time: {elapsed:.2f}s")
     print(f"   Crops analyzed: {len(results)}")
     print(f"   Avg per crop: {elapsed / max(len(results), 1):.2f}s")
     
@@ -59,7 +59,7 @@ def demo_sync(image_path: str):
 async def demo_async_streaming(image_path: str):
     """Demonstrate async streaming analysis mode."""
     print("\n" + "=" * 70)
-    print("⚡ ASYNC STREAMING MODE DEMO")
+    print("ASYNC STREAMING MODE DEMO")
     print("=" * 70)
     
     # Create pipeline
@@ -69,20 +69,20 @@ async def demo_async_streaming(image_path: str):
     start_time = time.perf_counter()
     results_collected = []
     
-    print("\n📡 Streaming results as they arrive:\n")
+    print("\nStreaming results as they arrive:\n")
     
     async for event in pipeline.analyze_streaming(image_path):
         elapsed = time.perf_counter() - start_time
         
         if event.event_type == "detection_complete":
-            print(f"[{elapsed:5.2f}s] 🔍 Detection complete: {event.data['num_detections']} objects found")
+            print(f"[{elapsed:5.2f}s] Detection complete: {event.data['num_detections']} objects found")
             for det in event.data['detections'][:5]:  # Show first 5
                 print(f"         • {det['class']} (conf: {det['confidence']:.2f})")
             if len(event.data['detections']) > 5:
                 print(f"         ... and {len(event.data['detections']) - 5} more")
         
         elif event.event_type == "routing_complete":
-            print(f"[{elapsed:5.2f}s] 🔀 Routing complete:")
+            print(f"[{elapsed:5.2f}s] Routing complete:")
             print(f"         • Skip VLM: {event.data['yolo_only']}")
             print(f"         • Low conf: {event.data['low_confidence']}")
             print(f"         • Full VLM: {event.data['vlm_full']}")
@@ -96,18 +96,18 @@ async def demo_async_streaming(image_path: str):
             if analysis:
                 # VLM result - show preview
                 preview = analysis[:60].replace('\n', ' ') + "..." if len(analysis) > 60 else analysis.replace('\n', ' ')
-                print(f"[{elapsed:5.2f}s] ✅ Crop {idx} ({stage}): {preview}")
+                print(f"[{elapsed:5.2f}s] Crop {idx} ({stage}): {preview}")
             else:
                 # Skipped
-                print(f"[{elapsed:5.2f}s] ⏭️  Crop {idx} ({stage}): {data.get('reason', 'skipped')}")
+                print(f"[{elapsed:5.2f}s] Crop {idx} ({stage}): {data.get('reason', 'skipped')}")
             
             results_collected.append(data)
         
         elif event.event_type == "complete":
-            print(f"\n[{elapsed:5.2f}s] 🏁 Analysis complete!")
+            print(f"\n[{elapsed:5.2f}s] Analysis complete!")
     
     total_time = time.perf_counter() - start_time
-    print(f"\n⏱️  Total streaming time: {total_time:.2f}s")
+    print(f"\nTotal streaming time: {total_time:.2f}s")
     print(f"   Results received: {len(results_collected)}")
     
     return pipeline, results_collected
@@ -116,7 +116,7 @@ async def demo_async_streaming(image_path: str):
 def demo_custom_prompt(pipeline: HierarchicalPipeline, image_path: str):
     """Demonstrate using a custom prompt."""
     print("\n" + "=" * 70)
-    print("📝 CUSTOM PROMPT DEMO")
+    print("CUSTOM PROMPT DEMO")
     print("=" * 70)
     
     custom_prompt = """What is directly visible?
@@ -140,7 +140,7 @@ If unsure, say 'unclear'."""
 def benchmark_comparison(image_path: str):
     """Compare different optimization settings."""
     print("\n" + "=" * 70)
-    print("📊 OPTIMIZATION BENCHMARK")
+    print("OPTIMIZATION BENCHMARK")
     print("=" * 70)
     
     configs = [
@@ -152,7 +152,7 @@ def benchmark_comparison(image_path: str):
     results = []
     
     for name, config in configs:
-        print(f"\n🔧 Testing: {name}")
+        print(f"\nTesting: {name}")
         
         pipeline = HierarchicalPipeline(config)
         
@@ -175,7 +175,7 @@ def benchmark_comparison(image_path: str):
             pipeline.cleanup()
             
         except Exception as e:
-            print(f"   ❌ Failed: {e}")
+            print(f"   Failed: {e}")
             results.append((name, None, 0))
     
     # Summary table
@@ -196,7 +196,7 @@ def main():
     print("╔" + "═" * 68 + "╗")
     print("║" + " HIERARCHICAL VISION ANALYSIS PIPELINE - DEMO ".center(68) + "║")
     print("╚" + "═" * 68 + "╝")
-    print(f"\n📷 Image: {image_path}")
+    print(f"\nImage: {image_path}")
     
     # Run demos
     try:
@@ -215,18 +215,18 @@ def main():
         # 4. Benchmark (optional, takes longer)
         # Skip in non-interactive mode
         try:
-            run_benchmark = input("\n🔧 Run optimization benchmark? (y/n): ").lower() == 'y'
+            run_benchmark = input("\nRun optimization benchmark? (y/n): ").lower() == 'y'
             if run_benchmark:
                 benchmark_comparison(image_path)
         except EOFError:
             print("\n(Skipping benchmark in non-interactive mode)")
         
     except FileNotFoundError:
-        print(f"\n❌ Error: Image not found at '{image_path}'")
+        print(f"\nError: Image not found at '{image_path}'")
         print("   Please provide a valid image path as argument.")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\nError: {e}")
         raise
 
 

@@ -1,0 +1,2 @@
+export { CanvasSection } from './CanvasSection';
+

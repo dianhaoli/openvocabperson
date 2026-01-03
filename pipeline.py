@@ -32,6 +32,48 @@ from ultralytics import YOLO
 
 from qwen_vl_utils import process_vision_info
 
+# Try to import LogitsProcessor, fallback if not available
+try:
+    from transformers import LogitsProcessor
+except ImportError:
+    try:
+        from transformers.generation.logits_processor import LogitsProcessor
+    except ImportError:
+        # Fallback: define a minimal interface
+        class LogitsProcessor:
+            def __call__(self, input_ids, scores):
+                return scores
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NUMERICAL STABILITY HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NumericalStabilityProcessor(LogitsProcessor):
+    """Logits processor to prevent inf/nan values in probability tensors."""
+    
+    def __init__(self, min_logit: float = -1e9, max_logit: float = 1e9):
+        self.min_logit = min_logit
+        self.max_logit = max_logit
+    
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        # Fast path: check if any issues exist before processing
+        if not (torch.isnan(scores).any() or torch.isinf(scores).any() or 
+                (scores < self.min_logit).any() or (scores > self.max_logit).any()):
+            return scores  # No processing needed, return as-is
+        
+        # Only process if issues detected
+        scores = torch.clamp(scores, min=self.min_logit, max=self.max_logit)
+        
+        # Replace any remaining inf/nan with finite values
+        scores = torch.where(
+            torch.isfinite(scores),
+            scores,
+            torch.zeros_like(scores)
+        )
+        
+        return scores
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -71,10 +113,75 @@ class PipelineConfig:
     compile_mode: str = "reduce-overhead"  # "default", "reduce-overhead", "max-autotune"
     
     # ── Batching Settings ──
-    batch_size: int = 4  # VLM batch size
+    batch_size: int = 4  # Max crops per batch
+    reference_area: int = 512 * 512  # Reference crop size for area budgeting (262144 px)
     
     # ── Async Settings ──
     max_workers: int = 2  # Thread pool workers
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIZE-AWARE BATCHING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def batch_by_area(
+    crops: list,
+    max_batch_size: int,
+    max_total_area: int,
+) -> list[list]:
+    """
+    Pack crops into batches using First-Fit Decreasing by area.
+    
+    Why size-aware batching?
+    VLM attention cost scales superlinearly with image size (O(n²) for self-attention).
+    A single large crop can dominate batch latency, causing unpredictable spikes.
+    By budgeting total pixel area per batch, we:
+      - Isolate large crops into their own batches when needed
+      - Pack small crops together efficiently
+      - Achieve more predictable, stable latency
+    
+    Args:
+        crops: List of CropInfo objects with crop_image attribute
+        max_batch_size: Maximum number of crops per batch
+        max_total_area: Maximum total pixel area per batch
+    
+    Returns:
+        List of batches, where each batch is a list of CropInfo objects
+    """
+    if not crops:
+        return []
+    
+    # Calculate area for each crop and pair with original index for stable sorting
+    crops_with_area = [
+        (crop, crop.crop_image.width * crop.crop_image.height)
+        for crop in crops
+    ]
+    
+    # Sort by area descending (First-Fit Decreasing strategy)
+    # Large crops get placed first, small crops fill remaining space
+    crops_with_area.sort(key=lambda x: x[1], reverse=True)
+    
+    batches = []
+    
+    for crop, area in crops_with_area:
+        placed = False
+        
+        # Try to fit into existing batch
+        for batch in batches:
+            batch_count = len(batch)
+            batch_area = sum(c.crop_image.width * c.crop_image.height for c in batch)
+            
+            # Check both constraints: count limit and area budget
+            if batch_count < max_batch_size and batch_area + area <= max_total_area:
+                batch.append(crop)
+                placed = True
+                break
+        
+        # Create new batch if crop doesn't fit anywhere
+        if not placed:
+            batches.append([crop])
+    
+    return batches
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -121,6 +228,7 @@ class AnalysisResult:
     stage: ProcessingStage
     analysis_text: Optional[str] = None
     reason: Optional[str] = None  # Why this stage was chosen
+    embedding: Optional[np.ndarray] = None  # Visual embedding for similarity search
     
     def to_dict(self) -> dict:
         return {
@@ -194,7 +302,7 @@ class HierarchicalPipeline:
     
     def _load_models(self):
         """Load YOLO and VLM models with optimizations."""
-        print("🚀 Initializing Hierarchical Pipeline...")
+        print("Initializing Hierarchical Pipeline...")
         print("─" * 60)
         
         # ── PyTorch Backend Optimizations ──
@@ -223,7 +331,7 @@ class HierarchicalPipeline:
         
         self.initialized = True
         print("─" * 60)
-        print("✅ Pipeline initialized!\n")
+        print("Pipeline initialized!\n")
     
     def _configure_pytorch_backends(self):
         """Configure PyTorch for optimal inference."""
@@ -285,6 +393,13 @@ class HierarchicalPipeline:
         # Fix padding side for decoder-only models
         if hasattr(self.processor, 'tokenizer'):
             self.processor.tokenizer.padding_side = 'left'
+            # Ensure pad_token_id is set (Qwen models may use eos_token_id as pad_token_id)
+            if self.processor.tokenizer.pad_token_id is None:
+                if hasattr(self.processor.tokenizer, 'eos_token_id') and self.processor.tokenizer.eos_token_id is not None:
+                    self.processor.tokenizer.pad_token_id = self.processor.tokenizer.eos_token_id
+                else:
+                    # Fallback: set to a safe default
+                    self.processor.tokenizer.pad_token_id = 0
         
         print("   ✓ VLM loaded")
         
@@ -298,7 +413,7 @@ class HierarchicalPipeline:
                 )
                 print(f"   ✓ torch.compile enabled (mode={self.config.compile_mode})")
             except Exception as e:
-                print(f"   ⚠ torch.compile failed: {e}")
+                print(f"   Warning: torch.compile failed: {e}")
     
     # ──────────────────────────────────────────────────────────────────────────
     # STAGE 1: YOLO DETECTION
@@ -421,25 +536,55 @@ class HierarchicalPipeline:
         self,
         crops: list[CropInfo],
         prompt: str = ANALYSIS_PROMPT,
-    ) -> list[str]:
+    ) -> tuple[list[str], list[np.ndarray]]:
         """
         Analyze multiple crops in batches using VLM.
         
-        Uses batched inference for efficiency while maintaining accuracy.
+        Uses size-aware batching to prevent latency spikes from large crops.
+        Batches are packed by total pixel area, not just count, because
+        VLM attention cost scales superlinearly with image size.
+        
+        Returns:
+            tuple: (list of analysis texts, list of embeddings per crop)
         """
-        all_results = []
+        if not crops:
+            return [], []
         
-        for i in range(0, len(crops), self.config.batch_size):
-            batch = crops[i:i + self.config.batch_size]
-            batch_results = self._analyze_batch(batch, prompt)
-            all_results.extend(batch_results)
+        # Calculate max total area budget: batch_size * reference_area
+        max_total_area = self.config.batch_size * self.config.reference_area
         
-        return all_results
+        # Create size-aware batches using First-Fit Decreasing
+        batches = batch_by_area(crops, self.config.batch_size, max_total_area)
+        
+        # Process batches and maintain original crop order for results
+        crop_to_result = {}
+        crop_to_embedding = {}
+        
+        for batch in batches:
+            batch_results, batch_embeddings = self._analyze_batch(batch, prompt)
+            for i, crop in enumerate(batch):
+                crop_to_result[id(crop)] = batch_results[i]
+                crop_to_embedding[id(crop)] = batch_embeddings[i]
+        
+        # Return results in original crop order
+        analyses = [crop_to_result[id(crop)] for crop in crops]
+        embeddings = [crop_to_embedding[id(crop)] for crop in crops]
+        
+        return analyses, embeddings
     
-    def _analyze_batch(self, batch: list[CropInfo], prompt: str) -> list[str]:
-        """Analyze a batch of crops in a single forward pass."""
+    def _analyze_batch(self, batch: list[CropInfo], prompt: str) -> tuple[list[str], np.ndarray]:
+        """
+        Analyze a batch of crops in a single forward pass.
+        
+        Extracts both text analysis and visual embeddings efficiently:
+        - One forward pass for embeddings (hidden states)
+        - One generation pass for text analysis
+        
+        Returns:
+            tuple: (list of analysis texts, numpy array of embeddings)
+        """
         if not batch:
-            return []
+            return [], np.array([])
         
         # Build batch of messages
         conversations = []
@@ -479,48 +624,121 @@ class HierarchicalPipeline:
                     inputs[key] = inputs[key].pin_memory().to(self.device, non_blocking=True)
                 else:
                     inputs[key] = inputs[key].to(self.device)
+                
+                # Single validation after device transfer (catches both pre and post-transfer issues)
+                if torch.isnan(inputs[key]).any() or torch.isinf(inputs[key]).any():
+                    raise ValueError(f"Input tensor '{key}' contains NaN or Inf values")
         
-        # Generate with optimizations
         with torch.inference_mode():
-            generated_ids = self.vlm.generate(
-                **inputs,
-                max_new_tokens=self.config.max_new_tokens,
-                use_cache=True,
-                pad_token_id=self.processor.tokenizer.pad_token_id,
-            )
+            # Single forward pass: generate text AND extract embeddings
+            # Using return_dict_in_generate + output_hidden_states avoids running model twice
+            
+            # Get token IDs with fallbacks for numerical stability
+            pad_token_id = self.processor.tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = getattr(self.processor.tokenizer, 'eos_token_id', 0)
+            
+            eos_token_id = getattr(self.processor.tokenizer, 'eos_token_id', None)
+            
+            # Generation parameters (logits processor only added on error)
+            generation_kwargs = {
+                "max_new_tokens": self.config.max_new_tokens,
+                "use_cache": True,
+                "pad_token_id": pad_token_id,
+                "return_dict_in_generate": True,
+                "output_hidden_states": True,
+                "do_sample": False,  # Greedy decoding for stability
+                # Note: logits_processor only added in exception handler when needed
+            }
+            
+            # Add eos_token_id if available
+            if eos_token_id is not None:
+                generation_kwargs["eos_token_id"] = eos_token_id
+            
+            try:
+                generated_outputs = self.vlm.generate(
+                    **inputs,
+                    **generation_kwargs,
+                )
+            except RuntimeError as e:
+                error_str = str(e).lower()
+                if "probability tensor" in error_str or "inf" in error_str or "nan" in error_str:
+                    # Add logits processor only when numerical stability error occurs
+                    generation_kwargs["logits_processor"] = [
+                        NumericalStabilityProcessor(min_logit=-50.0, max_logit=50.0)
+                    ]
+                    # Try again with numerical stability processor
+                    try:
+                        generated_outputs = self.vlm.generate(
+                            **inputs,
+                            **generation_kwargs,
+                        )
+                    except RuntimeError as e2:
+                        # If still failing, raise with more context
+                        raise RuntimeError(
+                            f"Generation failed due to numerical instability: {e2}. "
+                            f"Input shape: {inputs['input_ids'].shape if 'input_ids' in inputs else 'unknown'}, "
+                            f"Pad token ID: {pad_token_id}, EOS token ID: {eos_token_id}"
+                        ) from e2
+                else:
+                    raise
+            
+            generated_ids = generated_outputs.sequences
+            
+            # Extract embeddings from hidden states of the first generation step (prompt processing)
+            # hidden_states structure: tuple of (prompt_hidden_states, gen_step_1, gen_step_2, ...)
+            # Each element is a tuple of layer hidden states; we use layer 0
+            embeddings = np.zeros((len(batch), 1536))  # Default fallback
+            if hasattr(generated_outputs, 'hidden_states') and generated_outputs.hidden_states:
+                # First element contains prompt processing hidden states (tuple of layers)
+                prompt_hidden_states = generated_outputs.hidden_states[0]
+                if prompt_hidden_states and len(prompt_hidden_states) > 0:
+                    # Use first layer's hidden state
+                    hidden = prompt_hidden_states[0]  # [batch, seq_len, hidden_dim]
+                    pooled = hidden.mean(dim=1)  # [batch, hidden_dim]
+                    norms = torch.norm(pooled, dim=1, keepdim=True)
+                    normalized = pooled / (norms + 1e-8)
+                    embeddings = normalized.cpu().numpy()
         
         # Decode responses - handle variable input lengths in batch
         # Each sequence may have different input length due to padding
+        # IMPORTANT: For left-padded sequences, we need to find where the actual input ends
+        # The generated_ids includes both input and generated tokens, so we slice from input_end
         responses = []
+        input_seq_len = inputs.input_ids.shape[1]  # Padded input length
+        
         for i in range(len(batch)):
-            # Get the actual input length for this sequence (excluding padding)
-            input_ids_i = inputs.input_ids[i]
-            # Find where actual tokens end (non-pad tokens)
-            if hasattr(self.processor, 'tokenizer') and self.processor.tokenizer.pad_token_id is not None:
-                pad_id = self.processor.tokenizer.pad_token_id
-                # For left-padded, find first non-pad token
-                non_pad_mask = input_ids_i != pad_id
-                if non_pad_mask.any():
-                    input_len = non_pad_mask.sum().item()
-                else:
-                    input_len = len(input_ids_i)
-            else:
-                input_len = inputs.input_ids.shape[1]
+            # The generated_ids includes the full input sequence (with padding) plus generated tokens
+            # So we can safely slice from input_seq_len to get only the generated part
+            # This works because all sequences are padded to the same length during batching
+            generated_tokens = generated_ids[i, input_seq_len:]
             
-            # Decode only the generated part
-            generated_tokens = generated_ids[i, inputs.input_ids.shape[1]:]
-            response = self.processor.decode(
-                generated_tokens,
-                skip_special_tokens=True,
-            ).strip()
+            # Decode the generated tokens
+            try:
+                response = self.processor.decode(
+                    generated_tokens,
+                    skip_special_tokens=True,
+                ).strip()
+            except Exception as e:
+                # Fallback: decode as string and handle errors gracefully
+                print(f"Warning: Decode failed for batch item {i}: {e}")
+                response = ""
+            
             responses.append(response)
         
-        return responses
+        return responses, embeddings
     
-    def analyze_single_crop(self, crop_info: CropInfo, prompt: str = ANALYSIS_PROMPT) -> str:
-        """Analyze a single crop (for streaming or individual analysis)."""
-        results = self._analyze_batch([crop_info], prompt)
-        return results[0] if results else ""
+    def analyze_single_crop(self, crop_info: CropInfo, prompt: str = ANALYSIS_PROMPT) -> tuple[str, np.ndarray]:
+        """
+        Analyze a single crop (for streaming or individual analysis).
+        
+        Returns:
+            tuple: (analysis text, embedding vector)
+        """
+        results, embeddings = self._analyze_batch([crop_info], prompt)
+        text = results[0] if results else ""
+        embedding = embeddings[0] if len(embeddings) > 0 else np.zeros(1536)
+        return text, embedding
     
     # ──────────────────────────────────────────────────────────────────────────
     # MAIN ANALYSIS (SYNCHRONOUS)
@@ -542,7 +760,7 @@ class HierarchicalPipeline:
         
         # Stage 1: Detection
         image_pil, image_cv, detections = self.detect(image_source)
-        print(f"📊 Detected {len(detections)} objects")
+        print(f"Detected {len(detections)} objects")
         
         # Stage 2: Crop extraction
         crops = self.extract_crops(image_cv, detections)
@@ -573,18 +791,19 @@ class HierarchicalPipeline:
                 reason=f"Low confidence ({crop_info.detection.confidence:.2f})",
             ))
         
-        # Process VLM_FULL (batched)
+        # Process VLM_FULL (batched) - extracts both analysis and embeddings
         vlm_crops = routed[ProcessingStage.VLM_FULL]
         if vlm_crops:
-            print(f"\n🔍 Analyzing {len(vlm_crops)} crops with VLM...")
-            analyses = self.analyze_crops_batched(vlm_crops, prompt)
+            print(f"\nAnalyzing {len(vlm_crops)} crops with VLM...")
+            analyses, embeddings = self.analyze_crops_batched(vlm_crops, prompt)
             
-            for crop_info, analysis in zip(vlm_crops, analyses):
+            for crop_info, analysis, embedding in zip(vlm_crops, analyses, embeddings):
                 results.append(AnalysisResult(
                     crop_info=crop_info,
                     stage=ProcessingStage.VLM_FULL,
                     analysis_text=analysis,
                     reason="High confidence, priority class",
+                    embedding=embedding,
                 ))
         
         # Sort by original detection index
@@ -676,28 +895,39 @@ class HierarchicalPipeline:
         # Stage 3: VLM analysis (stream as completed)
         vlm_crops = routed[ProcessingStage.VLM_FULL]
         if vlm_crops:
-            # Process in batches, yield after each batch
-            for i in range(0, len(vlm_crops), self.config.batch_size):
-                batch = vlm_crops[i:i + self.config.batch_size]
+            # Use size-aware batching to prevent latency spikes from large crops
+            # Batches are packed by total pixel area, not just count
+            max_total_area = self.config.batch_size * self.config.reference_area
+            batches = batch_by_area(vlm_crops, self.config.batch_size, max_total_area)
+            
+            # Process batches, yield after each batch
+            for batch in batches:
+                # FIX: PyTorch CUDA/MPS operations are not thread-safe with ThreadPoolExecutor
+                # Running them in executor can cause deadlocks. Run directly for GPU devices.
+                # Brief blocking is acceptable for GPU inference (typically fast).
+                if self.device in ("cuda", "mps"):
+                    # Run directly to avoid deadlocks with PyTorch GPU operations
+                    analyses, embeddings = self._analyze_batch(batch, prompt)
+                else:
+                    # CPU operations are fine in executor
+                    analyses, embeddings = await loop.run_in_executor(
+                        self.executor, self._analyze_batch, batch, prompt
+                    )
                 
-                # Run batch analysis in executor
-                analyses = await loop.run_in_executor(
-                    self.executor, self._analyze_batch, batch, prompt
-                )
-                
-                # Yield each result in the batch
-                # REFACTOR: Include full result object for single-pass streaming
-                for crop_info, analysis in zip(batch, analyses):
+                # Yield each result in the batch with embeddings
+                for i, (crop_info, analysis) in enumerate(zip(batch, analyses)):
+                    embedding = embeddings[i] if i < len(embeddings) else None
                     result = AnalysisResult(
                         crop_info=crop_info,
                         stage=ProcessingStage.VLM_FULL,
                         analysis_text=analysis,
                         reason="Full VLM analysis",
+                        embedding=embedding,
                     )
                     yield StreamEvent(
                         event_type="crop_analyzed",
                         data=result.to_dict(),
-                        result=result,  # Include full result with crop image
+                        result=result,  # Include full result with crop image and embedding
                     )
         
         yield StreamEvent(event_type="complete", data={})
@@ -759,7 +989,7 @@ class HierarchicalPipeline:
     def print_results(self, results: list[AnalysisResult]):
         """Print formatted analysis results."""
         print("\n" + "═" * 80)
-        print("📋 HIERARCHICAL ANALYSIS RESULTS")
+        print("HIERARCHICAL ANALYSIS RESULTS")
         print("═" * 80)
         
         for result in results:
@@ -803,7 +1033,7 @@ class HierarchicalPipeline:
             torch.cuda.empty_cache()
         
         self.initialized = False
-        print("🧹 Pipeline cleaned up, GPU memory freed.")
+        print("Pipeline cleaned up, GPU memory freed.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

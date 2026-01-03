@@ -29,3 +29,11 @@ bitsandbytes>=0.41.0  # INT8/INT4 quantization
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6  # For file uploads
+# Database 
+asyncpg>=0.29.0  # PostgreSQL async driver
+python-dotenv>=1.0.0  # For .env file support
+
+# Note: pgvector extension is installed in PostgreSQL, not Python
+# Install in PostgreSQL: CREATE EXTENSION vector;
+# The vector similarity search will use pgvector if available,
+# otherwise falls back to JSON embedding storage with Python-based similarity

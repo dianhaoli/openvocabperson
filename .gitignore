@@ -1,0 +1,40 @@
+# Database
+data/
+*.db
+*.db-journal
+
+# Storage (images)
+storage/
+
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist/
+build/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Model files (large)
+# Uncomment if you want to ignore model files
+# *.pt
+# *.pth
+# *.onnx
+

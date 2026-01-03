@@ -1,3 +1,5 @@
+<!-- legacy html file, no longer used -->
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -121,11 +123,490 @@
             width: 340px;
             background: var(--bg-secondary);
             border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        
+        .sidebar-content {
+            flex: 1;
             padding: 1.5rem;
             display: flex;
             flex-direction: column;
             gap: 1rem;
             overflow-y: auto;
+        }
+        
+        /* Sidebar Tabs */
+        .sidebar-tabs {
+            display: flex;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-tertiary);
+        }
+        
+        .sidebar-tab {
+            flex: 1;
+            padding: 0.75rem 1rem;
+            font-family: inherit;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            background: none;
+            border: none;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+        
+        .sidebar-tab:hover {
+            color: var(--text-primary);
+            background: var(--bg-secondary);
+        }
+        
+        .sidebar-tab.active {
+            color: var(--accent);
+            background: var(--bg-secondary);
+            border-bottom: 2px solid var(--accent);
+        }
+        
+        .tab-content {
+            display: none;
+            flex-direction: column;
+            gap: 1rem;
+            flex: 1;
+            overflow-y: auto;
+        }
+        
+        .tab-content.active {
+            display: flex;
+        }
+        
+        /* Search Section */
+        .search-section {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+        
+        .search-input-wrapper {
+            position: relative;
+        }
+        
+        .search-input {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            font-family: inherit;
+            font-size: 0.9rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            color: var(--text-primary);
+            outline: none;
+        }
+        
+        .search-input:focus {
+            border-color: var(--accent);
+        }
+        
+        .search-input::placeholder {
+            color: var(--text-muted);
+        }
+        
+        .search-divider {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            color: var(--text-muted);
+            font-size: 0.75rem;
+            text-transform: uppercase;
+        }
+        
+        .search-divider::before,
+        .search-divider::after {
+            content: '';
+            flex: 1;
+            height: 1px;
+            background: var(--border);
+        }
+        
+        .search-image-drop {
+            border: 2px dashed var(--border);
+            border-radius: var(--radius);
+            padding: 1rem;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .search-image-drop:hover,
+        .search-image-drop.dragover {
+            border-color: var(--accent);
+            background: var(--accent-soft);
+        }
+        
+        .search-image-drop.has-image {
+            border-style: solid;
+            border-color: var(--success);
+        }
+        
+        .search-image-preview {
+            max-width: 100%;
+            max-height: 80px;
+            border-radius: 6px;
+            display: none;
+        }
+        
+        .search-image-drop.has-image .search-image-preview {
+            display: block;
+            margin: 0 auto;
+        }
+        
+        .search-image-drop.has-image .search-drop-text {
+            display: none;
+        }
+        
+        .search-drop-text {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+        
+        .search-weights {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+        }
+        
+        .weight-slider-group {
+            flex: 1;
+        }
+        
+        .weight-label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            margin-bottom: 0.25rem;
+        }
+        
+        .weight-slider {
+            width: 100%;
+            accent-color: var(--accent);
+        }
+        
+        .search-btn {
+            width: 100%;
+            padding: 0.75rem;
+            font-family: inherit;
+            font-size: 0.9rem;
+            font-weight: 500;
+            background: var(--accent);
+            border: none;
+            border-radius: var(--radius);
+            color: white;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .search-btn:hover:not(:disabled) {
+            background: #5558e3;
+        }
+        
+        .search-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .search-results-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.5rem 0;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 0.5rem;
+        }
+        
+        .search-results-count {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+        
+        .clear-search-btn {
+            padding: 0.3rem 0.6rem;
+            font-size: 0.75rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-secondary);
+            cursor: pointer;
+        }
+        
+        .clear-search-btn:hover {
+            border-color: var(--error);
+            color: var(--error);
+        }
+        
+        .search-result-item {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 0.75rem;
+            display: flex;
+            gap: 0.75rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .search-result-item:hover {
+            border-color: var(--border-highlight);
+            transform: translateX(2px);
+        }
+        
+        .search-result-thumb {
+            width: 60px;
+            height: 60px;
+            object-fit: cover;
+            border-radius: 6px;
+            flex-shrink: 0;
+        }
+        
+        .search-result-info {
+            flex: 1;
+            min-width: 0;
+        }
+        
+        .search-result-class {
+            font-size: 0.8rem;
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+        
+        .search-result-analysis {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+            margin-top: 0.25rem;
+        }
+        
+        .search-result-scores {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 0.35rem;
+        }
+        
+        .score-badge {
+            padding: 0.15rem 0.4rem;
+            font-size: 0.65rem;
+            border-radius: 4px;
+            background: var(--bg-tertiary);
+            color: var(--text-muted);
+        }
+        
+        .score-badge.hybrid {
+            background: var(--accent-soft);
+            color: var(--accent);
+        }
+        
+        /* History Section */
+        .history-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+        
+        .history-count {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+        
+        .history-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+        
+        .history-item {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            overflow: hidden;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .history-item:hover {
+            border-color: var(--border-highlight);
+            transform: translateX(2px);
+        }
+        
+        .history-item.active {
+            border-color: var(--accent);
+        }
+        
+        .history-thumb {
+            width: 100%;
+            height: 100px;
+            object-fit: cover;
+            background: var(--bg-tertiary);
+        }
+        
+        .history-info {
+            padding: 0.6rem 0.75rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .history-meta {
+            display: flex;
+            flex-direction: column;
+            gap: 0.15rem;
+        }
+        
+        .history-date {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+        
+        .history-entities {
+            font-size: 0.7rem;
+            color: var(--text-muted);
+        }
+        
+        .history-delete {
+            padding: 0.35rem;
+            background: transparent;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.2s ease;
+            opacity: 0;
+        }
+        
+        .history-item:hover .history-delete {
+            opacity: 1;
+        }
+        
+        .history-delete:hover {
+            background: var(--error);
+            border-color: var(--error);
+            color: white;
+        }
+        
+        .history-empty {
+            text-align: center;
+            padding: 2rem 1rem;
+            color: var(--text-muted);
+        }
+        
+        .history-empty-icon {
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+            opacity: 0.5;
+        }
+        
+        .load-more-btn {
+            width: 100%;
+            padding: 0.6rem;
+            font-family: inherit;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .load-more-btn:hover {
+            background: var(--bg-card);
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+        
+        /* Delete Confirmation Modal */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            backdrop-filter: blur(4px);
+        }
+        
+        .modal-overlay.active {
+            display: flex;
+        }
+        
+        .modal {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            padding: 1.5rem;
+            max-width: 400px;
+            width: 90%;
+        }
+        
+        .modal-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin-bottom: 0.75rem;
+        }
+        
+        .modal-text {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            margin-bottom: 1.25rem;
+        }
+        
+        .modal-actions {
+            display: flex;
+            gap: 0.75rem;
+            justify-content: flex-end;
+        }
+        
+        .modal-btn {
+            padding: 0.6rem 1.25rem;
+            font-family: inherit;
+            font-size: 0.9rem;
+            font-weight: 500;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .modal-btn-cancel {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+        }
+        
+        .modal-btn-cancel:hover {
+            background: var(--bg-card);
+            color: var(--text-primary);
+        }
+        
+        .modal-btn-delete {
+            background: var(--error);
+            border: none;
+            color: white;
+        }
+        
+        .modal-btn-delete:hover {
+            background: #dc2626;
         }
 
         .card {
@@ -737,7 +1218,7 @@
     <header>
         <div class="header-content">
             <div class="logo">
-                <div class="logo-icon">👤</div>
+                <div class="logo-icon"></div>
                 <h1>Human-Centric Vision Analysis</h1>
             </div>
             <div class="status-badge">
@@ -747,39 +1228,143 @@
         </div>
     </header>
 
+    <!-- Delete Confirmation Modal -->
+    <div class="modal-overlay" id="deleteModal">
+        <div class="modal">
+            <div class="modal-title">Delete Session?</div>
+            <div class="modal-text" id="deleteModalText">
+                This will permanently delete this analysis session and all detected entities.
+            </div>
+            <div class="modal-actions">
+                <button class="modal-btn modal-btn-cancel" id="deleteCancelBtn">Cancel</button>
+                <button class="modal-btn modal-btn-delete" id="deleteConfirmBtn">Delete</button>
+            </div>
+        </div>
+    </div>
+
     <main>
         <!-- Left Sidebar - Upload & Progress -->
         <aside class="sidebar-left">
-            <div class="card">
-                <div class="card-title">Upload Image</div>
-                <div class="dropzone" id="dropzone">
-                    <div class="dropzone-icon">📷</div>
-                    <div class="dropzone-text">
-                        <strong>Click to upload</strong> or drag and drop
-                    </div>
-                    <div class="dropzone-hint">PNG, JPG up to 10MB</div>
-                </div>
-                <input type="file" id="fileInput" accept="image/*">
-                
-                <div class="preview-container" id="previewContainer">
-                    <img src="" alt="Preview" class="preview-image" id="previewImage">
-                    <div class="preview-info">
-                        <span id="fileName">image.jpg</span>
-                        <span id="fileSize">0 KB</span>
-                    </div>
-                </div>
+            <!-- Sidebar Tabs -->
+            <div class="sidebar-tabs">
+                <button class="sidebar-tab active" data-tab="upload" id="tabUpload">
+                    Upload
+                </button>
+                <button class="sidebar-tab" data-tab="search" id="tabSearch">
+                    Search
+                </button>
+                <button class="sidebar-tab" data-tab="history" id="tabHistory">
+                    History
+                </button>
             </div>
+            
+            <div class="sidebar-content">
+                <!-- Upload Tab Content -->
+                <div class="tab-content active" id="uploadTab">
+                    <div class="card">
+                        <div class="card-title">Upload Image</div>
+                        <div class="dropzone" id="dropzone">
+                            <div class="dropzone-icon"></div>
+                            <div class="dropzone-text">
+                                <strong>Click to upload</strong> or drag and drop
+                            </div>
+                            <div class="dropzone-hint">PNG, JPG up to 10MB</div>
+                        </div>
+                        <input type="file" id="fileInput" accept="image/*">
+                        
+                        <div class="preview-container" id="previewContainer">
+                            <img src="" alt="Preview" class="preview-image" id="previewImage">
+                            <div class="preview-info">
+                                <span id="fileName">image.jpg</span>
+                                <span id="fileSize">0 KB</span>
+                            </div>
+                        </div>
+                    </div>
 
-            <button class="analyze-btn" id="analyzeBtn" disabled>
-                <span>Analyze Image</span>
-            </button>
+                    <button class="analyze-btn" id="analyzeBtn" disabled>
+                        <span>Analyze Image</span>
+                    </button>
 
-            <div class="card progress-section" id="progressSection">
-                <div class="card-title">Progress</div>
-                <div class="progress-bar-container">
-                    <div class="progress-bar indeterminate" id="progressBar"></div>
+                    <div class="card progress-section" id="progressSection">
+                        <div class="card-title">Progress</div>
+                        <div class="progress-bar-container">
+                            <div class="progress-bar indeterminate" id="progressBar"></div>
+                        </div>
+                        <div class="progress-log" id="progressLog"></div>
+                    </div>
                 </div>
-                <div class="progress-log" id="progressLog"></div>
+                
+                <!-- Search Tab Content -->
+                <div class="tab-content" id="searchTab">
+                    <div class="card search-section">
+                        <div class="card-title">Search Entities</div>
+                        
+                        <!-- Text search input -->
+                        <div class="search-input-wrapper">
+                            <input type="text" 
+                                   class="search-input" 
+                                   id="searchTextInput" 
+                                   placeholder="Search by description...">
+                        </div>
+                        
+                        <div class="search-divider">and/or</div>
+                        
+                        <!-- Image similarity search -->
+                        <div class="search-image-drop" id="searchImageDrop">
+                            <span class="search-drop-text">Drop image to find similar</span>
+                            <img src="" alt="Search image" class="search-image-preview" id="searchImagePreview">
+                        </div>
+                        <input type="file" id="searchImageInput" accept="image/*" style="display: none;">
+                        
+                        <!-- Weight sliders for hybrid search -->
+                        <div class="search-weights" id="searchWeights" style="display: none;">
+                            <div class="weight-slider-group">
+                                <div class="weight-label">
+                                    <span>Text</span>
+                                    <span id="textWeightValue">50%</span>
+                                </div>
+                                <input type="range" class="weight-slider" id="textWeightSlider" 
+                                       min="0" max="100" value="50">
+                            </div>
+                            <div class="weight-slider-group">
+                                <div class="weight-label">
+                                    <span>Image</span>
+                                    <span id="vectorWeightValue">50%</span>
+                                </div>
+                                <input type="range" class="weight-slider" id="vectorWeightSlider" 
+                                       min="0" max="100" value="50">
+                            </div>
+                        </div>
+                        
+                        <button class="search-btn" id="searchBtn" disabled>
+                            Search
+                        </button>
+                    </div>
+                    
+                    <!-- Search Results -->
+                    <div class="search-results-header" id="searchResultsHeader" style="display: none;">
+                        <span class="search-results-count" id="searchResultsCount">0 results</span>
+                        <button class="clear-search-btn" id="clearSearchBtn">Clear</button>
+                    </div>
+                    <div id="searchResultsList"></div>
+                </div>
+                
+                <!-- History Tab Content -->
+                <div class="tab-content" id="historyTab">
+                    <div class="history-header">
+                        <div class="card-title" style="margin-bottom: 0;">Past Sessions</div>
+                        <div class="history-count" id="historyCount">0 sessions</div>
+                    </div>
+                    <div class="history-list" id="historyList">
+                        <div class="history-empty">
+                            <div class="history-empty-icon"></div>
+                            <p>No past sessions yet</p>
+                        </div>
+                    </div>
+                    <button class="load-more-btn" id="loadMoreBtn" style="display: none;">
+                        Load More
+                    </button>
+                </div>
             </div>
         </aside>
 
@@ -807,7 +1392,7 @@
                 
                 <div class="results-grid" id="resultsGrid">
                     <div class="empty-state">
-                        <div class="empty-icon">🔍</div>
+                        <div class="empty-icon"></div>
                         <p>Upload an image to start analysis</p>
                     </div>
                 </div>
@@ -1000,7 +1585,7 @@
             resultsStats.style.display = 'none';
             resultsGrid.innerHTML = `
                 <div class="empty-state">
-                    <div class="empty-icon">🔍</div>
+                    <div class="empty-icon"></div>
                     <p>Click "Analyze Image" to start</p>
                 </div>
             `;
@@ -1056,7 +1641,7 @@
             });
         }
 
-        // Canvas click detection
+        // Canvas click detection - smallest box wins for overlapping boxes
         canvas.addEventListener('click', (e) => {
             if (entities.length === 0) return;
             
@@ -1064,17 +1649,25 @@
             const clickX = (e.clientX - rect.left) / canvasScale;
             const clickY = (e.clientY - rect.top) / canvasScale;
             
-            for (let i = entities.length - 1; i >= 0; i--) {
-                const entity = entities[i];
+            // Find all boxes containing the click point
+            const hits = entities.filter(entity => {
                 const [x1, y1, x2, y2] = entity.box;
-                
-                if (clickX >= x1 && clickX <= x2 && clickY >= y1 && clickY <= y2) {
-                    selectEntity(entity.object_id);
-                    return;
-                }
+                return clickX >= x1 && clickX <= x2 && clickY >= y1 && clickY <= y2;
+            });
+            
+            if (hits.length === 0) {
+                deselectEntity();
+                return;
             }
             
-            deselectEntity();
+            // Select the smallest box (most specific)
+            const smallest = hits.reduce((a, b) => {
+                const areaA = (a.box[2] - a.box[0]) * (a.box[3] - a.box[1]);
+                const areaB = (b.box[2] - b.box[0]) * (b.box[3] - b.box[1]);
+                return areaA < areaB ? a : b;
+            });
+            
+            selectEntity(smallest.object_id);
         });
 
         window.addEventListener('resize', () => {
@@ -1154,7 +1747,7 @@
             selectedEntityId = null;
             entityPanel.classList.remove('active');
             
-            addLog('info', '🚀', 'Starting analysis...');
+            addLog('info', '', 'Starting analysis...');
             
             const formData = new FormData();
             formData.append('file', selectedFile);
@@ -1193,16 +1786,16 @@
                     }
                 } else {
                     // Fallback to non-streaming
-                    addLog('warning', '⚠️', 'Streaming unavailable, using sync mode');
+                    addLog('warning', '', 'Streaming unavailable, using sync mode');
                     await runSyncAnalysis();
                 }
             } catch (error) {
-                addLog('error', '❌', `Error: ${error.message}`);
+                addLog('error', '', `Error: ${error.message}`);
                 // Try sync fallback
                 try {
                     await runSyncAnalysis();
                 } catch (e2) {
-                    addLog('error', '❌', `Fallback also failed: ${e2.message}`);
+                    addLog('error', '', `Fallback also failed: ${e2.message}`);
                 }
             }
             
@@ -1226,7 +1819,7 @@
             
             const data = await response.json();
             
-            addLog('success', '✅', `Detected ${data.num_detections} entities`);
+            addLog('success', '', `Detected ${data.num_detections} entities`);
             
             entities = data.results;
             displayResults(data.results, data.elapsed_seconds);
@@ -1244,25 +1837,25 @@
             
             switch (type) {
                 case 'detection_complete':
-                    addLog('success', '🎯', `Detected ${data.num_detections} objects`);
+                    addLog('success', '', `Detected ${data.num_detections} objects`);
                     break;
                     
                 case 'routing_complete':
-                    addLog('info', '🔀', `Routing: ${data.vlm_full} VLM, ${data.yolo_only} skip, ${data.low_confidence} low conf`);
+                    addLog('info', '', `Routing: ${data.vlm_full} VLM, ${data.yolo_only} skip, ${data.low_confidence} low conf`);
                     break;
                     
                 case 'crop_analyzed':
                     const idx = data.index ?? '?';
                     if (data.analysis) {
                         const preview = data.analysis.substring(0, 50) + (data.analysis.length > 50 ? '...' : '');
-                        addLog('success', '✅', `Crop ${idx}: ${preview}`);
+                        addLog('success', '', `Crop ${idx}: ${preview}`);
                     } else {
-                        addLog('warning', '⏭️', `Crop ${idx}: ${data.reason || 'skipped'}`);
+                        addLog('warning', '', `Crop ${idx}: ${data.reason || 'skipped'}`);
                     }
                     break;
                     
                 case 'complete':
-                    addLog('success', '🏁', `Complete in ${event.elapsed}s`);
+                    addLog('success', '', `Complete in ${event.elapsed}s`);
                     entities = event.results;
                     displayResults(event.results, event.elapsed);
                     drawCanvas();
@@ -1275,7 +1868,7 @@
                     break;
                     
                 case 'error':
-                    addLog('error', '❌', event.message);
+                    addLog('error', '', event.message);
                     break;
             }
         }
@@ -1308,7 +1901,7 @@
             if (!results || results.length === 0) {
                 resultsGrid.innerHTML = `
                     <div class="empty-state">
-                        <div class="empty-icon">🤷</div>
+                        <div class="empty-icon"></div>
                         <p>No objects detected in this image</p>
                     </div>
                 `;
@@ -1369,7 +1962,7 @@
             
             // Add loading item to history
             const isFullScene = useFullScene.checked;
-            const modeLabel = isFullScene ? ' 🖼️' : '';  // Show icon if using full scene
+            const modeLabel = isFullScene ? '' : '';  // Show icon if using full scene
             const qaItem = document.createElement('div');
             qaItem.className = 'qa-item';
             qaItem.innerHTML = `
@@ -1407,6 +2000,577 @@
             
             qaSendBtn.disabled = false;
             qaHistory.scrollTop = qaHistory.scrollHeight;
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // SIDEBAR TABS
+        // ══════════════════════════════════════════════════════════════════════
+        const tabUpload = document.getElementById('tabUpload');
+        const tabHistory = document.getElementById('tabHistory');
+        const uploadTab = document.getElementById('uploadTab');
+        const historyTab = document.getElementById('historyTab');
+        const historyList = document.getElementById('historyList');
+        const historyCount = document.getElementById('historyCount');
+        const loadMoreBtn = document.getElementById('loadMoreBtn');
+        const deleteModal = document.getElementById('deleteModal');
+        const deleteModalText = document.getElementById('deleteModalText');
+        const deleteCancelBtn = document.getElementById('deleteCancelBtn');
+        const deleteConfirmBtn = document.getElementById('deleteConfirmBtn');
+
+        let historyOffset = 0;
+        const historyLimit = 20;
+        let totalSessions = 0;
+        let pendingDeleteId = null;
+
+        // Search elements
+        const tabSearch = document.getElementById('tabSearch');
+        const searchTab = document.getElementById('searchTab');
+        const searchTextInput = document.getElementById('searchTextInput');
+        const searchImageDrop = document.getElementById('searchImageDrop');
+        const searchImageInput = document.getElementById('searchImageInput');
+        const searchImagePreview = document.getElementById('searchImagePreview');
+        const searchWeights = document.getElementById('searchWeights');
+        const textWeightSlider = document.getElementById('textWeightSlider');
+        const vectorWeightSlider = document.getElementById('vectorWeightSlider');
+        const textWeightValue = document.getElementById('textWeightValue');
+        const vectorWeightValue = document.getElementById('vectorWeightValue');
+        const searchBtn = document.getElementById('searchBtn');
+        const searchResultsHeader = document.getElementById('searchResultsHeader');
+        const searchResultsCount = document.getElementById('searchResultsCount');
+        const clearSearchBtn = document.getElementById('clearSearchBtn');
+        const searchResultsList = document.getElementById('searchResultsList');
+        
+        let searchImageFile = null;
+
+        // Tab switching
+        tabUpload.addEventListener('click', () => switchTab('upload'));
+        tabSearch.addEventListener('click', () => switchTab('search'));
+        tabHistory.addEventListener('click', () => {
+            switchTab('history');
+            loadHistory(true);
+        });
+
+        function switchTab(tab) {
+            // Remove active from all tabs
+            tabUpload.classList.remove('active');
+            tabSearch.classList.remove('active');
+            tabHistory.classList.remove('active');
+            uploadTab.classList.remove('active');
+            searchTab.classList.remove('active');
+            historyTab.classList.remove('active');
+            
+            // Activate selected tab
+            if (tab === 'upload') {
+                tabUpload.classList.add('active');
+                uploadTab.classList.add('active');
+            } else if (tab === 'search') {
+                tabSearch.classList.add('active');
+                searchTab.classList.add('active');
+            } else {
+                tabHistory.classList.add('active');
+                historyTab.classList.add('active');
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // HISTORY MANAGEMENT
+        // ══════════════════════════════════════════════════════════════════════
+        async function loadHistory(reset = false) {
+            if (reset) {
+                historyOffset = 0;
+                historyList.innerHTML = '';
+            }
+
+            try {
+                const res = await fetch(`/api/sessions?limit=${historyLimit}&offset=${historyOffset}`);
+                const data = await res.json();
+
+                totalSessions = data.total;
+                historyCount.textContent = `${totalSessions} session${totalSessions !== 1 ? 's' : ''}`;
+
+                if (data.sessions.length === 0 && historyOffset === 0) {
+                    historyList.innerHTML = `
+                        <div class="history-empty">
+                            <div class="history-empty-icon"></div>
+                            <p>No past sessions yet</p>
+                        </div>
+                    `;
+                    loadMoreBtn.style.display = 'none';
+                    return;
+                }
+
+                // Render sessions
+                data.sessions.forEach(session => {
+                    const item = createHistoryItem(session);
+                    historyList.appendChild(item);
+                });
+
+                historyOffset += data.sessions.length;
+
+                // Show/hide load more button
+                if (historyOffset < totalSessions) {
+                    loadMoreBtn.style.display = 'block';
+                } else {
+                    loadMoreBtn.style.display = 'none';
+                }
+
+            } catch (error) {
+                console.error('Failed to load history:', error);
+                historyList.innerHTML = `
+                    <div class="history-empty">
+                        <div class="history-empty-icon"></div>
+                        <p>Failed to load history</p>
+                    </div>
+                `;
+            }
+        }
+
+        function createHistoryItem(session) {
+            const item = document.createElement('div');
+            item.className = 'history-item';
+            item.dataset.sessionId = session.session_id;
+
+            const date = new Date(session.created_at * 1000);
+            const dateStr = date.toLocaleDateString('en-US', {
+                month: 'short',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+
+            item.innerHTML = `
+                <img class="history-thumb" 
+                     src="/api/image/session/${session.session_id}" 
+                     alt="Session thumbnail"
+                     onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 60%22><rect fill=%22%231a1a24%22 width=%22100%22 height=%2260%22/><text x=%2250%22 y=%2235%22 text-anchor=%22middle%22 fill=%22%23606070%22 font-size=%2210%22>No image</text></svg>'">
+                <div class="history-info">
+                    <div class="history-meta">
+                        <div class="history-date">${dateStr}</div>
+                        <div class="history-entities">${session.entity_count} detection${session.entity_count !== 1 ? 's' : ''}</div>
+                    </div>
+                    <button class="history-delete" title="Delete session">Delete</button>
+                </div>
+            `;
+
+            // Click to load session
+            item.addEventListener('click', (e) => {
+                if (e.target.closest('.history-delete')) return;
+                loadHistorySession(session.session_id);
+            });
+
+            // Delete button
+            item.querySelector('.history-delete').addEventListener('click', (e) => {
+                e.stopPropagation();
+                showDeleteModal(session.session_id, session.entity_count);
+            });
+
+            return item;
+        }
+
+        async function loadHistorySession(sessionId) {
+            try {
+                // Show loading state
+                const items = historyList.querySelectorAll('.history-item');
+                items.forEach(item => {
+                    item.classList.toggle('active', item.dataset.sessionId === sessionId);
+                });
+
+                const res = await fetch(`/api/session/${sessionId}`);
+                if (!res.ok) throw new Error('Failed to load session');
+                
+                const data = await res.json();
+
+                // Load full image into canvas
+                const img = new Image();
+                img.onload = () => {
+                    currentImage = img;
+                    
+                    // Convert entities to expected format
+                    entities = data.entities.map((e, idx) => ({
+                        object_id: e.object_id,
+                        index: idx,
+                        class: e.class_name,
+                        confidence: e.confidence,
+                        box: e.box,
+                        stage: e.stage,
+                        analysis: e.analysis,
+                        crop_image: e.crop_image,
+                    }));
+
+                    // Update UI
+                    drawCanvas();
+                    displayResults(entities, 0);
+                    resultsStats.style.display = 'flex';
+                    statDetections.textContent = entities.length;
+                    statTime.textContent = 'cached';
+
+                    canvasHint.textContent = entities.length > 0 
+                        ? 'Click a bounding box or card to ask questions'
+                        : 'No entities in this session';
+
+                    // Switch to results view
+                    switchTab('upload');
+                };
+                img.onerror = () => {
+                    console.error('Failed to load session image');
+                };
+                img.src = `/api/image/session/${sessionId}`;
+
+            } catch (error) {
+                console.error('Failed to load session:', error);
+                alert('Failed to load session');
+            }
+        }
+
+        // Load more sessions
+        loadMoreBtn.addEventListener('click', () => loadHistory(false));
+
+        // ══════════════════════════════════════════════════════════════════════
+        // DELETE MODAL
+        // ══════════════════════════════════════════════════════════════════════
+        function showDeleteModal(sessionId, entityCount) {
+            pendingDeleteId = sessionId;
+            deleteModalText.textContent = `This will permanently delete this session and ${entityCount} detection${entityCount !== 1 ? 's' : ''}.`;
+            deleteModal.classList.add('active');
+        }
+
+        function hideDeleteModal() {
+            pendingDeleteId = null;
+            deleteModal.classList.remove('active');
+        }
+
+        deleteCancelBtn.addEventListener('click', hideDeleteModal);
+        deleteModal.addEventListener('click', (e) => {
+            if (e.target === deleteModal) hideDeleteModal();
+        });
+
+        deleteConfirmBtn.addEventListener('click', async () => {
+            if (!pendingDeleteId) return;
+
+            deleteConfirmBtn.disabled = true;
+            deleteConfirmBtn.textContent = 'Deleting...';
+
+            try {
+                const res = await fetch(`/api/session/${pendingDeleteId}`, {
+                    method: 'DELETE'
+                });
+
+                if (!res.ok) throw new Error('Delete failed');
+
+                // Remove from list
+                const item = historyList.querySelector(`[data-session-id="${pendingDeleteId}"]`);
+                if (item) {
+                    item.style.animation = 'fadeOut 0.3s ease forwards';
+                    setTimeout(() => item.remove(), 300);
+                }
+
+                totalSessions--;
+                historyCount.textContent = `${totalSessions} session${totalSessions !== 1 ? 's' : ''}`;
+
+                if (totalSessions === 0) {
+                    historyList.innerHTML = `
+                        <div class="history-empty">
+                            <div class="history-empty-icon"></div>
+                            <p>No past sessions yet</p>
+                        </div>
+                    `;
+                }
+
+            } catch (error) {
+                console.error('Delete failed:', error);
+                alert('Failed to delete session');
+            }
+
+            deleteConfirmBtn.disabled = false;
+            deleteConfirmBtn.textContent = 'Delete';
+            hideDeleteModal();
+        });
+
+        // Fade out animation for deleted items
+        const fadeOutStyle = document.createElement('style');
+        fadeOutStyle.textContent = `
+            @keyframes fadeOut {
+                from { opacity: 1; transform: translateX(0); }
+                to { opacity: 0; transform: translateX(-20px); }
+            }
+        `;
+        document.head.appendChild(fadeOutStyle);
+
+        // ══════════════════════════════════════════════════════════════════════
+        // SEARCH FUNCTIONALITY
+        // ══════════════════════════════════════════════════════════════════════
+        
+        // Text input enables search
+        searchTextInput.addEventListener('input', updateSearchState);
+        
+        // Image drop zone
+        searchImageDrop.addEventListener('click', () => searchImageInput.click());
+        
+        searchImageDrop.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            searchImageDrop.classList.add('dragover');
+        });
+        
+        searchImageDrop.addEventListener('dragleave', () => {
+            searchImageDrop.classList.remove('dragover');
+        });
+        
+        searchImageDrop.addEventListener('drop', (e) => {
+            e.preventDefault();
+            searchImageDrop.classList.remove('dragover');
+            if (e.dataTransfer.files.length > 0 && e.dataTransfer.files[0].type.startsWith('image/')) {
+                handleSearchImage(e.dataTransfer.files[0]);
+            }
+        });
+        
+        searchImageInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleSearchImage(e.target.files[0]);
+            }
+        });
+        
+        function handleSearchImage(file) {
+            searchImageFile = file;
+            
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                searchImagePreview.src = e.target.result;
+                searchImageDrop.classList.add('has-image');
+            };
+            reader.readAsDataURL(file);
+            
+            updateSearchState();
+        }
+        
+        function updateSearchState() {
+            const hasText = searchTextInput.value.trim().length > 0;
+            const hasImage = searchImageFile !== null;
+            
+            // Enable search if we have text or image
+            searchBtn.disabled = !(hasText || hasImage);
+            
+            // Show weight sliders if both text and image are provided
+            if (hasText && hasImage) {
+                searchWeights.style.display = 'flex';
+            } else {
+                searchWeights.style.display = 'none';
+            }
+        }
+        
+        // Weight sliders - keep them balanced
+        textWeightSlider.addEventListener('input', () => {
+            const val = parseInt(textWeightSlider.value);
+            textWeightValue.textContent = val + '%';
+            vectorWeightSlider.value = 100 - val;
+            vectorWeightValue.textContent = (100 - val) + '%';
+        });
+        
+        vectorWeightSlider.addEventListener('input', () => {
+            const val = parseInt(vectorWeightSlider.value);
+            vectorWeightValue.textContent = val + '%';
+            textWeightSlider.value = 100 - val;
+            textWeightValue.textContent = (100 - val) + '%';
+        });
+        
+        // Clear search
+        clearSearchBtn.addEventListener('click', clearSearch);
+        
+        function clearSearch() {
+            searchTextInput.value = '';
+            searchImageFile = null;
+            searchImagePreview.src = '';
+            searchImageDrop.classList.remove('has-image');
+            searchWeights.style.display = 'none';
+            searchResultsHeader.style.display = 'none';
+            searchResultsList.innerHTML = '';
+            searchBtn.disabled = true;
+        }
+        
+        // Perform search
+        searchBtn.addEventListener('click', performSearch);
+        searchTextInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter' && !searchBtn.disabled) performSearch();
+        });
+        
+        async function performSearch() {
+            const textQuery = searchTextInput.value.trim();
+            const hasImage = searchImageFile !== null;
+            
+            if (!textQuery && !hasImage) return;
+            
+            searchBtn.disabled = true;
+            searchBtn.textContent = 'Searching...';
+            
+            try {
+                let results;
+                
+                if (textQuery && hasImage) {
+                    // Hybrid search
+                    const formData = new FormData();
+                    formData.append('file', searchImageFile);
+                    
+                    const textWeight = parseInt(textWeightSlider.value) / 100;
+                    const vectorWeight = parseInt(vectorWeightSlider.value) / 100;
+                    
+                    // Build query params
+                    const params = new URLSearchParams({
+                        text_query: textQuery,
+                        text_weight: textWeight,
+                        vector_weight: vectorWeight,
+                        limit: 20
+                    });
+                    
+                    const res = await fetch(`/api/search?${params}`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    results = await res.json();
+                    
+                } else if (hasImage) {
+                    // Image-only search
+                    const formData = new FormData();
+                    formData.append('file', searchImageFile);
+                    
+                    const res = await fetch('/api/search/image?limit=20', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    results = await res.json();
+                    
+                } else {
+                    // Text-only search
+                    const res = await fetch(`/api/search/text?q=${encodeURIComponent(textQuery)}&limit=50`);
+                    results = await res.json();
+                }
+                
+                displaySearchResults(results);
+                
+            } catch (error) {
+                console.error('Search failed:', error);
+                searchResultsList.innerHTML = `
+                    <div class="history-empty">
+                        <p>Search failed: ${error.message}</p>
+                    </div>
+                `;
+            }
+            
+            searchBtn.disabled = false;
+            searchBtn.textContent = 'Search';
+        }
+        
+        function displaySearchResults(data) {
+            const results = data.results || [];
+            
+            searchResultsHeader.style.display = 'flex';
+            searchResultsCount.textContent = `${results.length} result${results.length !== 1 ? 's' : ''}`;
+            
+            if (results.length === 0) {
+                searchResultsList.innerHTML = `
+                    <div class="history-empty">
+                        <p>No matching results found</p>
+                    </div>
+                `;
+                return;
+            }
+            
+            searchResultsList.innerHTML = '';
+            
+            results.forEach(result => {
+                const item = document.createElement('div');
+                item.className = 'search-result-item';
+                item.dataset.objectId = result.object_id;
+                item.dataset.sessionId = result.session_id;
+                
+                // Build scores HTML
+                let scoresHtml = '';
+                if (result.scores) {
+                    scoresHtml = `
+                        <div class="search-result-scores">
+                            <span class="score-badge hybrid">Score: ${(result.scores.hybrid * 100).toFixed(0)}%</span>
+                            ${result.scores.text > 0 ? `<span class="score-badge">Text: ${(result.scores.text * 100).toFixed(0)}%</span>` : ''}
+                            ${result.scores.vector > 0 ? `<span class="score-badge">Image: ${(result.scores.vector * 100).toFixed(0)}%</span>` : ''}
+                        </div>
+                    `;
+                } else if (result.similarity !== undefined) {
+                    scoresHtml = `
+                        <div class="search-result-scores">
+                            <span class="score-badge hybrid">Similarity: ${(result.similarity * 100).toFixed(0)}%</span>
+                        </div>
+                    `;
+                } else if (result.score !== undefined) {
+                    scoresHtml = `
+                        <div class="search-result-scores">
+                            <span class="score-badge hybrid">Relevance: ${(result.score * 100).toFixed(0)}%</span>
+                        </div>
+                    `;
+                }
+                
+                item.innerHTML = `
+                    <img class="search-result-thumb" 
+                         src="${result.crop_image || ''}" 
+                         alt="${result.class_name}">
+                    <div class="search-result-info">
+                        <div class="search-result-class">${result.class_name}</div>
+                        <div class="search-result-analysis">${result.analysis || 'No analysis'}</div>
+                        ${scoresHtml}
+                    </div>
+                `;
+                
+                // Click to load session
+                item.addEventListener('click', () => {
+                    loadSearchResultSession(result.session_id, result.object_id);
+                });
+                
+                searchResultsList.appendChild(item);
+            });
+        }
+        
+        async function loadSearchResultSession(sessionId, objectIdToSelect) {
+            try {
+                const res = await fetch(`/api/session/${sessionId}`);
+                if (!res.ok) throw new Error('Failed to load session');
+                
+                const data = await res.json();
+                
+                // Load full image into canvas
+                const img = new Image();
+                img.onload = () => {
+                    currentImage = img;
+                    
+                    // Convert entities
+                    entities = data.entities.map((e, idx) => ({
+                        object_id: e.object_id,
+                        index: idx,
+                        class: e.class_name,
+                        confidence: e.confidence,
+                        box: e.box,
+                        stage: e.stage,
+                        analysis: e.analysis,
+                        crop_image: e.crop_image,
+                    }));
+                    
+                    drawCanvas();
+                    displayResults(entities, 0);
+                    resultsStats.style.display = 'flex';
+                    statDetections.textContent = entities.length;
+                    statTime.textContent = 'cached';
+                    
+                    canvasHint.textContent = 'Click a bounding box or card to ask questions';
+                    
+                    // Switch to upload tab to show results
+                    switchTab('upload');
+                    
+                    // Select the specific entity if provided
+                    if (objectIdToSelect) {
+                        setTimeout(() => selectEntity(objectIdToSelect), 100);
+                    }
+                };
+                img.src = `/api/image/session/${sessionId}`;
+                
+            } catch (error) {
+                console.error('Failed to load session:', error);
+                alert('Failed to load session');
+            }
         }
     </script>
 </body>
