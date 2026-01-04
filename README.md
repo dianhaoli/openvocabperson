@@ -4,9 +4,9 @@ A production-ready hierarchical vision system that combines **YOLO** for fast de
 
 ![Demo](https://github.com/user-attachments/assets/81d30065-eaf9-461d-bddb-ee7183e1b14b)
 
-## Demo Video
+## Demo Image - Video Coming Soon
 
-**[Watch on YouTube](https://youtu.be/xvKNw0Qv5gY)**
+<img width="1683" height="920" alt="image" src="https://github.com/user-attachments/assets/f7a1219f-46c3-4930-b70b-e4ac124cf136" />
 
 ---
 
