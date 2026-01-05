@@ -22,6 +22,9 @@ dist/
 build/
 *.egg-info/
 
+# Frontend build artifacts
+frontend/dist/
+
 # IDE
 .vscode/
 .idea/
@@ -33,8 +36,7 @@ build/
 .ipynb_checkpoints
 
 # Model files (large)
-# Uncomment if you want to ignore model files
-# *.pt
-# *.pth
-# *.onnx
+*.pt
+*.pth
+*.onnx
 

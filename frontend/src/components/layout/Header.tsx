@@ -11,7 +11,7 @@ export function Header() {
           <div className="w-9 h-9 gradient-accent rounded-[10px] flex items-center justify-center text-xl">
           </div>
           <h1 className="text-xl font-semibold text-gradient">
-            Human-Centric Vision Analysis
+            Human Analysis System
           </h1>
         </div>
 
