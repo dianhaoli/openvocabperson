@@ -124,7 +124,7 @@ The easiest way to get started is using Docker Compose, which sets up the entire
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/openvocabperson.git
+git clone https://github.com/dianhaoli/openvocabperson.git
 cd openvocabperson
 
 # Start all services (PostgreSQL, backend, frontend)
