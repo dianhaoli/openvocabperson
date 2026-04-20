@@ -10,6 +10,10 @@ qwen-vl-utils>=0.0.14
 # Object Detection
 ultralytics>=8.1.0
 
+# Person Re-ID (OSNet)
+torchreid>=0.2.5
+gdown>=4.7.0
+
 # Image Processing
 opencv-python>=4.8.0
 pillow>=10.1.0

@@ -45,6 +45,7 @@ from pydantic import BaseModel
 
 from pipeline import (
     ANALYSIS_PROMPT,
+    AnalysisResult,
     HierarchicalPipeline,
     PipelineConfig,
     create_pipeline,
@@ -54,6 +55,7 @@ from pipeline import (
 from database import get_db, SearchResult
 from storage_utils import save_session_image, save_crop_image, load_image
 from embeddings import QwenEmbeddingExtractor, create_embedding_extractor
+from reid import create_reid_extractor, OSNetReIDExtractor
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -87,12 +89,30 @@ class AskRequest(BaseModel):
     use_full_scene: bool = False  # If True, analyze full image instead of crop
 
 
+class PersonPatchRequest(BaseModel):
+    """Update person / suspect metadata."""
+    label: Optional[str] = None
+    is_watchlist: Optional[bool] = None
+    notes: Optional[str] = None
+
+
+class PersonMergeRequest(BaseModel):
+    """Merge another person cluster into this one."""
+    other_id: str
+
+
+class EntityAssignRequest(BaseModel):
+    """Manually assign a detection to a person cluster."""
+    person_id: str
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # GLOBAL STATE
 # ══════════════════════════════════════════════════════════════════════════════
 
 pipeline: Optional[HierarchicalPipeline] = None
 embedding_extractor: Optional[QwenEmbeddingExtractor] = None
+reid_extractor: Optional[OSNetReIDExtractor] = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -154,7 +174,7 @@ Instructions:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize pipeline, embedding extractor, and database on startup."""
-    global pipeline, embedding_extractor
+    global pipeline, embedding_extractor, reid_extractor
     
     print("Starting Vision Analysis API...")
     
@@ -166,7 +186,7 @@ async def lifespan(app: FastAPI):
     config = PipelineConfig(
         use_quantization=True,
         use_torch_compile=False,
-        max_new_tokens=100,  # Allow longer responses for Q&A
+        max_new_tokens=40,  # Allow longer responses for Q&A
         batch_size=4,
     )
     pipeline = HierarchicalPipeline(config)
@@ -178,6 +198,22 @@ async def lifespan(app: FastAPI):
     print("Initializing embedding extractor...")
     embedding_extractor = create_embedding_extractor(pipeline)
     print(f"   Embedding dimension: {embedding_extractor.get_embedding_dim()}")
+
+    # Person Re-ID (OSNet)
+    print("Initializing OSNet Re-ID...")
+    try:
+        reid_extractor = create_reid_extractor(
+            pipeline.device,
+            model_name=pipeline.config.reid_model,
+            verbose=True,
+        )
+        pipeline.reid = reid_extractor
+        print("   Re-ID extractor ready.")
+    except Exception as e:
+        print(f"   Warning: Re-ID disabled ({e})")
+        reid_extractor = None
+        pipeline.reid = None
+        pipeline.config.enable_reid = False
     
     print("API ready!")
     
@@ -245,6 +281,39 @@ def generate_object_id() -> str:
     return str(uuid.uuid4())[:8]
 
 
+async def attach_person_identity_to_entity(
+    db,
+    object_id: str,
+    result: AnalysisResult,
+) -> dict:
+    """
+    Store Re-ID embedding and link entity to a person cluster (matched / new / pending).
+    """
+    empty = {
+        "person_id": None,
+        "person_label": None,
+        "is_watchlist": False,
+        "match_score": None,
+        "match_status": None,
+    }
+    if not pipeline or not pipeline.initialized:
+        return empty
+    if result.crop_info.detection.class_name != "person" or result.reid_embedding is None:
+        return empty
+    try:
+        await db.update_entity_reid_embedding(object_id, result.reid_embedding)
+        pinfo = await db.assign_detection_to_person(
+            object_id,
+            result.reid_embedding,
+            pipeline.config.reid_match_threshold,
+            pipeline.config.reid_review_threshold,
+        )
+        return {**empty, **pinfo}
+    except Exception as e:
+        print(f"Warning: person identity assignment failed for {object_id}: {e}")
+        return empty
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -269,6 +338,7 @@ async def health_check():
     return {
         "status": "healthy",
         "pipeline_ready": pipeline is not None and pipeline.initialized,
+        "reid_ready": reid_extractor is not None,
         "total_sessions": session_count,
     }
 
@@ -385,6 +455,8 @@ async def analyze_image(
                     await db.update_entity_embedding(object_id, result.embedding)
                 except Exception as e:
                     print(f"Warning: Failed to store embedding for {object_id}: {e}")
+
+            pinfo = await attach_person_identity_to_entity(db, object_id, result)
             
             # Use URL instead of base64 encoding (much faster)
             crop_image_url = f"/api/image/crop/{object_id}"
@@ -399,6 +471,7 @@ async def analyze_image(
                 "analysis": result.analysis_text,
                 "reason": result.reason,
                 "crop_image": crop_image_url,
+                **pinfo,
             })
         
         return response_data
@@ -483,7 +556,7 @@ async def ask_about_object(
             expanded_box=(entity.box_x1, entity.box_y1, entity.box_x2, entity.box_y2),
         )
         
-        answer, _ = pipeline.analyze_single_crop(crop_info, prompt=prompt)  # Discard embedding for Q&A
+        answer, _, _ = pipeline.analyze_single_crop(crop_info, prompt=prompt)  # Discard embeddings for Q&A
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"VLM inference failed: {str(e)}")
     
@@ -646,6 +719,8 @@ async def analyze_full_stream(
                             await db.update_entity_embedding(object_id, result.embedding)
                         except Exception as e:
                             print(f"Warning: Failed to store embedding: {e}")
+
+                    pinfo = await attach_person_identity_to_entity(db, object_id, result)
                     
                     # Use URL instead of base64 encoding (much faster)
                     crop_image_url = f"/api/image/crop/{object_id}"
@@ -660,6 +735,7 @@ async def analyze_full_stream(
                         "analysis": result.analysis_text,
                         "reason": result.reason,
                         "crop_image": crop_image_url,
+                        **pinfo,
                     })
                 except Exception as e:
                     print(f"Error processing result: {e}")
@@ -740,6 +816,11 @@ async def get_session_details(session_id: str):
             "analysis": e.initial_analysis,
             "crop_image": f"data:image/jpeg;base64,{crop_b64}" if crop_b64 else None,
             "created_at": e.created_at,
+            "person_id": e.person_id,
+            "person_label": e.person_label,
+            "is_watchlist": e.person_is_watchlist,
+            "match_score": e.match_score,
+            "match_status": e.match_status,
         })
     
     return {
@@ -1068,6 +1149,177 @@ async def search_by_image(
         "results": formatted,
         "count": len(formatted),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PERSON / RE-ID ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/persons")
+async def list_persons_api(
+    watchlist: bool = Query(False, description="Only suspects on watchlist"),
+    limit: int = Query(80, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    db = await get_db()
+    persons = await db.list_persons(watchlist_only=watchlist, limit=limit, offset=offset)
+    out = []
+    for p in persons:
+        rep_url = None
+        if p.representative_entity_id:
+            rep_url = f"/api/image/crop/{p.representative_entity_id}"
+        out.append({
+            "person_id": p.person_id,
+            "label": p.label,
+            "is_watchlist": p.is_watchlist,
+            "notes": p.notes,
+            "sighting_count": p.sighting_count,
+            "representative_entity_id": p.representative_entity_id,
+            "representative_crop_url": rep_url,
+            "created_at": p.created_at,
+            "updated_at": p.updated_at,
+        })
+    return {"persons": out, "count": len(out)}
+
+
+@app.get("/api/persons/{person_id}")
+async def get_person_detail(person_id: str):
+    db = await get_db()
+    p = await db.get_person(person_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Person not found")
+    sightings = await db.get_person_sightings(person_id)
+    rep_url = (
+        f"/api/image/crop/{p.representative_entity_id}"
+        if p.representative_entity_id
+        else None
+    )
+    sight_list = []
+    for e in sightings:
+        sight_list.append({
+            "object_id": e.object_id,
+            "session_id": e.session_id,
+            "confidence": e.confidence,
+            "box": [e.box_x1, e.box_y1, e.box_x2, e.box_y2],
+            "stage": e.stage,
+            "analysis": e.initial_analysis,
+            "crop_image": f"/api/image/crop/{e.object_id}",
+            "created_at": e.created_at,
+        })
+    return {
+        "person_id": p.person_id,
+        "label": p.label,
+        "is_watchlist": p.is_watchlist,
+        "notes": p.notes,
+        "sighting_count": p.sighting_count,
+        "representative_entity_id": p.representative_entity_id,
+        "representative_crop_url": rep_url,
+        "created_at": p.created_at,
+        "updated_at": p.updated_at,
+        "sightings": sight_list,
+    }
+
+
+@app.patch("/api/persons/{person_id}")
+async def patch_person(person_id: str, body: PersonPatchRequest):
+    db = await get_db()
+    ok = await db.update_person(
+        person_id,
+        label=body.label,
+        is_watchlist=body.is_watchlist,
+        notes=body.notes,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Person not found or nothing to update")
+    p = await db.get_person(person_id)
+    return {"success": True, "person": {"person_id": p.person_id, "label": p.label, "is_watchlist": p.is_watchlist, "notes": p.notes}}
+
+
+@app.delete("/api/persons/{person_id}")
+async def remove_person(person_id: str):
+    db = await get_db()
+    ok = await db.delete_person(person_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Person not found")
+    return {"success": True, "person_id": person_id}
+
+
+@app.post("/api/persons/{person_id}/merge")
+async def merge_person_endpoint(person_id: str, body: PersonMergeRequest):
+    db = await get_db()
+    ok = await db.merge_persons(person_id, body.other_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Merge failed (check IDs)")
+    return {"success": True, "kept_person_id": person_id, "removed_person_id": body.other_id}
+
+
+@app.post("/api/entity/{object_id}/assign")
+async def assign_entity_to_person(object_id: str, body: EntityAssignRequest):
+    db = await get_db()
+    entity = await db.get_entity(object_id)
+    if not entity:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    ok = await db.reassign_entity(object_id, body.person_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Assignment failed")
+    updated = await db.get_entity(object_id)
+    return {
+        "success": True,
+        "object_id": object_id,
+        "person_id": updated.person_id if updated else body.person_id,
+        "person_label": updated.person_label if updated else None,
+        "is_watchlist": updated.person_is_watchlist if updated else False,
+        "match_status": updated.match_status if updated else "matched",
+    }
+
+
+@app.post("/api/persons/search")
+async def search_persons_by_photo(
+    file: UploadFile = File(...),
+    limit: int = Query(15, ge=1, le=50),
+    min_similarity: float = Query(0.2, ge=0.0, le=1.0),
+):
+    """
+    Upload a photo; uses largest person crop (or full frame) to search person clusters.
+    """
+    if not pipeline or not pipeline.initialized:
+        raise HTTPException(status_code=503, detail="Pipeline not ready")
+    if not reid_extractor:
+        raise HTTPException(status_code=503, detail="Re-ID not available")
+    image = await load_upload_image(file)
+    image_pil, image_cv, detections = pipeline.detect(image)
+    person_dets = [d for d in detections if d.class_name == "person"]
+    if not person_dets:
+        query_emb = reid_extractor.generate_embedding(image_pil)
+    else:
+        largest = max(
+            person_dets,
+            key=lambda d: (d.box[2] - d.box[0]) * (d.box[3] - d.box[1]),
+        )
+        crops = pipeline.extract_crops(image_cv, [largest])
+        query_emb = reid_extractor.generate_embedding(crops[0].crop_image)
+
+    db = await get_db()
+    scored = await db.search_persons_by_embedding(
+        query_emb, limit=limit, min_similarity=min_similarity
+    )
+    formatted = []
+    for p, sim in scored:
+        rep_url = (
+            f"/api/image/crop/{p.representative_entity_id}"
+            if p.representative_entity_id
+            else None
+        )
+        formatted.append({
+            "person_id": p.person_id,
+            "label": p.label,
+            "is_watchlist": p.is_watchlist,
+            "sighting_count": p.sighting_count,
+            "similarity": round(sim, 4),
+            "representative_crop_url": rep_url,
+        })
+    return {"results": formatted, "count": len(formatted)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

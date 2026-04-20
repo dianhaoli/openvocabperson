@@ -17,7 +17,10 @@ import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import AsyncGenerator, Optional
+from typing import TYPE_CHECKING, AsyncGenerator, Optional
+
+if TYPE_CHECKING:
+    from reid import OSNetReIDExtractor
 
 import cv2
 import numpy as np
@@ -119,6 +122,12 @@ class PipelineConfig:
     # ── Async Settings ──
     max_workers: int = 2  # Thread pool workers
 
+    # ── Person Re-ID (OSNet) ──
+    reid_model: str = "osnet_x1_0"
+    reid_match_threshold: float = 0.75
+    reid_review_threshold: float = 0.60
+    enable_reid: bool = True
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SIZE-AWARE BATCHING
@@ -192,11 +201,8 @@ ANALYSIS_PROMPT = """Answer only what is directly visible. Do not infer intent, 
 
 A. Actions visible now?
 B. Objects person is interacting with?
-C. Clothing (non-sensitive)?
-D. What's NOT visible/uncertain?
-E. Visibility limitations?
-
-Be concise."""
+C. Clothing?
+Be concise. Answer each in 6 words or less."""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -228,8 +234,9 @@ class AnalysisResult:
     stage: ProcessingStage
     analysis_text: Optional[str] = None
     reason: Optional[str] = None  # Why this stage was chosen
-    embedding: Optional[np.ndarray] = None  # Visual embedding for similarity search
-    
+    embedding: Optional[np.ndarray] = None  # VLM visual embedding for similarity search
+    reid_embedding: Optional[np.ndarray] = None  # OSNet 512-D person Re-ID (VLM_FULL persons only)
+
     def to_dict(self) -> dict:
         return {
             "index": self.crop_info.detection.index,
@@ -282,7 +289,11 @@ class HierarchicalPipeline:
         results = pipeline.analyze(image_path)
     """
     
-    def __init__(self, config: Optional[PipelineConfig] = None):
+    def __init__(
+        self,
+        config: Optional[PipelineConfig] = None,
+        reid_extractor: Optional["OSNetReIDExtractor"] = None,
+    ):
         self.config = config or PipelineConfig()
         self.yolo = None
         self.vlm = None
@@ -290,6 +301,7 @@ class HierarchicalPipeline:
         self.device = None
         self.initialized = False
         self.executor = ThreadPoolExecutor(max_workers=self.config.max_workers)
+        self.reid = reid_extractor  # optional OSNet extractor; set after load if needed
     
     # ──────────────────────────────────────────────────────────────────────────
     # INITIALIZATION
@@ -318,13 +330,34 @@ class HierarchicalPipeline:
         # Previously only checked for CUDA, falling back to CPU even when MPS was available.
         # This caused a device mismatch: model loaded on MPS via device_map="auto",
         # but inputs sent to CPU, resulting in slow inference and warnings.
+        
+        # Add diagnostic output
+        print(f"   Checking devices...")
+        print(f"      PyTorch version: {torch.__version__}")
+        print(f"      CUDA available: {torch.cuda.is_available()}")
+        
+        # Check MPS availability more carefully
+        mps_available = False
+        try:
+            if hasattr(torch.backends, 'mps'):
+                if hasattr(torch.backends.mps, 'is_available'):
+                    mps_available = torch.backends.mps.is_available()
+                    print(f"      MPS available: {mps_available}")
+                else:
+                    print(f"      MPS backend exists but is_available() not found")
+            else:
+                print(f"      MPS backend not available in this PyTorch build")
+        except Exception as e:
+            print(f"      MPS check failed: {e}")
+            mps_available = False
+        
         if torch.cuda.is_available():
             self.device = "cuda"
-        elif torch.backends.mps.is_available():
+        elif mps_available:
             self.device = "mps"
         else:
             self.device = "cpu"
-        print(f"   Device: {self.device}")
+        print(f"   Device selected: {self.device}")
         
         # ── Load VLM with Optimizations ──
         self._load_vlm_optimized()
@@ -372,8 +405,16 @@ class HierarchicalPipeline:
         # ── Load Model ──
         load_kwargs = {
             "torch_dtype": torch.float16,
-            "device_map": "auto",
         }
+        
+        # FIX: Explicitly set device for MPS instead of device_map="auto"
+        # device_map="auto" doesn't properly handle MPS and may place model on CPU
+        if self.device == "mps":
+            load_kwargs["device_map"] = "mps"
+        elif self.device == "cuda":
+            load_kwargs["device_map"] = "auto"
+        else:
+            load_kwargs["device_map"] = "cpu"
         
         if quantization_config:
             load_kwargs["quantization_config"] = quantization_config
@@ -388,6 +429,16 @@ class HierarchicalPipeline:
             self.config.vlm_model_id,
             **load_kwargs
         )
+        
+        # FIX: Verify model is actually on the expected device
+        # Some layers might have been placed elsewhere by device_map
+        if self.device in ("mps", "cuda"):
+            model_device = next(self.vlm.parameters()).device
+            if str(model_device) != self.device:
+                print(f"   ⚠ Warning: Model loaded on {model_device}, expected {self.device}")
+                print(f"   Moving model to {self.device}...")
+                self.vlm = self.vlm.to(self.device)
+        
         self.processor = AutoProcessor.from_pretrained(self.config.vlm_model_id)
         
         # Fix padding side for decoder-only models
@@ -536,7 +587,7 @@ class HierarchicalPipeline:
         self,
         crops: list[CropInfo],
         prompt: str = ANALYSIS_PROMPT,
-    ) -> tuple[list[str], list[np.ndarray]]:
+    ) -> tuple[list[str], list[np.ndarray], list[Optional[np.ndarray]]]:
         """
         Analyze multiple crops in batches using VLM.
         
@@ -545,10 +596,10 @@ class HierarchicalPipeline:
         VLM attention cost scales superlinearly with image size.
         
         Returns:
-            tuple: (list of analysis texts, list of embeddings per crop)
+            tuple: (analysis texts, VLM embeddings, Re-ID embeddings per crop)
         """
         if not crops:
-            return [], []
+            return [], [], []
         
         # Calculate max total area budget: batch_size * reference_area
         max_total_area = self.config.batch_size * self.config.reference_area
@@ -559,20 +610,23 @@ class HierarchicalPipeline:
         # Process batches and maintain original crop order for results
         crop_to_result = {}
         crop_to_embedding = {}
+        crop_to_reid = {}
         
         for batch in batches:
-            batch_results, batch_embeddings = self._analyze_batch(batch, prompt)
+            batch_results, batch_embeddings, batch_reid = self._analyze_batch(batch, prompt)
             for i, crop in enumerate(batch):
                 crop_to_result[id(crop)] = batch_results[i]
                 crop_to_embedding[id(crop)] = batch_embeddings[i]
+                crop_to_reid[id(crop)] = batch_reid[i]
         
         # Return results in original crop order
         analyses = [crop_to_result[id(crop)] for crop in crops]
         embeddings = [crop_to_embedding[id(crop)] for crop in crops]
+        reid_embs = [crop_to_reid[id(crop)] for crop in crops]
         
-        return analyses, embeddings
+        return analyses, embeddings, reid_embs
     
-    def _analyze_batch(self, batch: list[CropInfo], prompt: str) -> tuple[list[str], np.ndarray]:
+    def _analyze_batch(self, batch: list[CropInfo], prompt: str) -> tuple[list[str], np.ndarray, list[Optional[np.ndarray]]]:
         """
         Analyze a batch of crops in a single forward pass.
         
@@ -581,10 +635,10 @@ class HierarchicalPipeline:
         - One generation pass for text analysis
         
         Returns:
-            tuple: (list of analysis texts, numpy array of embeddings)
+            tuple: (analysis texts, VLM embedding array [B, D], Re-ID list per crop)
         """
         if not batch:
-            return [], np.array([])
+            return [], np.array([]), []
         
         # Build batch of messages
         conversations = []
@@ -725,20 +779,35 @@ class HierarchicalPipeline:
                 response = ""
             
             responses.append(response)
+
+        # Person Re-ID (OSNet) on VLM batch — all crops here are priority-class persons
+        reid_list: list[Optional[np.ndarray]] = [None] * len(batch)
+        if (
+            self.reid is not None
+            and self.config.enable_reid
+            and all(c.detection.class_name in self.config.priority_classes for c in batch)
+        ):
+            try:
+                reid_mat = self.reid.generate_embeddings_batch([c.crop_image for c in batch])
+                for i in range(len(batch)):
+                    reid_list[i] = reid_mat[i].astype(np.float32, copy=False)
+            except Exception as e:
+                print(f"Warning: Re-ID embedding failed: {e}")
         
-        return responses, embeddings
+        return responses, embeddings, reid_list
     
-    def analyze_single_crop(self, crop_info: CropInfo, prompt: str = ANALYSIS_PROMPT) -> tuple[str, np.ndarray]:
+    def analyze_single_crop(self, crop_info: CropInfo, prompt: str = ANALYSIS_PROMPT) -> tuple[str, np.ndarray, Optional[np.ndarray]]:
         """
         Analyze a single crop (for streaming or individual analysis).
         
         Returns:
-            tuple: (analysis text, embedding vector)
+            tuple: (analysis text, VLM embedding, optional Re-ID embedding)
         """
-        results, embeddings = self._analyze_batch([crop_info], prompt)
+        results, embeddings, reid_embs = self._analyze_batch([crop_info], prompt)
         text = results[0] if results else ""
         embedding = embeddings[0] if len(embeddings) > 0 else np.zeros(1536)
-        return text, embedding
+        reid_emb = reid_embs[0] if reid_embs else None
+        return text, embedding, reid_emb
     
     # ──────────────────────────────────────────────────────────────────────────
     # MAIN ANALYSIS (SYNCHRONOUS)
@@ -795,15 +864,18 @@ class HierarchicalPipeline:
         vlm_crops = routed[ProcessingStage.VLM_FULL]
         if vlm_crops:
             print(f"\nAnalyzing {len(vlm_crops)} crops with VLM...")
-            analyses, embeddings = self.analyze_crops_batched(vlm_crops, prompt)
+            analyses, embeddings, reid_embs = self.analyze_crops_batched(vlm_crops, prompt)
             
-            for crop_info, analysis, embedding in zip(vlm_crops, analyses, embeddings):
+            for crop_info, analysis, embedding, reid_emb in zip(
+                vlm_crops, analyses, embeddings, reid_embs
+            ):
                 results.append(AnalysisResult(
                     crop_info=crop_info,
                     stage=ProcessingStage.VLM_FULL,
                     analysis_text=analysis,
                     reason="High confidence, priority class",
                     embedding=embedding,
+                    reid_embedding=reid_emb,
                 ))
         
         # Sort by original detection index
@@ -907,22 +979,24 @@ class HierarchicalPipeline:
                 # Brief blocking is acceptable for GPU inference (typically fast).
                 if self.device in ("cuda", "mps"):
                     # Run directly to avoid deadlocks with PyTorch GPU operations
-                    analyses, embeddings = self._analyze_batch(batch, prompt)
+                    analyses, embeddings, reid_embs = self._analyze_batch(batch, prompt)
                 else:
                     # CPU operations are fine in executor
-                    analyses, embeddings = await loop.run_in_executor(
+                    analyses, embeddings, reid_embs = await loop.run_in_executor(
                         self.executor, self._analyze_batch, batch, prompt
                     )
                 
                 # Yield each result in the batch with embeddings
                 for i, (crop_info, analysis) in enumerate(zip(batch, analyses)):
                     embedding = embeddings[i] if i < len(embeddings) else None
+                    reid_emb = reid_embs[i] if i < len(reid_embs) else None
                     result = AnalysisResult(
                         crop_info=crop_info,
                         stage=ProcessingStage.VLM_FULL,
                         analysis_text=analysis,
                         reason="Full VLM analysis",
                         embedding=embedding,
+                        reid_embedding=reid_emb,
                     )
                     yield StreamEvent(
                         event_type="crop_analyzed",

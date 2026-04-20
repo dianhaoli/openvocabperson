@@ -1,6 +1,6 @@
 # Open-Vocabulary Person Analysis Pipeline
 
-A production-ready hierarchical vision system that combines **YOLO** for fast detection with **Qwen2.5-VL** Vision-Language Model for detailed person analysis. Features natural language search, image similarity matching, and interactive Q&A.
+A production-ready hierarchical vision system that combines **YOLO** for fast detection with **Qwen2.5-VL** Vision-Language Model for detailed person analysis. Features natural language search, image similarity matching, and interactive Q&A. Person detections also get a **512-D OSNet Re-ID** embedding: each crop is matched against a persistent **person cluster** (centroid in PostgreSQL/pgvector), so the same individual can be recognized across separate uploads, promoted to a named **watchlist suspect**, and surfaced with match badges in the UI.
 
 ![Demo](https://github.com/user-attachments/assets/81d30065-eaf9-461d-bddb-ee7183e1b14b)
 
@@ -17,6 +17,7 @@ A production-ready hierarchical vision system that combines **YOLO** for fast de
 | **Hierarchical Detection** | YOLO → Class Filter → VLM routing saves compute by only running expensive VLM on priority detections |
 | **Natural Language Search** | Full-text search on VLM analysis ("person wearing red jacket") |
 | **Image Similarity** | Upload an image to find visually similar people using vector embeddings |
+| **Cross-upload identity** | Re-ID cosine match vs cluster centroids: auto-clusters, watchlist suspects, manual assign/merge; VLM 1536-d embeddings unchanged for semantic / hybrid search |
 | **Hybrid Search** | Combine text + image queries with configurable weights |
 | **Follow-up Q&A** | Ask questions about specific detected people |
 | **Streaming Results** | SSE streaming for real-time progress updates |
@@ -56,6 +57,7 @@ A production-ready hierarchical vision system that combines **YOLO** for fast de
 │  • Batched inference with size-aware batching                    │
 │  • Extracts: actions, clothing, objects, visibility              │
 │  • Generates embeddings for similarity search                    │
+│  • OSNet Re-ID (512-d) on full-VLM person crops only             │
 └─────────────────────────────────┬───────────────────────────────┘
                                   ▼
 ┌─────────────────────────────────────────────────────────────────┐
@@ -63,8 +65,29 @@ A production-ready hierarchical vision system that combines **YOLO** for fast de
 │  • Sessions & entities with image paths                          │
 │  • Full-text search index (GIN)                                  │
 │  • Vector similarity index (HNSW)                                │
+│  • Person clusters: centroid (Re-ID) + optional watchlist flag   │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### Cross-upload matching (Re-ID + centroids)
+
+VLM embeddings continue to power **text and image-semantic** search. **Identity** across uploads uses **torchreid OSNet** (`osnet_x1_0`, MSMT17 weights): greedy cosine similarity against each person’s **running-mean centroid**; new sightings update the centroid. Defaults: **matched** if best similarity ≥ `reid_match_threshold` (0.75), **new** auto-cluster if the best score is below `reid_review_threshold` (0.60), **pending** in between (needs review). Tune per scene in `PipelineConfig`. If Re-ID fails to initialize (e.g. missing deps), the pipeline disables it and analysis still runs.
+
+```mermaid
+flowchart LR
+    Upload[New image] --> YOLO[YOLO person crops]
+    YOLO --> VLM[VLM + 1536-d embedding]
+    YOLO --> ReID[OSNet 512-d Re-ID]
+    ReID --> Match{Cosine vs centroids}
+    Match -->|sim >= 0.75| Link[Link person]
+    Match -->|sim < 0.6| NewId[New cluster]
+    Match -->|0.6 - 0.75| Pending[Pending review]
+    Link --> UpdateCentroid[Update centroid mean]
+    NewId --> UpdateCentroid
+    UpdateCentroid --> Response[Badges in API/UI]
+```
+
+**Not in v1:** temporal/video tracking (Kalman, DeepSORT), face recognition, or multi-camera calibration—this is **cross-image** body Re-ID only (clothing changes limit robustness).
 
 ---
 
@@ -76,6 +99,8 @@ A production-ready hierarchical vision system that combines **YOLO** for fast de
 ├── pipeline.py             # Hierarchical detection/analysis pipeline
 ├── database.py             # PostgreSQL + pgvector hybrid search
 ├── embeddings.py           # Image embedding extraction from VLM
+├── reid.py                 # OSNet Re-ID extractor (512-d, mirrors embeddings API shape)
+├── person_matcher.py       # Threshold rules: matched / new / pending vs top centroid matches
 ├── storage_utils.py        # Image storage utilities
 ├── demo.py                 # CLI demo for testing
 ├── model.ipynb             # Development notebook
@@ -107,7 +132,7 @@ A production-ready hierarchical vision system that combines **YOLO** for fast de
 │   └── vite.config.ts      # Vite build configuration
 │
 ├── static/                 # Legacy static frontend (index.html)
-│   └── index.html          # Simple HTML/JS frontend
+│   └── index.html          # Simple HTML/JS frontend (upload, search, **Persons** watchlist / auto-clusters, match badges)
 │
 └── storage/                # Image storage (gitignored)
     ├── sessions/           # Full session images
@@ -239,6 +264,18 @@ The application will use sensible defaults if environment variables are not set.
 | `/api/session/{id}` | DELETE | Delete session and entities |
 | `/api/image/{type}/{id}` | GET | Serve stored images (type: `session` or `crop`) |
 
+### Person identity (Re-ID clusters)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/persons` | GET | List clusters; `watchlist=true` for named suspects only (`limit`, `offset`) |
+| `/api/persons/{person_id}` | GET | Detail + all linked sightings |
+| `/api/persons/{person_id}` | PATCH | Set `label`, `is_watchlist`, `notes` (promote auto-cluster → suspect) |
+| `/api/persons/{person_id}` | DELETE | Remove person row (entity links cleared) |
+| `/api/persons/{person_id}/merge` | POST | Body `{ "other_id" }` — merge another cluster into this one |
+| `/api/entity/{object_id}/assign` | POST | Body `{ "person_id" }` — manual correction / reassignment |
+| `/api/persons/search` | POST | Upload query image; rank persons by Re-ID similarity (“look up by photo”) |
+
 ### Request/Response Examples
 
 #### Analyze Image
@@ -262,11 +299,18 @@ curl -X POST -F "file=@image.jpg" http://localhost:8000/analyze
       "stage": "vlm_full",
       "analysis": "A. Standing, walking. B. Holding phone. C. Dark jacket, jeans. D. Face partially obscured. E. Good visibility.",
       "box": [120, 50, 280, 400],
-      "crop_image": "data:image/jpeg;base64,..."
+      "crop_image": "data:image/jpeg;base64,...",
+      "person_id": "p_01hx…",
+      "person_label": "Suspect A",
+      "is_watchlist": true,
+      "match_score": 0.87,
+      "match_status": "matched"
     }
   ]
 }
 ```
+
+`match_status` is one of `matched`, `new`, or `pending` (ambiguous band). Non-person or non–VLM-full rows omit Re-ID linkage fields when Re-ID is disabled or not applicable.
 
 #### Streaming Analysis (SSE)
 
@@ -377,6 +421,12 @@ PipelineConfig(
     
     # Device
     device="auto",                # "auto", "cuda", "mps", or "cpu"
+    
+    # Person Re-ID (OSNet; only VLM_FULL person crops)
+    reid_model="osnet_x1_0",
+    reid_match_threshold=0.75,   # cosine ≥ this → link to existing cluster
+    reid_review_threshold=0.60,   # below this → new auto-cluster; between → pending
+    enable_reid=True,
 )
 ```
 
@@ -393,6 +443,7 @@ PipelineConfig(
 | **SDPA Attention** | 2x faster attention | Auto-enabled in PyTorch 2.0+ |
 | **torch.compile** | 10-20% faster | Disabled with quantization |
 | **pgvector HNSW** | O(log n) search | Approximate nearest neighbor |
+| **OSNet Re-ID** | Small add-on latency | Lightweight backbone; batch runs with VLM crops |
 
 ### Memory Requirements
 
@@ -417,8 +468,9 @@ PipelineConfig(
 |-------|---------|------|--------|
 | [YOLO11-Large](https://docs.ultralytics.com/) | Object detection | 25M params | Ultralytics |
 | [Qwen2.5-VL-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) | Vision-language analysis | 3B params | Alibaba Qwen |
+| [OSNet x1.0](https://github.com/KaiyangZhou/deep-person-reid) (via [torchreid](https://github.com/KaiyangZhou/deep-person-reid)) | Person Re-ID embedding | ~2M params, 512-d | torchreid `pretrained=True` defaults |
 
-Both models are loaded once at startup and reused for all requests. Models are automatically downloaded from Hugging Face on first run.
+YOLO and Qwen load from Hugging Face / Ultralytics on first run; OSNet is pulled in by **torchreid** (see `requirements.txt`, including **gdown** when weights download is needed). All are initialized once at API startup and reused per request.
 
 ---
 
@@ -433,6 +485,7 @@ Both models are loaded once at startup and reused for all requests. Models are a
 - **Ultralytics YOLO** - Object detection
 - **PostgreSQL** - Relational database
 - **pgvector** - Vector similarity extension
+- **torchreid** - OSNet person Re-ID
 
 ### Frontend
 - **React 19** - UI framework
@@ -631,6 +684,14 @@ Requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-nat
 - Verify full-text search index exists
 - Check database logs for errors
 
+#### Person match / Re-ID unavailable
+
+**Problem**: Analyze responses lack `person_id` / `match_status`, or `/api/persons/search` returns 503.
+
+**Solutions**:
+- Install backend deps: `pip install -r requirements.txt` (includes **torchreid** and **gdown**)
+- Check API startup logs for `Initializing OSNet Re-ID...` vs `Warning: Re-ID disabled (...)`; on failure the server sets `enable_reid=False` and continues without identity linking
+
 ### Debug Mode
 
 Enable debug logging:
@@ -704,6 +765,14 @@ CREATE INDEX idx_entities_analysis ON entities USING GIN (to_tsvector('english',
 CREATE INDEX idx_entities_embedding ON entities USING hnsw (embedding vector_cosine_ops);
 ```
 
+### Persons table (identity clusters)
+
+Running schema is created in `database.py` (with pgvector optional). Conceptually:
+
+- **`persons`**: `id`, optional `label`, `is_watchlist`, `notes`, `sighting_count`, **Re-ID centroid** (`vector(512)` when pgvector is available, plus JSON fallback for portability), `representative_entity_id`, timestamps.
+- **`entities`** extensions: `reid_embedding` (512-d), `person_id` (FK), `match_score`, `match_status` (`matched`, `new`, `pending`).
+- **Indexes**: HNSW on person centroids (cosine), btree on `entities(person_id)`, partial index on watchlist flag.
+
 ---
 
 ## License
@@ -716,6 +785,7 @@ MIT
 
 - [Qwen2.5-VL](https://github.com/QwenLM/Qwen2-VL) by Alibaba
 - [Ultralytics YOLO](https://github.com/ultralytics/ultralytics)
+- [torchreid / OSNet](https://github.com/KaiyangZhou/deep-person-reid)
 - [pgvector](https://github.com/pgvector/pgvector)
 - [FastAPI](https://fastapi.tiangolo.com/)
 - [React](https://react.dev/)
@@ -733,20 +803,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 5. Open a Pull Request
 
 ---
-
-## Roadmap
-
-- [ ] Support for multiple object classes (not just person)
-- [ ] Real-time video stream analysis
-- [ ] Advanced filtering and sorting in search
-- [ ] Export search results to CSV/JSON
-- [ ] Batch image upload
-- [ ] User authentication and multi-tenancy
-- [ ] API rate limiting
-- [ ] WebSocket support for real-time updates
-
----
-
-## Support
-
-For issues, questions, or contributions, please open an issue on GitHub.

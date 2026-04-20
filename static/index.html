@@ -1,5 +1,3 @@
-<!-- legacy html file, no longer used -->
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -146,9 +144,9 @@
         
         .sidebar-tab {
             flex: 1;
-            padding: 0.75rem 1rem;
+            padding: 0.75rem 0.5rem;
             font-family: inherit;
-            font-size: 0.85rem;
+            font-size: 0.78rem;
             font-weight: 500;
             color: var(--text-secondary);
             background: none;
@@ -171,6 +169,57 @@
             background: var(--bg-secondary);
             border-bottom: 2px solid var(--accent);
         }
+
+        .badge-identity {
+            display: inline-block;
+            margin-top: 0.35rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 6px;
+            font-size: 0.72rem;
+            font-weight: 500;
+        }
+        .badge-identity.matched-watch {
+            background: var(--success-soft);
+            color: var(--success);
+            border: 1px solid rgba(34, 197, 94, 0.35);
+        }
+        .badge-identity.matched-auto {
+            background: rgba(99, 102, 241, 0.12);
+            color: #a5b4fc;
+            border: 1px solid var(--accent-border);
+        }
+        .badge-identity.new-id {
+            background: rgba(245, 158, 11, 0.12);
+            color: var(--warning);
+        }
+        .badge-identity.pending {
+            background: rgba(96, 96, 112, 0.25);
+            color: var(--text-secondary);
+        }
+
+        .person-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 0.75rem;
+            margin-bottom: 0.6rem;
+            display: flex;
+            gap: 0.75rem;
+            align-items: center;
+        }
+        .person-card img { width: 48px; height: 64px; object-fit: cover; border-radius: 6px; }
+        .person-card-info { flex: 1; min-width: 0; font-size: 0.8rem; }
+        .person-card-actions { display: flex; flex-direction: column; gap: 0.35rem; }
+        .person-mini-btn {
+            font-size: 0.72rem;
+            padding: 0.25rem 0.5rem;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            cursor: pointer;
+        }
+        .person-mini-btn:hover { border-color: var(--accent); color: var(--accent); }
         
         .tab-content {
             display: none;
@@ -1256,6 +1305,9 @@
                 <button class="sidebar-tab" data-tab="history" id="tabHistory">
                     History
                 </button>
+                <button class="sidebar-tab" data-tab="persons" id="tabPersons">
+                    Persons
+                </button>
             </div>
             
             <div class="sidebar-content">
@@ -1350,6 +1402,24 @@
                 </div>
                 
                 <!-- History Tab Content -->
+                <div class="tab-content" id="personsTab">
+                    <div class="card">
+                        <div class="card-title">Suspect watchlist</div>
+                        <button class="person-mini-btn" type="button" id="refreshPersonsBtn" style="margin-bottom:0.75rem;">Refresh</button>
+                        <div id="watchlistPersons"></div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Auto clusters</div>
+                        <div id="autoPersons"></div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Look up person (photo)</div>
+                        <input type="file" id="personSearchFile" accept="image/*" style="width:100%;margin-bottom:0.5rem;">
+                        <button class="search-btn" type="button" id="personSearchBtn">Search persons</button>
+                        <div id="personSearchResults" style="margin-top:0.75rem;"></div>
+                    </div>
+                </div>
+
                 <div class="tab-content" id="historyTab">
                     <div class="history-header">
                         <div class="card-title" style="margin-bottom: 0;">Past Sessions</div>
@@ -1424,6 +1494,18 @@
                     <div class="meta-item">
                         <div class="meta-label">Stage</div>
                         <div class="meta-value" id="metaStage">vlm_full</div>
+                    </div>
+                    <div class="meta-item" id="metaPersonRow" style="display: none;">
+                        <div class="meta-label">Identity</div>
+                        <div class="meta-value" id="metaPerson">—</div>
+                    </div>
+                </div>
+
+                <div class="identity-actions" id="identityActions" style="display: none;">
+                    <div class="card-title" style="margin-top: 0.75rem;">Link to person</div>
+                    <div style="display:flex; gap:0.5rem; margin-top:0.35rem;">
+                        <input type="text" id="assignPersonIdInput" placeholder="person_id" class="search-input" style="flex:1;">
+                        <button class="qa-send-btn" type="button" id="assignPersonBtn">Assign</button>
                     </div>
                 </div>
 
@@ -1697,6 +1779,22 @@
             metaConf.textContent = (entity.confidence * 100).toFixed(0) + '%';
             metaId.textContent = entity.object_id;
             metaStage.textContent = entity.stage.replace('_', ' ');
+
+            const metaPersonRow = document.getElementById('metaPersonRow');
+            const metaPerson = document.getElementById('metaPerson');
+            const identityActions = document.getElementById('identityActions');
+            if (entity.match_status) {
+                metaPersonRow.style.display = 'block';
+                let bits = [entity.match_status];
+                if (entity.person_label) bits.push(entity.person_label);
+                if (entity.person_id) bits.push('id:' + entity.person_id);
+                if (entity.match_score != null && entity.match_score !== undefined)
+                    bits.push((Number(entity.match_score) * 100).toFixed(0) + '%');
+                metaPerson.textContent = bits.join(' · ');
+            } else {
+                metaPersonRow.style.display = 'none';
+            }
+            identityActions.style.display = (entity.class === 'person') ? 'block' : 'none';
             
             if (entity.analysis) {
                 initialAnalysis.textContent = entity.analysis;
@@ -1895,6 +1993,32 @@
         // ══════════════════════════════════════════════════════════════════════
         // DISPLAY RESULTS GRID
         // ══════════════════════════════════════════════════════════════════════
+        function escapeHtml(s) {
+            if (s == null || s === '') return '';
+            return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+
+        function formatIdentityBadge(result) {
+            const st = result.match_status;
+            if (!st) return '';
+            const pct = (result.match_score != null && result.match_score !== undefined)
+                ? (Number(result.match_score) * 100).toFixed(0) + '%' : '';
+            if (st === 'matched' && result.is_watchlist) {
+                return `<div class="badge-identity matched-watch">Matched: ${escapeHtml(result.person_label || 'Suspect')}${pct ? ' · ' + pct : ''}</div>`;
+            }
+            if (st === 'matched') {
+                const lbl = result.person_label || ('#' + String(result.person_id || '').slice(0, 8));
+                return `<div class="badge-identity matched-auto">Cluster ${escapeHtml(lbl)}${pct ? ' · ' + pct : ''}</div>`;
+            }
+            if (st === 'new') {
+                return `<div class="badge-identity new-id">New identity</div>`;
+            }
+            if (st === 'pending') {
+                return `<div class="badge-identity pending">Needs review${pct ? ' · ' + pct : ''}</div>`;
+            }
+            return '';
+        }
+
         function displayResults(results, elapsed) {
             resultsGrid.innerHTML = '';
             
@@ -1933,6 +2057,7 @@
                     </div>
                     <div class="result-content">
                         <div class="result-index">Detection #${result.index} • ID: ${result.object_id}</div>
+                        ${formatIdentityBadge(result)}
                         <div class="result-analysis ${hasAnalysis ? '' : 'empty'}">
                             ${hasAnalysis ? result.analysis : (result.reason || 'No analysis')}
                         </div>
@@ -2007,8 +2132,10 @@
         // ══════════════════════════════════════════════════════════════════════
         const tabUpload = document.getElementById('tabUpload');
         const tabHistory = document.getElementById('tabHistory');
+        const tabPersons = document.getElementById('tabPersons');
         const uploadTab = document.getElementById('uploadTab');
         const historyTab = document.getElementById('historyTab');
+        const personsTab = document.getElementById('personsTab');
         const historyList = document.getElementById('historyList');
         const historyCount = document.getElementById('historyCount');
         const loadMoreBtn = document.getElementById('loadMoreBtn');
@@ -2049,15 +2176,21 @@
             switchTab('history');
             loadHistory(true);
         });
+        tabPersons.addEventListener('click', () => {
+            switchTab('persons');
+            loadPersons();
+        });
 
         function switchTab(tab) {
             // Remove active from all tabs
             tabUpload.classList.remove('active');
             tabSearch.classList.remove('active');
             tabHistory.classList.remove('active');
+            tabPersons.classList.remove('active');
             uploadTab.classList.remove('active');
             searchTab.classList.remove('active');
             historyTab.classList.remove('active');
+            personsTab.classList.remove('active');
             
             // Activate selected tab
             if (tab === 'upload') {
@@ -2066,11 +2199,137 @@
             } else if (tab === 'search') {
                 tabSearch.classList.add('active');
                 searchTab.classList.add('active');
+            } else if (tab === 'persons') {
+                tabPersons.classList.add('active');
+                personsTab.classList.add('active');
             } else {
                 tabHistory.classList.add('active');
                 historyTab.classList.add('active');
             }
         }
+
+        async function loadPersons() {
+            const wlEl = document.getElementById('watchlistPersons');
+            const autoEl = document.getElementById('autoPersons');
+            wlEl.innerHTML = '<div class="log-entry info">Loading…</div>';
+            autoEl.innerHTML = '';
+            try {
+                const res = await fetch('/api/persons?watchlist=false&limit=200&offset=0');
+                const data = await res.json();
+                const wl = data.persons.filter(p => p.is_watchlist);
+                const auto = data.persons.filter(p => !p.is_watchlist);
+                wlEl.innerHTML = '';
+                autoEl.innerHTML = '';
+                if (!wl.length) wlEl.innerHTML = '<p style="color:var(--text-muted);font-size:0.85rem;">No suspects on watchlist</p>';
+                if (!auto.length) autoEl.innerHTML = '<p style="color:var(--text-muted);font-size:0.85rem;">No auto-clusters yet</p>';
+                wl.forEach(p => wlEl.appendChild(renderPersonCard(p, true)));
+                auto.forEach(p => autoEl.appendChild(renderPersonCard(p, false)));
+            } catch (err) {
+                wlEl.textContent = 'Failed to load persons';
+                console.error(err);
+            }
+        }
+
+        function renderPersonCard(p, onWatchlist) {
+            const div = document.createElement('div');
+            div.className = 'person-card';
+            const img = document.createElement('img');
+            img.src = p.representative_crop_url || '';
+            img.onerror = () => { img.style.display = 'none'; };
+            const info = document.createElement('div');
+            info.className = 'person-card-info';
+            const title = p.label || p.person_id;
+            info.innerHTML = `<strong>${escapeHtml(title)}</strong><br><span style="color:var(--text-muted)">${p.sighting_count} sightings</span>`;
+            const actions = document.createElement('div');
+            actions.className = 'person-card-actions';
+            if (!onWatchlist) {
+                const b = document.createElement('button');
+                b.type = 'button';
+                b.className = 'person-mini-btn';
+                b.textContent = 'Promote';
+                b.addEventListener('click', () => promotePerson(p.person_id));
+                actions.appendChild(b);
+            }
+            div.appendChild(img);
+            div.appendChild(info);
+            div.appendChild(actions);
+            return div;
+        }
+
+        async function promotePerson(personId) {
+            const name = prompt('Suspect label (name)?');
+            if (!name) return;
+            try {
+                const res = await fetch(`/api/persons/${personId}`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ label: name, is_watchlist: true }),
+                });
+                if (!res.ok) throw new Error('Update failed');
+                loadPersons();
+            } catch (e) {
+                alert('Promote failed: ' + e.message);
+            }
+        }
+
+        document.getElementById('refreshPersonsBtn').addEventListener('click', loadPersons);
+
+        document.getElementById('personSearchBtn').addEventListener('click', async () => {
+            const inp = document.getElementById('personSearchFile');
+            const out = document.getElementById('personSearchResults');
+            if (!inp.files || !inp.files[0]) {
+                out.textContent = 'Choose an image first.';
+                return;
+            }
+            out.innerHTML = '<div class="log-entry info">Searching…</div>';
+            const fd = new FormData();
+            fd.append('file', inp.files[0]);
+            try {
+                const res = await fetch('/api/persons/search?limit=15&min_similarity=0.2', { method: 'POST', body: fd });
+                const data = await res.json();
+                if (!data.results || !data.results.length) {
+                    out.innerHTML = '<p style="color:var(--text-muted)">No matching persons.</p>';
+                    return;
+                }
+                out.innerHTML = data.results.map(r => `
+                    <div class="person-card">
+                        <img src="${r.representative_crop_url || ''}" alt="" onerror="this.style.display='none'">
+                        <div class="person-card-info">
+                            <strong>${escapeHtml(r.label || r.person_id)}</strong>
+                            <br><span style="color:var(--text-muted)">sim ${r.similarity} · ${r.sighting_count} sightings</span>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (e) {
+                out.textContent = 'Search failed';
+            }
+        });
+
+        document.getElementById('assignPersonBtn').addEventListener('click', async () => {
+            const pid = document.getElementById('assignPersonIdInput').value.trim();
+            if (!selectedEntityId || !pid) return;
+            try {
+                const res = await fetch(`/api/entity/${selectedEntityId}/assign`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ person_id: pid }),
+                });
+                if (!res.ok) throw new Error('Assign failed');
+                const data = await res.json();
+                const ent = entities.find(e => e.object_id === selectedEntityId);
+                if (ent) {
+                    ent.person_id = data.person_id;
+                    ent.person_label = data.person_label;
+                    ent.is_watchlist = data.is_watchlist;
+                    ent.match_status = data.match_status;
+                }
+                selectEntity(selectedEntityId);
+                displayResults(entities, 0);
+                drawCanvas();
+            } catch (e) {
+                alert(e.message);
+            }
+        });
 
         // ══════════════════════════════════════════════════════════════════════
         // HISTORY MANAGEMENT
@@ -2195,6 +2454,11 @@
                         stage: e.stage,
                         analysis: e.analysis,
                         crop_image: e.crop_image,
+                        person_id: e.person_id,
+                        person_label: e.person_label,
+                        is_watchlist: e.is_watchlist,
+                        match_score: e.match_score,
+                        match_status: e.match_status,
                     }));
 
                     // Update UI
@@ -2547,6 +2811,11 @@
                         stage: e.stage,
                         analysis: e.analysis,
                         crop_image: e.crop_image,
+                        person_id: e.person_id,
+                        person_label: e.person_label,
+                        is_watchlist: e.is_watchlist,
+                        match_score: e.match_score,
+                        match_status: e.match_status,
                     }));
                     
                     drawCanvas();
