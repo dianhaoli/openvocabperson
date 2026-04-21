@@ -5,7 +5,7 @@ import {
   useCallback,
   type ReactNode,
 } from 'react';
-import type { Entity, SidebarTab, LogEntry } from '../types';
+import type { Entity, SidebarTab, LogEntry, MatchStatus } from '../types';
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Context Types
@@ -51,6 +51,16 @@ interface AppActions {
   // Utilities
   reset: () => void;
   getSelectedEntity: () => Entity | undefined;
+  updateEntityIdentity: (
+    objectId: string,
+    patch: {
+      person_id?: string | null;
+      person_label?: string | null;
+      is_watchlist?: boolean;
+      match_score?: number | null;
+      match_status?: MatchStatus | null;
+    }
+  ) => void;
 }
 
 type AppContextValue = AppState & AppActions;
@@ -163,6 +173,27 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return state.entities.find((e) => e.object_id === state.selectedEntityId);
   }, [state.entities, state.selectedEntityId]);
 
+  const updateEntityIdentity = useCallback(
+    (
+      objectId: string,
+      patch: {
+        person_id?: string | null;
+        person_label?: string | null;
+        is_watchlist?: boolean;
+        match_score?: number | null;
+        match_status?: MatchStatus | null;
+      }
+    ) => {
+      setState((s) => ({
+        ...s,
+        entities: s.entities.map((e) =>
+          e.object_id === objectId ? { ...e, ...patch } : e
+        ),
+      }));
+    },
+    []
+  );
+
   const value: AppContextValue = {
     ...state,
     setSelectedFile,
@@ -178,6 +209,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setPipelineReady,
     reset,
     getSelectedEntity,
+    updateEntityIdentity,
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

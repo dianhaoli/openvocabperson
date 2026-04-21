@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { checkHealth } from '../api/client';
 import { useApp } from '../context/AppContext';
 
@@ -9,6 +9,7 @@ import { useApp } from '../context/AppContext';
 export function useHealth() {
   const { isPipelineReady, setPipelineReady } = useApp();
   const timeoutRef = useRef<number | null>(null);
+  const [reidReady, setReidReady] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -17,6 +18,11 @@ export function useHealth() {
       try {
         const data = await checkHealth();
         if (!cancelled) {
+          if (data.reid_ready === true) {
+            setReidReady(true);
+          } else {
+            setReidReady(false);
+          }
           if (data.pipeline_ready) {
             setPipelineReady(true);
           } else {
@@ -34,6 +40,13 @@ export function useHealth() {
 
     if (!isPipelineReady) {
       check();
+    } else {
+      // Refresh reid flag once pipeline is ready
+      checkHealth()
+        .then((d) => {
+          if (!cancelled && d.reid_ready === true) setReidReady(true);
+        })
+        .catch(() => {});
     }
 
     return () => {
@@ -44,7 +57,7 @@ export function useHealth() {
     };
   }, [isPipelineReady, setPipelineReady]);
 
-  return { isPipelineReady };
+  return { isPipelineReady, reidReady };
 }
 
 export default useHealth;

@@ -8,6 +8,10 @@ import type {
   SearchResponse,
   TextSearchResponse,
   StreamEvent,
+  Person,
+  PersonDetail,
+  PersonSearchResult,
+  AssignEntityResponse,
 } from '../types';
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -217,6 +221,109 @@ export async function hybridSearch(
   });
   
   if (!res.ok) throw new Error('Hybrid search failed');
+  return res.json();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Persons / Re-ID
+// ══════════════════════════════════════════════════════════════════════════════
+
+export async function listPersons(
+  watchlist = false,
+  limit = 80,
+  offset = 0
+): Promise<{ persons: Person[]; count: number }> {
+  const params = new URLSearchParams({
+    watchlist: String(watchlist),
+    limit: String(limit),
+    offset: String(offset),
+  });
+  const res = await fetch(`/api/persons?${params}`);
+  if (!res.ok) throw new Error('Failed to load persons');
+  return res.json();
+}
+
+export async function getPerson(personId: string): Promise<PersonDetail> {
+  const res = await fetch(`/api/persons/${encodeURIComponent(personId)}`);
+  if (!res.ok) throw new Error('Failed to load person');
+  return res.json();
+}
+
+export async function patchPerson(
+  personId: string,
+  body: { label?: string | null; is_watchlist?: boolean; notes?: string | null }
+): Promise<{ success: boolean; person: Pick<Person, 'person_id' | 'label' | 'is_watchlist' | 'notes'> }> {
+  const res = await fetch(`/api/persons/${encodeURIComponent(personId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Update failed' }));
+    throw new Error(err.detail || 'Update failed');
+  }
+  return res.json();
+}
+
+export async function deletePerson(personId: string): Promise<{ success: boolean; person_id: string }> {
+  const res = await fetch(`/api/persons/${encodeURIComponent(personId)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error('Failed to delete person');
+  return res.json();
+}
+
+export async function mergePersons(
+  keepId: string,
+  otherId: string
+): Promise<{ success: boolean; kept_person_id: string; removed_person_id: string }> {
+  const res = await fetch(`/api/persons/${encodeURIComponent(keepId)}/merge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ other_id: otherId }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Merge failed' }));
+    throw new Error(err.detail || 'Merge failed');
+  }
+  return res.json();
+}
+
+export async function assignEntity(
+  objectId: string,
+  personId: string
+): Promise<AssignEntityResponse> {
+  const res = await fetch(`/api/entity/${encodeURIComponent(objectId)}/assign`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ person_id: personId }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Assignment failed' }));
+    throw new Error(err.detail || 'Assignment failed');
+  }
+  return res.json();
+}
+
+export async function searchPersonsByPhoto(
+  file: File,
+  limit = 15,
+  minSimilarity = 0.2
+): Promise<{ results: PersonSearchResult[]; count: number }> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const params = new URLSearchParams({
+    limit: String(limit),
+    min_similarity: String(minSimilarity),
+  });
+  const res = await fetch(`/api/persons/search?${params}`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Person search failed' }));
+    throw new Error(err.detail || 'Person search failed');
+  }
   return res.json();
 }
 

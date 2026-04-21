@@ -1,13 +1,38 @@
+import { useState } from 'react';
 import { useEntity } from '../../hooks';
 import { QASection } from './QASection';
+import { ChangeIdentityModal } from './ChangeIdentityModal';
+import { formatPersonDisplayLabel } from '../../utils/personDisplay';
+import { Button } from '../ui';
+import { patchPerson } from '../../api/client';
+import { useApp } from '../../context/AppContext';
 import { cn } from '../../utils/cn';
 
 export function EntityPanel() {
   const { selectedEntity, deselectEntity } = useEntity();
+  const { updateEntityIdentity } = useApp();
+  const [changeIdentityOpen, setChangeIdentityOpen] = useState(false);
+  const [promoting, setPromoting] = useState(false);
 
   if (!selectedEntity) return null;
 
   const hasAnalysis = selectedEntity.analysis && selectedEntity.analysis.trim();
+  const isPersonClass = selectedEntity.class === 'person';
+  const personId = selectedEntity.person_id;
+  const hasIdentity = isPersonClass && personId;
+
+  const handlePromote = async () => {
+    if (!personId) return;
+    setPromoting(true);
+    try {
+      await patchPerson(personId, { is_watchlist: true });
+      updateEntityIdentity(selectedEntity.object_id, { is_watchlist: true });
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setPromoting(false);
+    }
+  };
 
   return (
     <aside className="w-[380px] bg-bg-secondary border-l border-border flex flex-col">
@@ -47,6 +72,71 @@ export function EntityPanel() {
           />
         </div>
 
+        {isPersonClass && (
+          <div>
+            <h4 className="text-xs font-medium text-text-muted uppercase tracking-wider mb-2">
+              Identity
+            </h4>
+            {hasIdentity ? (
+              <div className="p-3 bg-bg-tertiary rounded-[12px] space-y-2">
+                <div className="text-sm font-medium text-text-primary">
+                  {formatPersonDisplayLabel(
+                    personId!,
+                    selectedEntity.person_label
+                  )}
+                  {selectedEntity.is_watchlist && (
+                    <span className="ml-2 text-[10px] uppercase text-error">
+                      Watchlist
+                    </span>
+                  )}
+                </div>
+                <div className="text-xs text-text-muted">
+                  Status:{' '}
+                  <span className="text-text-secondary">
+                    {selectedEntity.match_status ?? '—'}
+                  </span>
+                  {selectedEntity.match_score != null && (
+                    <>
+                      {' '}
+                      · Match{' '}
+                      {(selectedEntity.match_score * 100).toFixed(0)}%
+                    </>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-2 pt-1">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => setChangeIdentityOpen(true)}
+                  >
+                    Change identity
+                  </Button>
+                  {!selectedEntity.is_watchlist && (
+                    <Button
+                      size="sm"
+                      onClick={handlePromote}
+                      loading={promoting}
+                    >
+                      Promote to watchlist
+                    </Button>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="p-3 bg-bg-tertiary rounded-[12px] text-xs text-text-muted space-y-2">
+                <p>No identity cluster linked (e.g. skipped Re-ID or non-VLM person).</p>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => setChangeIdentityOpen(true)}
+                >
+                  Assign to person…
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Initial analysis */}
         <div>
           <h4 className="text-xs font-medium text-text-muted uppercase tracking-wider mb-2">
@@ -67,6 +157,12 @@ export function EntityPanel() {
         {/* Q&A Section */}
         <QASection />
       </div>
+
+      <ChangeIdentityModal
+        objectId={selectedEntity.object_id}
+        isOpen={changeIdentityOpen}
+        onClose={() => setChangeIdentityOpen(false)}
+      />
     </aside>
   );
 }

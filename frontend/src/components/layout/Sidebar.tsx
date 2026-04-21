@@ -14,6 +14,7 @@ export function Sidebar({ children }: SidebarProps) {
     { id: 'upload', label: 'Upload' },
     { id: 'search', label: 'Search' },
     { id: 'history', label: 'History' },
+    { id: 'persons', label: 'Persons' },
   ];
 
   return (
@@ -25,8 +26,8 @@ export function Sidebar({ children }: SidebarProps) {
             key={tab.id}
             onClick={() => setActiveTab(tab.id)}
             className={cn(
-              'flex-1 px-4 py-3 text-sm font-medium transition-all duration-200',
-              'flex items-center justify-center gap-2',
+              'flex-1 px-2 py-3 text-xs sm:text-sm font-medium transition-all duration-200',
+              'flex items-center justify-center gap-1',
               activeTab === tab.id
                 ? 'text-accent bg-bg-secondary border-b-2 border-accent'
                 : 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'

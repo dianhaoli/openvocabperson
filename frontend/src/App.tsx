@@ -1,6 +1,6 @@
 import { AppProvider, useApp } from './context/AppContext';
 import { Header, Sidebar, MainLayout } from './components/layout';
-import { UploadTab, SearchTab, HistoryTab } from './components/sidebar';
+import { UploadTab, SearchTab, HistoryTab, PersonsTab } from './components/sidebar';
 import { CanvasSection } from './components/canvas';
 import { ResultsGrid } from './components/results';
 import { EntityPanel } from './components/entity';
@@ -21,6 +21,7 @@ function AppContent() {
             {activeTab === 'upload' && <UploadTab />}
             {activeTab === 'search' && <SearchTab />}
             {activeTab === 'history' && <HistoryTab />}
+            {activeTab === 'persons' && <PersonsTab />}
           </Sidebar>
         }
         canvas={<CanvasSection />}

@@ -11,6 +11,8 @@ export interface BoundingBox {
   y2: number;
 }
 
+export type MatchStatus = 'matched' | 'new' | 'pending';
+
 export interface Entity {
   object_id: string;
   index: number;
@@ -20,7 +22,12 @@ export interface Entity {
   stage: AnalysisStage;
   analysis: string | null;
   reason?: string;
-  crop_image: string; // base64 data URL
+  crop_image: string; // data URL or /api/image/crop/... URL
+  person_id?: string | null;
+  person_label?: string | null;
+  is_watchlist?: boolean;
+  match_score?: number | null;
+  match_status?: MatchStatus | null;
 }
 
 export interface EntityFromSession {
@@ -32,6 +39,11 @@ export interface EntityFromSession {
   analysis: string | null;
   crop_image: string | null;
   created_at: number;
+  person_id?: string | null;
+  person_label?: string | null;
+  is_watchlist?: boolean;
+  match_score?: number | null;
+  match_status?: MatchStatus | null;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -61,6 +73,7 @@ export interface HealthResponse {
   status: string;
   pipeline_ready: boolean;
   total_sessions: number;
+  reid_ready?: boolean;
 }
 
 export interface AnalyzeResponse {
@@ -165,7 +178,56 @@ export interface StreamEvent {
 // UI State Types
 // ══════════════════════════════════════════════════════════════════════════════
 
-export type SidebarTab = 'upload' | 'search' | 'history';
+export type SidebarTab = 'upload' | 'search' | 'history' | 'persons';
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Person / Re-ID Types
+// ══════════════════════════════════════════════════════════════════════════════
+
+export interface Person {
+  person_id: string;
+  label: string | null;
+  is_watchlist: boolean;
+  notes: string | null;
+  sighting_count: number;
+  representative_entity_id: string | null;
+  representative_crop_url: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface PersonSighting {
+  object_id: string;
+  session_id: string;
+  confidence: number;
+  box: [number, number, number, number];
+  stage: AnalysisStage;
+  analysis: string | null;
+  crop_image: string;
+  created_at: number;
+}
+
+export interface PersonDetail extends Person {
+  sightings: PersonSighting[];
+}
+
+export interface PersonSearchResult {
+  person_id: string;
+  label: string | null;
+  is_watchlist: boolean;
+  sighting_count: number;
+  similarity: number;
+  representative_crop_url: string | null;
+}
+
+export interface AssignEntityResponse {
+  success: boolean;
+  object_id: string;
+  person_id: string | null;
+  person_label: string | null;
+  is_watchlist: boolean;
+  match_status: string;
+}
 
 export interface LogEntry {
   id: string;

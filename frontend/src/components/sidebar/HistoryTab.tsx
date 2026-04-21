@@ -74,6 +74,11 @@ export function HistoryTab() {
           stage: e.stage,
           analysis: e.analysis,
           crop_image: e.crop_image || '',
+          person_id: e.person_id,
+          person_label: e.person_label,
+          is_watchlist: e.is_watchlist,
+          match_score: e.match_score,
+          match_status: e.match_status,
         }));
 
         setEntities(entities);

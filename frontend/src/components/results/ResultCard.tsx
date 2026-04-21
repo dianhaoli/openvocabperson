@@ -1,5 +1,81 @@
 import { cn } from '../../utils/cn';
 import type { Entity } from '../../types';
+import { formatPersonDisplayLabel } from '../../utils/personDisplay';
+
+function IdentityBadge({ entity }: { entity: Entity }) {
+  const status = entity.match_status;
+  const hasPerson = entity.person_id != null && entity.person_id !== '';
+  if (!status && !hasPerson) return null;
+
+  const scorePct =
+    entity.match_score != null
+      ? `${Math.round(Number(entity.match_score) * 100)}%`
+      : '';
+
+  const displayLabel = entity.person_id
+    ? formatPersonDisplayLabel(entity.person_id, entity.person_label)
+    : entity.person_label || '';
+
+  const effectiveStatus = status ?? (hasPerson ? 'matched' : null);
+  if (!effectiveStatus) return null;
+
+  if (effectiveStatus === 'matched' && entity.is_watchlist) {
+    return (
+      <span
+        className={cn(
+          'px-2 py-0.5 text-[10px] font-medium rounded-[5px] backdrop-blur-md',
+          'bg-red-600/90 text-white border border-red-400/50 max-w-[11rem] truncate'
+        )}
+        title={`Watchlist: ${displayLabel}`}
+      >
+        Watchlist: {displayLabel}
+        {scorePct ? ` · ${scorePct}` : ''}
+      </span>
+    );
+  }
+
+  if (effectiveStatus === 'matched') {
+    return (
+      <span
+        className={cn(
+          'px-2 py-0.5 text-[10px] font-medium rounded-[5px] backdrop-blur-md',
+          'bg-sky-600/90 text-white border border-sky-400/40 max-w-[11rem] truncate'
+        )}
+      >
+        {displayLabel}
+        {scorePct ? ` · ${scorePct}` : ''}
+      </span>
+    );
+  }
+
+  if (effectiveStatus === 'pending') {
+    return (
+      <span
+        className={cn(
+          'px-2 py-0.5 text-[10px] font-medium rounded-[5px] backdrop-blur-md',
+          'bg-amber-500/90 text-black border border-amber-300/60 max-w-[11rem] truncate'
+        )}
+      >
+        Review{scorePct ? ` · ${scorePct}` : ''}
+      </span>
+    );
+  }
+
+  if (effectiveStatus === 'new') {
+    return (
+      <span
+        className={cn(
+          'px-2 py-0.5 text-[10px] font-medium rounded-[5px] backdrop-blur-md',
+          'bg-zinc-600/90 text-zinc-100 border border-zinc-500/50'
+        )}
+      >
+        New ID
+      </span>
+    );
+  }
+
+  return null;
+}
 
 interface ResultCardProps {
   entity: Entity;
@@ -51,15 +127,18 @@ export function ResultCard({
           </span>
         </div>
         
-        {/* Top-right stage badge */}
-        <span
-          className={cn(
-            'absolute top-2 right-2 px-2 py-0.5 text-[10px] font-medium rounded-[5px] uppercase tracking-wide',
-            stageStyles[entity.stage]
-          )}
-        >
-          {entity.stage.replace('_', ' ')}
-        </span>
+        {/* Top-right: identity + stage */}
+        <div className="absolute top-2 right-2 flex flex-col items-end gap-1 max-w-[calc(100%-1rem)]">
+          <IdentityBadge entity={entity} />
+          <span
+            className={cn(
+              'px-2 py-0.5 text-[10px] font-medium rounded-[5px] uppercase tracking-wide',
+              stageStyles[entity.stage]
+            )}
+          >
+            {entity.stage.replace('_', ' ')}
+          </span>
+        </div>
       </div>
 
       {/* Content */}

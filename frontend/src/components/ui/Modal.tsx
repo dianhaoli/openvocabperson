@@ -8,9 +8,18 @@ interface ModalProps {
   title: string;
   children: ReactNode;
   actions?: ReactNode;
+  /** Wider panel for complex forms (e.g. person detail) */
+  panelClassName?: string;
 }
 
-export function Modal({ isOpen, onClose, title, children, actions }: ModalProps) {
+export function Modal({
+  isOpen,
+  onClose,
+  title,
+  children,
+  actions,
+  panelClassName,
+}: ModalProps) {
   // Close on escape key
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
@@ -40,7 +49,12 @@ export function Modal({ isOpen, onClose, title, children, actions }: ModalProps)
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="bg-bg-secondary border border-border rounded-[20px] p-6 max-w-[400px] w-[90%] animate-fade-in">
+      <div
+        className={cn(
+          'bg-bg-secondary border border-border rounded-[20px] p-6 max-w-[400px] w-[90%] animate-fade-in',
+          panelClassName
+        )}
+      >
         <h2 className="text-lg font-semibold mb-3">{title}</h2>
         <div className="text-text-secondary text-sm mb-5">{children}</div>
         {actions && (
