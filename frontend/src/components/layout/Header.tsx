@@ -1,37 +1,80 @@
-import { useHealth } from '../../hooks';
+import { useActions, useAppState } from '../../context/hooks';
+import type { Capabilities } from '../../types';
 import { cn } from '../../utils/cn';
+import { Button } from '../ui/Button';
+
+const CAP_LABELS: Record<keyof Capabilities, string> = {
+  vlm: 'VLM',
+  llm: 'LLM',
+  segmentation: 'Masks',
+  clip: 'CLIP',
+  text_search: 'Text search',
+  reid: 'Re-ID',
+  video: 'Video',
+  agent: 'Agent',
+};
 
 export function Header() {
-  const { isPipelineReady } = useHealth();
+  const { health, healthError } = useAppState();
+  const { setModelsOpen } = useActions();
+
+  const status = healthError ? 'offline' : !health ? 'connecting' : health.ready ? 'ready' : 'loading';
+  const dotClass = {
+    offline: 'bg-error',
+    connecting: 'bg-text-muted',
+    ready: 'bg-success shadow-[0_0_8px_rgba(34,197,94,0.7)]',
+    loading: 'bg-warning animate-pulse',
+  }[status];
+  const statusText = {
+    offline: 'Backend unreachable',
+    connecting: 'Connecting…',
+    ready: `Ready${health?.device ? ` · ${health.device}` : ''}`,
+    loading: `Loading models${health?.device ? ` · ${health.device}` : ''}`,
+  }[status];
+
+  const caps = health?.capabilities;
 
   return (
-    <header className="bg-bg-secondary border-b border-border px-8 py-4 sticky top-0 z-50 backdrop-blur-xl">
-      <div className="max-w-[1800px] mx-auto flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 gradient-accent rounded-[10px] flex items-center justify-center text-xl">
+    <header className="h-14 shrink-0 flex items-center gap-4 px-4 border-b border-border bg-bg-secondary/80 backdrop-blur z-10">
+      <div className="flex items-center gap-2.5 shrink-0">
+        <div className="w-8 h-8 rounded-[10px] gradient-accent flex items-center justify-center text-white text-base font-bold">◎</div>
+        <div className="leading-tight">
+          <div className="font-semibold text-[15px]">
+            OpenVocab <span className="text-gradient">Vision</span>
           </div>
-          <h1 className="text-xl font-semibold text-gradient">
-            Human Analysis System
-          </h1>
-        </div>
-
-        <div className="flex items-center gap-2 px-4 py-2 bg-bg-tertiary border border-border rounded-full text-sm text-text-secondary">
-          <div
-            className={cn(
-              'w-2 h-2 rounded-full',
-              isPipelineReady
-                ? 'bg-success shadow-[0_0_8px_theme(colors.success.DEFAULT)]'
-                : 'bg-text-muted'
-            )}
-          />
-          <span>
-            {isPipelineReady ? 'Pipeline Ready' : 'Loading Models...'}
-          </span>
+          {health?.version && <div className="text-[10px] text-text-muted font-mono">v{health.version}</div>}
         </div>
       </div>
+
+      <div className="flex items-center gap-2 text-xs text-text-secondary shrink-0" title={health ? `db: ${String(health.db)}` : undefined}>
+        <span className={cn('w-2.5 h-2.5 rounded-full', dotClass)} />
+        {statusText}
+      </div>
+
+      <div className="flex-1 min-w-0 flex items-center gap-1.5 overflow-x-auto">
+        {caps &&
+          (Object.keys(CAP_LABELS) as (keyof Capabilities)[]).map((k) => {
+            const v = caps[k];
+            const on = !!v;
+            return (
+              <span
+                key={k}
+                title={typeof v === 'string' ? `${CAP_LABELS[k]}: ${v}` : `${CAP_LABELS[k]} ${on ? 'available' : 'unavailable'}`}
+                className={cn(
+                  'shrink-0 px-2 py-0.5 rounded-full border text-[10.5px]',
+                  on ? 'border-success/40 text-success bg-success-soft' : 'border-border text-text-muted line-through decoration-text-muted/60',
+                )}
+              >
+                {CAP_LABELS[k]}
+                {typeof v === 'string' ? ` · ${v}` : ''}
+              </span>
+            );
+          })}
+      </div>
+
+      <Button variant="secondary" size="sm" onClick={() => setModelsOpen(true)}>
+        ⚙ Models
+      </Button>
     </header>
   );
 }
-
-export default Header;
-

@@ -40,3 +40,8 @@ frontend/dist/
 *.pth
 *.onnx
 
+
+# model weights / caches
+mobileclip*.ts
+*.engine
+storage/

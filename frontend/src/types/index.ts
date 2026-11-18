@@ -1,245 +1,296 @@
-// ══════════════════════════════════════════════════════════════════════════════
-// Entity & Detection Types
-// ══════════════════════════════════════════════════════════════════════════════
+// Types mirroring docs/API.md. Field names are kept in snake_case exactly as in the JSON.
 
-export type AnalysisStage = 'vlm_full' | 'yolo_only' | 'low_confidence';
+export type Box = [number, number, number, number];
+/** One trajectory sample: [t, x1, y1, x2, y2] */
+export type TrajectoryPoint = [number, number, number, number, number];
+export type Point = [number, number];
 
-export interface BoundingBox {
-  x1: number;
-  y1: number;
-  x2: number;
-  y2: number;
+export type EntityStage = 'described' | 'detected' | 'low_confidence' | 'rejected';
+export type MatchStatus = 'matched' | 'new' | 'pending' | 'manual';
+export type MediaKind = 'image' | 'video';
+
+export interface PersonRef {
+  id: string;
+  label: string | null;
+  is_watchlist: boolean;
 }
-
-export type MatchStatus = 'matched' | 'new' | 'pending';
 
 export interface Entity {
-  object_id: string;
-  index: number;
-  class: string;
-  confidence: number;
-  box: [number, number, number, number]; // [x1, y1, x2, y2]
-  stage: AnalysisStage;
-  analysis: string | null;
-  reason?: string;
-  crop_image: string; // data URL or /api/image/crop/... URL
-  person_id?: string | null;
-  person_label?: string | null;
-  is_watchlist?: boolean;
-  match_score?: number | null;
-  match_status?: MatchStatus | null;
+  id: string;
+  media_id: string;
+  label: string;
+  concept: string | null;
+  score: number;
+  box: Box;
+  polygon: Point[][] | null;
+  mask_area: number | null;
+  crop_url: string;
+  description: string | null;
+  attributes: Record<string, unknown> | null;
+  verified: boolean | null;
+  verify_reason: string | null;
+  stage: EntityStage;
+  track_id?: number | null;
+  t_start?: number | null;
+  t_end?: number | null;
+  frame_index?: number | null;
+  trajectory?: TrajectoryPoint[] | null;
+  person: PersonRef | null;
+  match_status: MatchStatus | null;
+  match_score: number | null;
+  suggested_person?: PersonRef | null;
+  created_at: number;
 }
 
-export interface EntityFromSession {
-  object_id: string;
-  class_name: string;
-  confidence: number;
-  box: [number, number, number, number];
-  stage: AnalysisStage;
-  analysis: string | null;
-  crop_image: string | null;
-  created_at: number;
-  person_id?: string | null;
-  person_label?: string | null;
-  is_watchlist?: boolean;
-  match_score?: number | null;
-  match_status?: MatchStatus | null;
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// Session Types
-// ══════════════════════════════════════════════════════════════════════════════
-
-export interface Session {
-  session_id: string;
-  created_at: number;
+export interface Media {
+  id: string;
+  kind: MediaKind;
+  name: string;
+  width: number;
+  height: number;
+  duration: number | null;
+  fps: number | null;
+  url: string;
+  thumb_url: string;
+  query: string | null;
   entity_count: number;
-}
-
-export interface SessionDetails {
-  session_id: string;
+  person_count: number;
   created_at: number;
-  image_width: number;
-  image_height: number;
-  full_image_path: string;
-  entities: EntityFromSession[];
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// API Response Types
-// ══════════════════════════════════════════════════════════════════════════════
-
-export interface HealthResponse {
-  status: string;
-  pipeline_ready: boolean;
-  total_sessions: number;
-  reid_ready?: boolean;
+export interface MediaDetail extends Media {
+  entities: Entity[];
+  plan: Plan | null;
 }
 
-export interface AnalyzeResponse {
-  success: boolean;
-  session_id: string;
-  elapsed_seconds: number;
-  num_detections: number;
-  image_width: number;
-  image_height: number;
-  results: Entity[];
-}
-
-export interface SessionsListResponse {
-  sessions: Session[];
-  total: number;
-  limit: number;
-  offset: number;
-}
-
-export interface AskResponse {
-  success: boolean;
-  object_id: string;
+export interface QAItem {
   question: string;
   answer: string;
-  elapsed_seconds: number;
+  created_at: number;
 }
 
-export interface DeleteSessionResponse {
-  success: boolean;
-  session_id: string;
-  entities_deleted: number;
+export interface EntityDetail extends Entity {
+  media: Media;
+  qa: QAItem[];
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Search Types
-// ══════════════════════════════════════════════════════════════════════════════
+export type ConceptKind = 'object' | 'person_attribute' | string;
 
-export interface SearchScores {
-  text: number;
-  vector: number;
-  hybrid: number;
+export interface PlanConcept {
+  name: string;
+  kind: ConceptKind;
+  prompts: string[];
+  verify: boolean;
+  question: string | null;
+}
+
+export type PlanSource = 'llm' | 'lexicon' | 'literal' | 'default';
+
+export interface Plan {
+  query: string | null;
+  expanded: boolean;
+  source: PlanSource;
+  concepts: PlanConcept[];
+  prompts: string[];
+}
+
+export type JobKind = 'analyze' | 'scan';
+export type JobStatus = 'queued' | 'running' | 'done' | 'error' | 'cancelled';
+
+export interface JobProgress {
+  done: number;
+  total: number;
+  stage?: string | null;
+  message?: string | null;
+}
+
+export type Tristate = boolean | 'auto';
+export type DescribeMode = 'persons' | 'all' | 'none';
+
+export interface AnalyzeOptions {
+  query?: string | null;
+  expand?: Tristate;
+  verify?: Tristate;
+  segment?: boolean;
+  describe?: DescribeMode;
+  detector?: string | null;
+  segmenter?: string | null;
+  vlm?: string | null;
+  conf?: number;
+  video_fps?: number;
+  max_frames?: number;
+  reid?: boolean;
+}
+
+export interface Job {
+  id: string;
+  kind: JobKind;
+  status: JobStatus;
+  progress: JobProgress | null;
+  media_ids: string[];
+  error: string | null;
+  created_at: number;
+  finished_at: number | null;
+  options: AnalyzeOptions | null;
+}
+
+// ---------- Job SSE events ----------
+interface JobEventBase {
+  job_id: string;
+  ts: number;
+}
+export type PipelineStage = 'detect' | 'track' | 'segment' | 'verify' | 'describe' | 'embed' | 'identity' | 'save';
+export type LogLevel = 'info' | 'warning' | 'error';
+
+export type JobEvent =
+  | (JobEventBase & { type: 'job_started'; job: Job })
+  | (JobEventBase & { type: 'plan'; plan: Plan })
+  | (JobEventBase & { type: 'media_started'; index: number; total: number; name: string; kind: MediaKind })
+  | (JobEventBase & { type: 'media_created'; media: Media })
+  | (JobEventBase & { type: 'stage'; media_id: string; stage: PipelineStage | string; message: string })
+  | (JobEventBase & { type: 'detections'; media_id: string; count: number; labels: Record<string, number> })
+  | (JobEventBase & { type: 'entity'; entity: Entity })
+  | (JobEventBase & { type: 'media_done'; media: MediaDetail })
+  | (JobEventBase & { type: 'progress'; done: number; total: number })
+  | (JobEventBase & { type: 'log'; level: LogLevel; message: string })
+  | (JobEventBase & { type: 'job_done'; job: Job });
+
+// ---------- System ----------
+export interface Capabilities {
+  vlm: boolean;
+  llm: boolean;
+  segmentation: boolean;
+  clip: boolean;
+  text_search: boolean;
+  reid: string | boolean | null;
+  video: boolean;
+  agent: boolean;
+}
+
+export interface Health {
+  status: string;
+  ready: boolean;
+  device: string;
+  db: string | boolean | null;
+  capabilities: Capabilities;
+  version: string;
+}
+
+export type ModelRole = 'detector' | 'segmenter' | 'vlm' | 'llm' | 'embedder' | 'reid';
+export const MODEL_ROLES: ModelRole[] = ['detector', 'segmenter', 'vlm', 'llm', 'embedder', 'reid'];
+
+export interface ModelProvider {
+  spec: string;
+  label: string;
+  available: boolean;
+  local?: boolean;
+  open_vocab?: boolean;
+  masks?: boolean;
+  note: string | null;
+}
+
+export interface ModelsInfo {
+  device: string;
+  defaults: Partial<Record<ModelRole | 'text_embedder', string | null>>;
+  providers: Partial<Record<ModelRole, ModelProvider[]>>;
+  capabilities: Capabilities;
+}
+
+export type ConfigPatch = Partial<Record<ModelRole, string>>;
+
+export interface Stats {
+  media: number;
+  images: number;
+  videos: number;
+  entities: number;
+  persons: number;
+  watchlist: number;
+  labels: { label: string; count: number }[];
+}
+
+// ---------- Search ----------
+export interface ScoreBreakdown {
+  fts: number | null;
+  semantic: number | null;
+  clip: number | null;
+  label: number | null;
+  image: number | null;
+  reid: number | null;
 }
 
 export interface SearchResult {
-  object_id: string;
-  session_id: string;
-  class_name: string;
-  confidence?: number;
-  analysis: string | null;
-  crop_image: string | null;
-  scores?: SearchScores;
-  similarity?: number;
-  score?: number;
+  entity: Entity;
+  media: Media;
+  score: number;
+  scores: Partial<ScoreBreakdown>;
 }
 
 export interface SearchResponse {
   results: SearchResult[];
   count: number;
-  query?: {
-    text: string | null;
-    has_image: boolean;
-    text_weight: number;
-    vector_weight: number;
-  };
+  query: { text: string | null; has_image: boolean };
 }
 
-export interface TextSearchResponse {
-  results: SearchResult[];
-  count: number;
-  query: string;
+export interface SearchRequest {
+  text?: string;
+  labels?: string[];
+  media_id?: string;
+  person_id?: string;
+  kind?: MediaKind;
+  limit?: number;
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Streaming Event Types
-// ══════════════════════════════════════════════════════════════════════════════
-
-export type StreamEventType = 
-  | 'detection_complete'
-  | 'routing_complete'
-  | 'crop_analyzed'
-  | 'complete'
-  | 'error';
-
-export interface StreamEvent {
-  type: StreamEventType;
-  elapsed: number;
-  data?: {
-    num_detections?: number;
-    vlm_full?: number;
-    yolo_only?: number;
-    low_confidence?: number;
-    index?: number;
-    analysis?: string;
-    reason?: string;
-  };
-  results?: Entity[];
-  message?: string;
-  session_id?: string;
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// UI State Types
-// ══════════════════════════════════════════════════════════════════════════════
-
-export type SidebarTab = 'upload' | 'search' | 'history' | 'persons';
-
-// ══════════════════════════════════════════════════════════════════════════════
-// Person / Re-ID Types
-// ══════════════════════════════════════════════════════════════════════════════
-
+// ---------- Persons ----------
 export interface Person {
-  person_id: string;
+  id: string;
   label: string | null;
   is_watchlist: boolean;
   notes: string | null;
   sighting_count: number;
+  media_count: number;
   representative_entity_id: string | null;
-  representative_crop_url: string | null;
+  thumb_url: string | null;
+  first_seen: number | null;
+  last_seen: number | null;
   created_at: number;
   updated_at: number;
 }
 
-export interface PersonSighting {
-  object_id: string;
-  session_id: string;
-  confidence: number;
-  box: [number, number, number, number];
-  stage: AnalysisStage;
-  analysis: string | null;
-  crop_image: string;
-  created_at: number;
-}
+export type Sighting = Entity & { media: Media };
 
 export interface PersonDetail extends Person {
-  sightings: PersonSighting[];
+  sightings: Sighting[];
 }
 
-export interface PersonSearchResult {
-  person_id: string;
-  label: string | null;
-  is_watchlist: boolean;
-  sighting_count: number;
-  similarity: number;
-  representative_crop_url: string | null;
+export interface PersonPatch {
+  label?: string | null;
+  is_watchlist?: boolean;
+  notes?: string | null;
 }
 
-export interface AssignEntityResponse {
-  success: boolean;
-  object_id: string;
-  person_id: string | null;
-  person_label: string | null;
-  is_watchlist: boolean;
-  match_status: string;
-}
+export type ReviewAction = 'accept' | 'new' | 'reject';
 
-export interface LogEntry {
+// ---------- Agent ----------
+export interface AgentToolResult {
   id: string;
-  type: 'info' | 'success' | 'warning' | 'error';
+  name: string;
+  summary: string;
+  entities?: Entity[];
+  media?: Media[];
+  persons?: Person[];
+  job_id?: string;
+}
+
+export type AgentEvent =
+  | { type: 'conversation'; conversation_id: string }
+  | { type: 'tool_call'; id: string; name: string; arguments: Record<string, unknown> | string | null }
+  | ({ type: 'tool_result' } & AgentToolResult)
+  | { type: 'message'; text: string }
+  | { type: 'done' }
+  | { type: 'error'; message: string };
+
+export interface AgentChatRequest {
   message: string;
-  time: string;
+  conversation_id?: string;
+  llm?: string;
 }
-
-export interface QAItem {
-  id: string;
-  question: string;
-  answer: string | null;
-  loading: boolean;
-}
-

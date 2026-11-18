@@ -22,19 +22,26 @@ npm run preview
 
 ```
 src/
-├── api/            # Typed API client functions
+├── api/client.ts      # Typed API client (docs/API.md), ApiError, SSE-over-fetch generator
+├── types/             # Types mirroring docs/API.md (snake_case JSON fields)
+├── context/           # App state (reducer + context), toasts, health polling
+├── hooks/             # useApi, useJobTracker (job SSE), useWorkspaceJob, useObjectUrl, useElementSize
 ├── components/
-│   ├── canvas/     # Canvas with bounding boxes
-│   ├── entity/     # Entity panel and Q&A
-│   ├── layout/     # Header, Sidebar, MainLayout
-│   ├── results/    # Results grid and cards
-│   ├── sidebar/    # Upload, Search, History tabs
-│   └── ui/         # Reusable UI components
-├── context/        # React Context for global state
-├── hooks/          # Custom React hooks
-├── types/          # TypeScript type definitions
-└── utils/          # Utility functions
+│   ├── layout/        # Header (health + capabilities), Sidebar tabs
+│   ├── analyze/       # Upload + open-vocab query + options + plan preview
+│   ├── agent/         # Agent chat (SSE), tool-call cards with galleries
+│   ├── search/        # Text / image search
+│   ├── library/       # Media library, scan job, recent jobs
+│   ├── people/        # Persons grid, review queue, find-by-photo, person modal
+│   ├── workspace/     # Image canvas / video overlay + timeline, legend, entity cards, scene Q&A
+│   ├── detail/        # Selected-entity panel (identity, attributes, Q&A)
+│   ├── models/        # Models & capabilities modal
+│   ├── jobs/          # Job progress panel, plan view
+│   ├── common/ ui/    # Shared building blocks
+└── utils/             # colors, geometry, formatting, canvas drawing
 ```
+
+The dev server proxies only `/api` to `http://localhost:8000`.
 
 ## Docker
 

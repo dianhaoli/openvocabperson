@@ -1,109 +1,108 @@
-import { useEffect, type ReactNode } from 'react';
+import { useEffect, useRef, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { cn } from '../../utils/cn';
-import Button from './Button';
+import { Button } from './Button';
+
+// Stack of open modals so Escape only closes the top-most one.
+const modalStack: symbol[] = [];
 
 interface ModalProps {
-  isOpen: boolean;
+  open: boolean;
   onClose: () => void;
-  title: string;
+  title: ReactNode;
   children: ReactNode;
   actions?: ReactNode;
-  /** Wider panel for complex forms (e.g. person detail) */
-  panelClassName?: string;
+  className?: string;
 }
 
-export function Modal({
-  isOpen,
-  onClose,
-  title,
-  children,
-  actions,
-  panelClassName,
-}: ModalProps) {
-  // Close on escape key
+export function Modal({ open, onClose, title, children, actions, className }: ModalProps) {
+  const onCloseRef = useRef(onClose);
   useEffect(() => {
-    const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+    onCloseRef.current = onClose;
+  });
+
+  useEffect(() => {
+    if (!open) return;
+    const token = Symbol('modal');
+    modalStack.push(token);
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && modalStack[modalStack.length - 1] === token) {
+        e.stopPropagation();
+        onCloseRef.current();
+      }
     };
-    
-    if (isOpen) {
-      document.addEventListener('keydown', handleEscape);
-      document.body.style.overflow = 'hidden';
-    }
-    
+    document.addEventListener('keydown', handler);
     return () => {
-      document.removeEventListener('keydown', handleEscape);
-      document.body.style.overflow = '';
+      document.removeEventListener('keydown', handler);
+      const idx = modalStack.indexOf(token);
+      if (idx !== -1) modalStack.splice(idx, 1);
     };
-  }, [isOpen, onClose]);
+  }, [open]);
 
-  if (!isOpen) return null;
+  if (!open) return null;
 
-  return (
+  return createPortal(
     <div
-      className={cn(
-        'fixed inset-0 z-[1000] flex items-center justify-center',
-        'bg-black/70 backdrop-blur-sm'
-      )}
-      onClick={(e) => {
+      className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+      onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
       <div
+        role="dialog"
+        aria-modal="true"
         className={cn(
-          'bg-bg-secondary border border-border rounded-[20px] p-6 max-w-[400px] w-[90%] animate-fade-in',
-          panelClassName
+          'bg-bg-secondary border border-border rounded-[20px] w-full max-w-[420px] max-h-[90vh] flex flex-col animate-fade-in shadow-2xl',
+          className,
         )}
       >
-        <h2 className="text-lg font-semibold mb-3">{title}</h2>
-        <div className="text-text-secondary text-sm mb-5">{children}</div>
-        {actions && (
-          <div className="flex gap-3 justify-end">{actions}</div>
-        )}
+        <div className="flex items-center justify-between gap-3 px-5 pt-4 pb-3 border-b border-border">
+          <h2 className="text-base font-semibold truncate">{title}</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-text-muted hover:text-text-primary text-xl leading-none px-1"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+        <div className="px-5 py-4 overflow-y-auto min-h-0 flex-1 text-sm">{children}</div>
+        {actions && <div className="flex gap-2 justify-end px-5 pb-4 pt-2 border-t border-border">{actions}</div>}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
-// Convenience component for delete confirmation
-interface DeleteModalProps {
-  isOpen: boolean;
-  onClose: () => void;
-  onConfirm: () => void;
+interface ConfirmProps {
+  open: boolean;
+  title: string;
+  message: ReactNode;
+  confirmLabel?: string;
   loading?: boolean;
-  itemName?: string;
-  entityCount?: number;
+  onConfirm: () => void;
+  onClose: () => void;
 }
 
-export function DeleteModal({
-  isOpen,
-  onClose,
-  onConfirm,
-  loading = false,
-  itemName = 'session',
-  entityCount = 0,
-}: DeleteModalProps) {
+export function ConfirmModal({ open, title, message, confirmLabel = 'Delete', loading, onConfirm, onClose }: ConfirmProps) {
   return (
     <Modal
-      isOpen={isOpen}
+      open={open}
       onClose={onClose}
-      title={`Delete ${itemName}?`}
+      title={title}
       actions={
         <>
-          <Button variant="secondary" onClick={onClose}>
+          <Button variant="secondary" size="sm" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="danger" onClick={onConfirm} loading={loading}>
-            Delete
+          <Button variant="danger" size="sm" onClick={onConfirm} loading={loading}>
+            {confirmLabel}
           </Button>
         </>
       }
     >
-      This will permanently delete this {itemName}
-      {entityCount > 0 && ` and ${entityCount} detection${entityCount !== 1 ? 's' : ''}`}.
+      <div className="text-text-secondary">{message}</div>
     </Modal>
   );
 }
-
-export default Modal;
-

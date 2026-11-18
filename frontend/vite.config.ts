@@ -7,25 +7,21 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      // Only the API is proxied; the backend serves everything under /api.
       '/api': {
         target: 'http://localhost:8000',
         changeOrigin: true,
-      },
-      '/analyze': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-      },
-      '/object': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-      },
-      '/health': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-      },
-      '/session': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
+        // Keep SSE responses (job events, agent chat) unbuffered.
+        configure: (proxy) => {
+          proxy.on('proxyRes', (proxyRes) => {
+            const type = proxyRes.headers['content-type'] ?? ''
+            if (type.includes('text/event-stream')) {
+              proxyRes.headers['cache-control'] = 'no-cache, no-transform'
+              proxyRes.headers['x-accel-buffering'] = 'no'
+              delete proxyRes.headers['content-length']
+            }
+          })
+        },
       },
     },
   },
