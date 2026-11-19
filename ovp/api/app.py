@@ -16,16 +16,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image, ImageOps
+from PIL import Image
 from pydantic import BaseModel, Field
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .. import __version__, serialize
 from ..config import get_settings
 from ..context import AppContext, create_context, get_context
-from ..jobs import InputItem
-from ..models.registry import ModelUnavailable
+from ..jobs import InputItem, PathNotAllowed
+from ..models.registry import ModelUnavailable, normalize_spec
 from ..pipeline.analyzer import AnalyzeOptions
-from ..storage.files import media_kind
+from ..runtime import get_runtime
+from ..storage.files import FileStore, media_kind
 
 log = logging.getLogger("ovp.api")
 
@@ -39,6 +41,10 @@ log = logging.getLogger("ovp.api")
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     ctx = await create_context()
+    interrupted = await ctx.db.fail_interrupted_media()
+    if interrupted:
+        log.warning("marked %d media interrupted by the previous run as 'error'", interrupted)
+    ctx.jobs.purge_tmp()
     if get_settings().load_models_on_startup:
         # load models in the background: the API (library, search, history) is usable immediately
         ctx.warmup_task = asyncio.create_task(ctx.warmup())
@@ -46,16 +52,37 @@ async def lifespan(app: FastAPI):
         ctx.ready = True
     log.info("OpenVocab Vision API up · device=%s · defaults=%s", ctx.registry.device, ctx.registry.defaults)
     yield
-    for job in ctx.jobs.jobs.values():
-        ctx.jobs.cancel(job)
     if ctx.warmup_task:
         ctx.warmup_task.cancel()
+    await ctx.jobs.shutdown(timeout=10)  # running jobs stop before the models and the pool close
     await ctx.registry.aclose()
     await ctx.db.close()
 
 
+def _too_large() -> HTTPException:
+    return HTTPException(413, f"upload exceeds the {get_settings().max_upload_mb} MB limit (OVP_MAX_UPLOAD_MB)")
+
+
+class BodyLimit:
+    """Rejects requests whose declared Content-Length exceeds OVP_MAX_UPLOAD_MB before the body
+    is read (multipart parsing would otherwise spool it to disk); bodies without a length are
+    checked by the upload handlers while they read."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            length = dict(scope["headers"]).get(b"content-length", b"0")
+            if length.isdigit() and int(length) > get_settings().max_upload_bytes:
+                await JSONResponse({"detail": _too_large().detail}, status_code=413)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(title="OpenVocab Vision API", version=__version__, lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(BodyLimit)
+app.add_middleware(CORSMiddleware, allow_origins=get_settings().cors_origins, allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=2048)
 
 
@@ -77,10 +104,11 @@ def sse(gen: AsyncIterator[dict[str, Any]]) -> StreamingResponse:
 
 
 async def read_upload_image(file: UploadFile) -> Image.Image:
-    data = await file.read()
-    try:
-        img = Image.open(io.BytesIO(data))
-        return ImageOps.exif_transpose(img).convert("RGB")
+    data = await file.read(get_settings().max_upload_bytes + 1)
+    if len(data) > get_settings().max_upload_bytes:
+        raise _too_large()
+    try:  # decoding a large photo takes long enough to stall the event loop
+        return await get_runtime().run_cpu(FileStore.load_image, io.BytesIO(data))
     except Exception as e:
         raise HTTPException(400, f"invalid image: {e}")
 
@@ -172,17 +200,8 @@ def parse_options(raw: Optional[str | dict]) -> AnalyzeOptions:
         raise HTTPException(400, str(e))
 
 
-async def job_payload(job: Any, with_media: bool = True) -> dict[str, Any]:
-    out: dict[str, Any] = {"job": job.to_dict()}
-    if with_media:
-        c = ctx()
-        media = []
-        for mid in job.media_ids:
-            m = await c.db.get_media(mid)
-            if m is not None:
-                media.append(serialize.media_detail(m, await c.db.media_entities(mid)))
-        out["media"] = media
-    return out
+async def job_payload(job: Any) -> dict[str, Any]:
+    return {"job": job.to_dict(), "media": await ctx().jobs.media_details(job.media_ids)}
 
 
 @app.post("/api/analyze")
@@ -197,16 +216,20 @@ async def analyze(
     if query and not opts.query:
         opts.query = query
     items: list[InputItem] = []
+    budget = get_settings().max_upload_bytes
     try:
         for f in files:
             kind = media_kind(f.filename or "", f.content_type)
             if kind is None:
                 raise HTTPException(400, f"unsupported file type: {f.filename}")
             path = c.jobs.tmp_path(f.filename or ("upload.mp4" if kind == "video" else "upload.jpg"))
+            items.append(InputItem(path, f.filename or path.name, kind))
             with open(path, "wb") as out:
                 while chunk := await f.read(1 << 20):
-                    out.write(chunk)
-            items.append(InputItem(path, f.filename or path.name, kind))
+                    budget -= len(chunk)
+                    if budget < 0:
+                        raise _too_large()
+                    await asyncio.to_thread(out.write, chunk)
     except BaseException:
         for it in items:
             it.path.unlink(missing_ok=True)
@@ -228,7 +251,10 @@ class PathsRequest(BaseModel):
 @app.post("/api/analyze/paths")
 async def analyze_paths(body: PathsRequest, wait: bool = Query(False)) -> dict[str, Any]:
     c = ctx()
-    items = c.jobs.collect_paths(body.paths)
+    try:
+        items = await c.jobs.collect_paths(body.paths)
+    except PathNotAllowed as e:
+        raise HTTPException(403, str(e)) from e
     if not items:
         raise HTTPException(400, "no images or videos found at the given paths")
     job = c.jobs.submit_analyze(items, parse_options(body.options))
@@ -258,7 +284,7 @@ async def scan(body: ScanRequest, wait: bool = Query(False)) -> dict[str, Any]:
 
 @app.get("/api/jobs")
 async def list_jobs() -> dict[str, Any]:
-    return {"jobs": [j.to_dict() for j in ctx().jobs.list()]}
+    return {"jobs": [j.to_dict() for j in ctx().jobs.recent()]}
 
 
 def _job(job_id: str) -> Any:
@@ -324,7 +350,7 @@ async def delete_media(media_id: str) -> dict[str, Any]:
 VIDEO_TYPES = {".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime", ".mkv": "video/x-matroska", ".avi": "video/x-msvideo", ".m4v": "video/mp4"}
 
 
-@app.get("/api/media/{media_id}/file")
+@app.api_route("/api/media/{media_id}/file", methods=["GET", "HEAD"])
 async def media_file(media_id: str) -> FileResponse:
     m = await _media(media_id)
     p = Path(m["path"])
@@ -334,7 +360,7 @@ async def media_file(media_id: str) -> FileResponse:
     return FileResponse(p, media_type=mt, headers={"Cache-Control": "private, max-age=86400"})
 
 
-@app.get("/api/media/{media_id}/thumb")
+@app.api_route("/api/media/{media_id}/thumb", methods=["GET", "HEAD"])
 async def media_thumb(media_id: str) -> FileResponse:
     m = await _media(media_id)
     p = Path(m["thumb_path"] or m["path"])
@@ -396,7 +422,7 @@ async def delete_entity(entity_id: str) -> dict[str, Any]:
     return {"success": True, "entity_id": entity_id}
 
 
-@app.get("/api/entities/{entity_id}/crop")
+@app.api_route("/api/entities/{entity_id}/crop", methods=["GET", "HEAD"])
 async def entity_crop(entity_id: str) -> FileResponse:
     e = await _entity(entity_id)
     p = Path(e["crop_path"] or "")
@@ -551,28 +577,25 @@ async def get_person(person_id: str) -> dict[str, Any]:
 
 
 class PersonPatch(BaseModel):
+    # omitted fields are left unchanged; "" or null clears label/notes; is_watchlist cannot be null
     label: Optional[str] = None
-    is_watchlist: Optional[bool] = None
+    is_watchlist: bool = False
     notes: Optional[str] = None
 
 
 @app.patch("/api/persons/{person_id}")
 async def patch_person(person_id: str, body: PersonPatch) -> dict[str, Any]:
-    c = ctx()
-    await _person(person_id)
-    fields = body.model_dump(exclude_unset=True)
-    # empty strings clear label/notes
-    sets = {k: (v if v != "" else None) for k, v in fields.items()}
-    if sets:
-        assert c.db.pool
-        cols = ", ".join(f"{k} = ${i + 2}" for i, k in enumerate(sets))
-        await c.db.pool.execute(f"UPDATE persons SET {cols}, updated_at = NOW() WHERE id = $1", person_id, *sets.values())
+    sent = body.model_fields_set
+    clear = {k: (getattr(body, k) or "") for k in ("label", "notes") if k in sent}  # null clears like ""
+    watch = body.is_watchlist if "is_watchlist" in sent else None
+    if not await ctx().db.update_person(person_id, is_watchlist=watch, **clear):
+        raise HTTPException(404, "person not found")
     return serialize.person(await _person(person_id))
 
 
 @app.delete("/api/persons/{person_id}")
 async def delete_person(person_id: str) -> dict[str, Any]:
-    if not await ctx().db.delete_person(person_id):
+    if not await ctx().identity.delete(person_id):
         raise HTTPException(404, "person not found")
     return {"success": True, "person_id": person_id}
 
@@ -584,7 +607,7 @@ class MergeRequest(BaseModel):
 @app.post("/api/persons/{person_id}/merge")
 async def merge_persons(person_id: str, body: MergeRequest) -> dict[str, Any]:
     c = ctx()
-    if not await c.db.merge_persons(person_id, body.other_id):
+    if not await c.identity.merge(person_id, body.other_id):
         raise HTTPException(400, "merge failed (check both ids)")
     return serialize.person(await _person(person_id))
 
@@ -603,10 +626,14 @@ class ChatRequest(BaseModel):
 @app.post("/api/agent/chat")
 async def agent_chat(body: ChatRequest) -> StreamingResponse:
     c = ctx()
-    llm = await c.registry.ensure("llm", body.llm)
+    try:
+        spec = normalize_spec("llm", body.llm, get_settings()) if body.llm else None
+    except ModelUnavailable as e:
+        raise HTTPException(400, str(e)) from e
+    llm = await c.registry.ensure("llm", spec)
     if llm is None:
-        if body.llm:
-            reason = c.registry.errors.get(f"llm|{body.llm}", "not configured")
+        if spec:
+            reason = c.registry.errors.get(f"llm|{spec}", "not configured")
             raise HTTPException(400, f"LLM {body.llm!r} is unavailable: {reason}")
         raise HTTPException(503, "no LLM configured for the agent – set OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY or OVP_COMPAT_BASE_URL")
     if not llm.supports_tools:

@@ -31,6 +31,7 @@ import httpx
 from PIL import Image
 
 from ..config import Settings
+from ..runtime import get_runtime
 
 log = logging.getLogger("ovp.llm")
 
@@ -49,6 +50,14 @@ def encode_image(img: Image.Image, max_side: int = 1024, quality: int = 85) -> s
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+async def encode_images(messages: list[dict]) -> dict[int, str]:
+    """Base64 JPEG of every image part in ``messages`` (keyed by ``id(image)``), encoded in the CPU
+    pool: resizing and JPEG-encoding a large photo would otherwise stall the event loop."""
+    images = {id(p["image"]): p["image"] for m in messages if isinstance(m.get("content"), list) for p in m["content"] if p["type"] == "image"}
+    encoded = await asyncio.gather(*(get_runtime().run_cpu(encode_image, im) for im in images.values()))
+    return dict(zip(images, encoded))
 
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
@@ -291,7 +300,8 @@ class OpenAICompatModel(_HttpModel):
             return m.startswith(("gemini-2.5", "gemini-3"))
         return False
 
-    def _convert(self, messages: list[dict]) -> list[dict]:
+    def _convert(self, messages: list[dict], images: dict[int, str]) -> list[dict]:
+        """Neutral messages → chat-completions messages; ``images`` from ``encode_images``."""
         out: list[dict] = []
         for m in messages:
             role = m["role"]
@@ -307,7 +317,7 @@ class OpenAICompatModel(_HttpModel):
                     elif p["type"] == "image":
                         parts.append({
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{encode_image(p['image'])}", "detail": self.image_detail},
+                            "image_url": {"url": f"data:image/jpeg;base64,{images[id(p['image'])]}", "detail": self.image_detail},
                         })
                 # plain text-only content → string (better compatibility with local servers)
                 if all(p["type"] == "text" for p in parts):
@@ -326,7 +336,7 @@ class OpenAICompatModel(_HttpModel):
         return out
 
     async def chat(self, messages, tools=None, *, max_tokens=1024, json_mode=False, temperature=0.0) -> ChatResponse:
-        payload: dict[str, Any] = {"model": self.model, "messages": self._convert(messages)}
+        payload: dict[str, Any] = {"model": self.model, "messages": self._convert(messages, await encode_images(messages))}
         budget = max_tokens * REASONING_BUDGET_FACTOR if self._is_reasoning else max_tokens
         payload["max_completion_tokens" if self.provider == "openai" else "max_tokens"] = budget
         if self._is_reasoning:
@@ -387,7 +397,12 @@ def _reasoning_exhausted(data: dict) -> bool:
 class AnthropicModel(_HttpModel):
     provider = "anthropic"
 
-    def _convert(self, messages: list[dict]) -> tuple[str, list[dict]]:
+    def _convert(self, messages: list[dict], images: dict[int, str]) -> tuple[str, list[dict]]:
+        """Neutral messages → (system, Messages API turns); ``images`` from ``encode_images``.
+
+        Tool results become ``tool_result`` blocks of a user turn; consecutive user content (parallel
+        tool results, a user message right after them) is merged into one turn, since roles must
+        alternate."""
         system_parts: list[str] = []
         out: list[dict] = []
         for m in messages:
@@ -397,32 +412,35 @@ class AnthropicModel(_HttpModel):
                 continue
             if role == "tool":
                 block = {"type": "tool_result", "tool_use_id": m["tool_call_id"], "content": _as_text(m["content"])}
-                if out and out[-1]["role"] == "user" and isinstance(out[-1]["content"], list) and all(b.get("type") == "tool_result" for b in out[-1]["content"]):
-                    out[-1]["content"].append(block)
-                else:
-                    out.append({"role": "user", "content": [block]})
-                continue
-            blocks: list[dict] = []
-            content = m.get("content")
-            if isinstance(content, str):
-                if content:
-                    blocks.append({"type": "text", "text": content})
-            elif isinstance(content, list):
-                for p in content:
-                    if p["type"] == "text":
-                        blocks.append({"type": "text", "text": p["text"]})
-                    elif p["type"] == "image":
-                        blocks.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": encode_image(p["image"])}})
-            if role == "assistant":
-                for tc in m.get("tool_calls") or []:
-                    blocks.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.arguments})
-            if not blocks:
-                blocks = [{"type": "text", "text": "(empty)"}]
-            out.append({"role": role, "content": blocks})
+                if m.get("is_error"):
+                    block["is_error"] = True
+                blocks = [block]
+                role = "user"
+            else:
+                blocks = []
+                content = m.get("content")
+                if isinstance(content, str):
+                    if content:
+                        blocks.append({"type": "text", "text": content})
+                elif isinstance(content, list):
+                    for p in content:
+                        if p["type"] == "text":
+                            blocks.append({"type": "text", "text": p["text"]})
+                        elif p["type"] == "image":
+                            blocks.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": images[id(p["image"])]}})
+                if role == "assistant":
+                    for tc in m.get("tool_calls") or []:
+                        blocks.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.arguments})
+                if not blocks:
+                    blocks = [{"type": "text", "text": "(empty)"}]
+            if role == "user" and out and out[-1]["role"] == "user":
+                out[-1]["content"].extend(blocks)
+            else:
+                out.append({"role": role, "content": blocks})
         return "\n\n".join(system_parts), out
 
     async def chat(self, messages, tools=None, *, max_tokens=1024, json_mode=False, temperature=0.0) -> ChatResponse:
-        system, msgs = self._convert(messages)
+        system, msgs = self._convert(messages, await encode_images(messages))
         if json_mode:
             system = (system + "\n\nRespond with a single valid JSON value and nothing else.").strip()
         # Current Claude models think by default (adaptive thinking): keep the effort low for these short
@@ -439,7 +457,15 @@ class AnthropicModel(_HttpModel):
         if tools:
             payload["tools"] = [{"name": t.name, "description": t.description, "input_schema": t.parameters} for t in tools]
         headers = {"x-api-key": self.api_key or "", "anthropic-version": "2023-06-01", "content-type": "application/json"}
-        data = await self._post(f"{self.base_url}/v1/messages", payload, headers)
+        url = f"{self.base_url}/v1/messages"
+        data = await self._post(url, payload, headers)
+        if _truncated_tool_use(data):
+            # a tool call cut off by the token limit has incomplete arguments: retry once with more room
+            payload["max_tokens"] *= 2
+            log.info("%s: tool call truncated by max_tokens; retrying with max_tokens=%s", self.spec, payload["max_tokens"])
+            data = await self._post(url, payload, headers)
+            if _truncated_tool_use(data):
+                raise ProviderError(f"{self.spec}: tool call truncated at max_tokens={payload['max_tokens']}")
         if data.get("stop_reason") == "refusal":
             details = data.get("stop_details") or {}
             raise ProviderError(f"{self.spec}: request refused ({details.get('category') or 'unspecified'})")
@@ -451,6 +477,10 @@ class AnthropicModel(_HttpModel):
             elif block.get("type") == "tool_use":
                 calls.append(ToolCall(id=block["id"], name=block["name"], arguments=block.get("input") or {}))
         return ChatResponse(text="\n".join(texts).strip(), tool_calls=calls, raw=data)
+
+
+def _truncated_tool_use(data: dict) -> bool:
+    return data.get("stop_reason") == "max_tokens" and any(b.get("type") == "tool_use" for b in data.get("content") or [])
 
 
 def _as_text(content: Any) -> str:

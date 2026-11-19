@@ -24,7 +24,7 @@ docker compose up -d --build  # → http://localhost:8000
 
 ### Local
 
-You need Python 3.10+, PostgreSQL with [pgvector](https://github.com/pgvector/pgvector), and Node 18+ (only to build the UI).
+You need Python 3.10+, PostgreSQL with [pgvector](https://github.com/pgvector/pgvector), and Node 20.19+ or 22.12+ (only to build the UI; Vite 7).
 
 ```bash
 pip install -r requirements.txt          # + requirements-local.txt for local Qwen-VL / HF detectors
@@ -116,7 +116,7 @@ Every role takes a spec of the form `provider:model`. Set it in `.env` (`OVP_DET
 
 | Role | Local | Cloud / server | `auto` picks |
 |---|---|---|---|
-| Detector | `yoloe:yoloe-11{s,m,l}-seg.pt` (open-vocab and masks), `yolo-world:yolov8l-worldv2.pt`, `yolo:yolo11l.pt` / `yolo:yolo11l-seg.pt` (COCO only), `owlv2:google/owlv2-base-patch16-ensemble`, `grounding-dino:IDEA-Research/grounding-dino-tiny` | `vlm:<vlm spec>` (boxes from a VLM, e.g. `vlm:gemini:gemini-2.5-flash`) | YOLOE-11L on CUDA, otherwise YOLOE-11M. YOLO11-L without the CLIP package. A VLM without ultralytics |
+| Detector | `yoloe:yoloe-11{s,m,l}-seg.pt` (open-vocab and masks), `yolo-world:yolov8l-worldv2.pt`, `yolo:yolo11l.pt` / `yolo:yolo11l-seg.pt` (COCO only), `owlv2:google/owlv2-base-patch16-ensemble`, `grounding-dino:IDEA-Research/grounding-dino-tiny` | `vlm:<vlm spec>` (boxes from a VLM, e.g. `vlm:gemini:gemini-2.5-flash`; use Gemini or Qwen-VL, OpenAI models give coarse boxes) | YOLOE-11L on CUDA, otherwise YOLOE-11M. YOLO11-L without the CLIP package. A VLM without ultralytics |
 | Segmenter | `sam:sam2.1_{t,b,l}.pt`, `sam:mobile_sam.pt`, `sam:sam_b.pt`, `fastsam:FastSAM-s.pt`, `detector` (YOLOE-seg masks, free) | – | Detector masks when available, then `sam:sam2.1_b.pt` on CUDA, otherwise `sam:mobile_sam.pt` |
 | VLM | `qwen:Qwen/Qwen2.5-VL-3B-Instruct` (or `-7B`; `hf:` works too), `ollama:qwen2.5vl:7b` | `openai:gpt-4.1-mini`, `anthropic:claude-haiku-5-5`, `gemini:gemini-2.5-flash`, `openrouter:<model>`, `compat:<model>` | Local Qwen on a GPU, otherwise the first key found: OpenAI, Anthropic, Gemini, then compat |
 | LLM (planner, agent) | `ollama:qwen3:8b` | `openai:gpt-4.1-mini`, `anthropic:claude-sonnet-5-5`, `gemini:gemini-2.5-flash`, `openrouter:<model>`, `compat:<model>` | First key found: OpenAI, Anthropic, Gemini, then compat. The agent needs tool calling |
@@ -165,6 +165,9 @@ All settings are environment variables. A `.env` file in the working directory i
 | `OVP_JOB_CONCURRENCY` | `2` | Jobs running at once |
 | `OVP_MEDIA_CONCURRENCY` | `3` | Media items processed at once within a job |
 | `OVP_REID_MATCH` / `OVP_REID_REVIEW` | per backend | Identity thresholds. Defaults: OSNet 0.75/0.60, CLIP 0.88/0.80, colour 0.93/0.86 |
+| `OVP_IMPORT_ROOTS` | – (disabled) | Comma-separated server folders that `POST /api/analyze/paths`, the UI's "Analyze server paths" and the agent may read. Unset → those return 403. The CLI is not restricted |
+| `OVP_CORS_ORIGINS` | `http://localhost:5173,http://localhost:3000` | Comma-separated browser origins allowed to call the API cross-origin; `*` allows any. The UI served by the API itself needs no entry |
+| `OVP_MAX_UPLOAD_MB` | `2048` | Max request body for uploads (all files of one request together) → 413 |
 | `OVP_PRELOAD` | `true` | Load default models in the background at startup |
 | `OVP_FRONTEND_DIST` | `frontend/dist` | Built UI served at `/` |
 
@@ -174,7 +177,7 @@ All settings are environment variables. A `.env` file in the working directory i
 - **Verification and descriptions are only as good as the VLM.** Small or blurry crops and abstract concepts ("menacing") can be wrong. Each answer comes with the stored reason, so you can audit it.
 - **CPU works, but slowly.** On CPU, use YOLOE-11S, MobileSAM and a cloud VLM. Local Qwen-VL and SAM 2.1-L need a GPU. Long videos are capped by `OVP_MAX_FRAMES`.
 - **Jobs and agent conversations live in memory.** They are lost on restart. Analysis results themselves are stored in PostgreSQL.
-- **There is no authentication.** CORS is open, and `/api/analyze/paths` (also used by the agent) reads any path the server process can access. Run the server only on a trusted network or behind an authenticating proxy.
+- **There is no authentication.** Anyone who can reach the port can read and change the library, and `/api/analyze/paths` (also used by the agent) reads any media file under `OVP_IMPORT_ROOTS`. Run the server only on a trusted network or behind an authenticating proxy.
 - **Weights download on first use.** That includes ultralytics assets from GitHub, OSNet from Google Drive, and CLIP / Qwen / OWLv2 from Hugging Face. Offline machines need the weights placed in `OVP_WEIGHTS_DIR` or the caches in advance. When a download fails, the model is reported as unavailable instead of crashing the server.
 
 ## License

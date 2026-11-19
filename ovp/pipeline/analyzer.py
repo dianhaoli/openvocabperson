@@ -17,8 +17,10 @@ import asyncio
 import logging
 import math
 import queue
+import re
 import threading
 import time
+import weakref
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, Sequence, Union
@@ -28,7 +30,7 @@ from PIL import Image
 
 from .. import serialize
 from ..config import get_settings
-from ..models.detectors import COCO_CLASSES, box_iou, cross_label_nms
+from ..models.detectors import COCO_CLASSES, TRACK_LOST_SECONDS, box_iou, cross_label_nms
 from ..models.embedders import l2n
 from ..models.llm import extract_json, user
 from ..models.registry import ModelRegistry
@@ -41,6 +43,10 @@ from .planner import QueryPlanner
 log = logging.getLogger("ovp.pipeline")
 
 Emit = Callable[..., None]
+Counts = dict[str, int]  # {"accepted", "rejected", "updated"}
+
+DEFAULT_PLAN_CONF = 0.2  # recall for the default "everything" vocabulary
+QUERY_CONF = 0.15  # open-vocabulary text prompts score low (YOLOE often 0.1-0.25); verification filters the rest
 
 
 class Cancelled(Exception):
@@ -121,6 +127,9 @@ def build_crop_prompt(label: str, questions: list[str], describe: bool) -> str:
     return "\n".join(lines)
 
 
+_CHECK_ID = re.compile(r"q\d+")
+
+
 def parse_crop_reply(text: str, n_questions: int, describe: bool) -> tuple[list[tuple[Optional[bool], str]], Optional[str], Optional[dict]]:
     checks: list[tuple[Optional[bool], str]] = [(None, "")] * n_questions
     summary, attrs = None, None
@@ -138,13 +147,17 @@ def parse_crop_reply(text: str, n_questions: int, describe: bool) -> tuple[list[
             ans = True if low.startswith("yes") else False if low.startswith("no") else None
             checks = [(ans, (text or "")[:200])] * n_questions
         return checks, summary, attrs
-    raw_checks = data.get("checks") or []
-    by_id = {}
-    for i, c in enumerate(raw_checks if isinstance(raw_checks, list) else []):
-        if isinstance(c, dict):
-            by_id[str(c.get("id", f"q{i + 1}"))] = c
+    raw_checks = data.get("checks")
+    if isinstance(raw_checks, list):
+        items = [(str(c.get("id", f"q{i + 1}")) if isinstance(c, dict) else f"q{i + 1}", c) for i, c in enumerate(raw_checks)]
+    elif isinstance(raw_checks, dict):
+        items = [(str(k), v) for k, v in raw_checks.items()]
+    else:  # answers at the top level: {"q1": true, ...}
+        items = [(k, v) for k, v in data.items() if _CHECK_ID.fullmatch(k)]
+    answers = [(k, v if isinstance(v, dict) else {"answer": v}) for k, v in items]
+    by_id = dict(answers)
     for i in range(n_questions):
-        c = by_id.get(f"q{i + 1}") or (raw_checks[i] if isinstance(raw_checks, list) and i < len(raw_checks) and isinstance(raw_checks[i], dict) else None)
+        c = by_id.get(f"q{i + 1}") or (answers[i][1] if i < len(answers) else None)
         if c is None:
             continue
         a = c.get("answer")
@@ -154,8 +167,10 @@ def parse_crop_reply(text: str, n_questions: int, describe: bool) -> tuple[list[
     if describe:
         summary = data.get("summary")
         summary = str(summary).strip() if summary else None
-        attrs = {k: str(v).strip() for k, v in data.items() if k not in ("checks", "summary") and v not in (None, "", [], {})}
+        attrs = {k: str(v).strip() for k, v in data.items() if k not in ("checks", "summary") and not _CHECK_ID.fullmatch(k) and v not in (None, "", [], {})}
         attrs = {k: v for k, v in attrs.items() if v.lower() not in ("unclear", "none", "n/a")} or None
+        if not summary and attrs:  # fields without the summary line still describe the subject
+            summary = "; ".join(f"{k.replace('_', ' ')}: {v}" for k, v in attrs.items())
     return checks, summary, attrs
 
 
@@ -239,6 +254,30 @@ def _segments_overlap(a: list[tuple[float, float]], b: list[tuple[float, float]]
     return any(s1 <= e2 and s2 <= e1 for s1, e1 in a for s2, e2 in b)
 
 
+def _is_person(d: Detection) -> bool:
+    return d.label == "person"
+
+
+def _same_box(c: Candidate, e: Any) -> bool:
+    """Whether a new image detection duplicates a stored entity (same label, nearly the same box)."""
+    return bool(e["label"] == c.det.label and box_iou(c.det.box, (e["x1"], e["y1"], e["x2"], e["y2"])) > 0.7)
+
+
+def _split_existing(cands: list[Candidate], existing: Optional[list[Any]], same: Callable[[Candidate, Any], bool]) -> tuple[list[Candidate], list[tuple[Candidate, Any]]]:
+    """Split a scan's candidates into new ones and ``(candidate, stored entity)`` duplicates (one per entity)."""
+    new: list[Candidate] = []
+    matched: list[tuple[Candidate, Any]] = []
+    taken: set[str] = set()
+    for c in cands:
+        e = next((e for e in existing or () if same(c, e)), None)
+        if e is None:
+            new.append(c)
+        elif e["id"] not in taken:
+            taken.add(e["id"])
+            matched.append((c, e))
+    return new, matched
+
+
 def _same_track(c: Candidate, e: Any) -> bool:
     """Whether a new track duplicates a stored video entity (same label, overlapping in time and space)."""
     if e["label"] != c.det.label or e["t_start"] is None or c.t_start is None:
@@ -246,6 +285,46 @@ def _same_track(c: Candidate, e: Any) -> bool:
     if c.t_end < e["t_start"] or e["t_end"] < c.t_start:  # type: ignore[operator]
         return False
     return box_iou(c.det.box, (e["x1"], e["y1"], e["x2"], e["y2"])) > 0.5
+
+
+class _ByteTracker:
+    """ByteTrack over per-frame detections. The state lives here rather than in the detector, so the
+    device thread is free between frames and any detector can track."""
+
+    def __init__(self, conf: float, sample_fps: float):
+        from ultralytics.trackers.byte_tracker import BYTETracker
+        from ultralytics.utils import IterableSimpleNamespace
+
+        self.low = round(max(0.05, conf * 0.4), 3)  # detection threshold: feeds ByteTrack's low-score association
+        # the lost-track buffer is in *sampled* frames: at 2 fps the default (30) would keep a vanished track for 15 s
+        args = IterableSimpleNamespace(
+            tracker_type="bytetrack", track_high_thresh=conf, track_low_thresh=self.low, new_track_thresh=conf,
+            track_buffer=max(2, math.ceil(TRACK_LOST_SECONDS * sample_fps)), match_thresh=0.8, fuse_score=True,
+        )
+        self._tracker = BYTETracker(args)
+        self._classes: dict[str, int] = {}
+
+    def update(self, dets: list[Detection], shape: tuple[int, int]) -> list[Detection]:
+        """Feed one frame; returns its tracked detections with ``track_id`` set."""
+        from ultralytics.engine.results import Boxes
+
+        rows = [[*d.box, d.score, self._classes.setdefault(d.label, len(self._classes))] for d in dets]
+        out = []
+        for row in self._tracker.update(Boxes(np.asarray(rows, np.float32).reshape(-1, 6), shape)):
+            d = dets[int(row[-1])]
+            d.track_id = int(row[4])
+            out.append(d)
+        return out
+
+
+@dataclass
+class _Job:
+    """VLM work for one candidate."""
+
+    cand: Candidate
+    verify: list[Concept]
+    describe: bool
+    verify_only: bool  # only verification concepts claim it: denied by all checks → rejected
 
 
 @dataclass
@@ -343,7 +422,7 @@ class _FrameReader:
             try:
                 item = self._queue.get(timeout=0.2)
             except queue.Empty:
-                if self._stop.is_set():  # closed early (e.g. the awaiting task was cancelled): never block the device thread
+                if self._stop.is_set():  # closed early (e.g. the awaiting task was cancelled): never block the reading thread
                     return
                 continue
             if item is _END:
@@ -412,6 +491,7 @@ class Analyzer:
     def __init__(self, db: Database, store: FileStore, registry: ModelRegistry, planner: QueryPlanner, identity: IdentityService):
         self.db, self.store, self.reg, self.planner, self.identity = db, store, registry, planner, identity
         self.s = get_settings()
+        self._media_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
 
     # ── planning ──────────────────────────────────────────────────────────────
     async def make_plan(self, opts: AnalyzeOptions) -> QueryPlan:
@@ -470,137 +550,147 @@ class Analyzer:
         try:
             await self._image_entities(media_id, img, opts, plan, emit, cancel, existing=None)
             await self.db.update_media(media_id, status="done")
+        except Cancelled:
+            await self.db.update_media(media_id, status="cancelled")
+            raise
         except BaseException:
             await self.db.update_media(media_id, status="error")
             raise
         return media_id
+
+    def _conf(self, opts: AnalyzeOptions, plan: QueryPlan) -> float:
+        """Detection threshold: the user's, else a recall-oriented default (lower for queries)."""
+        if opts.conf is not None:
+            return opts.conf
+        return min(self.s.detection_conf, DEFAULT_PLAN_CONF if plan.source == "default" else QUERY_CONF)
 
     async def _detect_image(self, img: Image.Image, models: dict[str, Any], opts: AnalyzeOptions, plan: QueryPlan) -> list[Detection]:
         det = models["detector"]
         prompts = self._detector_supports(det, plan)
         if not prompts:
             return []
-        conf = opts.conf if opts.conf is not None else self.s.detection_conf
-        if plan.source == "default":
-            conf = min(conf, 0.2)
-        dets = await det.detect(img, prompts if plan.source != "default" or det.open_vocab else None, conf)
-        # keep person boxes separate from object boxes during cross-prompt NMS (a person holding a bag)
-        return cross_label_nms(dets, self.s.nms_iou, protect=lambda d: d.label == "person")
+        dets = await det.detect(img, prompts if plan.source != "default" or det.open_vocab else None, self._conf(opts, plan))
+        return cross_label_nms(dets, self.s.nms_iou, protect=_is_person)
 
-    async def _image_entities(self, media_id: str, img: Image.Image, opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event], existing: Optional[list[Any]]) -> int:
+    async def _image_entities(self, media_id: str, img: Image.Image, opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event], existing: Optional[list[Any]]) -> Counts:
         models = await self._models(opts, plan)
         emit("stage", media_id=media_id, stage="detect", message=f"Detecting {len(plan.prompts)} prompt(s) with {models['detector'].spec}")
         t0 = time.perf_counter()
         dets = await self._detect_image(img, models, opts, plan)
-        if existing:  # library scan: skip what is already there
-            dets = [d for d in dets if not any(e["label"] == d.label and box_iou(d.box, (e["x1"], e["y1"], e["x2"], e["y2"])) > 0.7 for e in existing)]
-        labels: dict[str, int] = {}
-        for d in dets:
-            labels[d.label] = labels.get(d.label, 0) + 1
-        emit("detections", media_id=media_id, count=len(dets), labels=labels, elapsed=round(time.perf_counter() - t0, 2))
         if not opts.segment:
             for d in dets:
                 d.polygons, d.mask_area = None, None
         w, h = img.size
         cands = [Candidate(det=d, crop=img.crop(expand_box(d.box, w, h, self.s.expand_ratio))) for d in dets]
+        cands, matched = _split_existing(cands, existing, _same_box)
+        emit("detections", media_id=media_id, count=len(cands), labels=_count(c.det.label for c in cands), elapsed=round(time.perf_counter() - t0, 2))
         segment_task = None
         seg = models["segmenter"]
-        if seg is not None and seg.kind != "detector" and dets:
-            emit("stage", media_id=media_id, stage="segment", message=f"Segmenting {len(dets)} object(s) with {seg.spec}")
-            segment_task = asyncio.create_task(seg.segment(img, dets))
-        await self._process(media_id, cands, opts, plan, models, emit, cancel, extra=[segment_task] if segment_task else [])
-        return len(cands)
+        if seg is not None and seg.kind != "detector" and cands:
+            emit("stage", media_id=media_id, stage="segment", message=f"Segmenting {len(cands)} object(s) with {seg.spec}")
+            segment_task = asyncio.create_task(seg.segment(img, [c.det for c in cands]))
+        try:
+            return await self._process(media_id, cands, opts, plan, models, emit, cancel, extra=[segment_task] if segment_task else [], matched=matched)
+        finally:
+            if segment_task is not None and not segment_task.done():  # cancelled before the stages were awaited
+                segment_task.cancel()
+                await asyncio.gather(segment_task, return_exceptions=True)
 
     # ── shared crop processing ────────────────────────────────────────────────
-    async def _process(self, media_id: str, cands: list[Candidate], opts: AnalyzeOptions, plan: QueryPlan, models: dict[str, Any], emit: Emit, cancel: Optional[threading.Event], extra: Sequence[asyncio.Task] = ()) -> None:
+    def _route(self, c: Candidate, plan: QueryPlan, opts: AnalyzeOptions, vlm: Any) -> _Job:
+        """Assign the candidate's concept (and low-confidence stage) and decide its VLM work."""
+        concepts = plan.concepts_for_label(c.det.label) if plan.source != "default" else []
+        plain = [k for k in concepts if not k.verify]
+        to_verify = [k for k in concepts if k.verify] if opts.verify is not False else []
+        if opts.verify is True and not to_verify:
+            to_verify = [Concept(name=k.name, prompts=k.prompts, verify=True, question=f"Is this really a {c.det.label} (part of '{k.name}')?") for k in plain]
+            plain = []
+        claimed = plain or to_verify or concepts
+        c.concept = claimed[0].name if claimed else None  # verified matches may re-assign it
+        if c.is_person and c.det.score < self.s.low_conf:
+            c.stage = "low_confidence"
+        # without a VLM we cannot verify: keep candidates, verification stays unknown
+        if vlm is None:
+            to_verify = []
+        if plain:
+            to_verify = [k for k in to_verify if k.kind == "person_attribute"] if c.is_person else []
+        describe = opts.describe == "all" or (opts.describe == "persons" and c.is_person)
+        describe = describe and c.stage != "low_confidence" and vlm is not None
+        if c.crop.width * c.crop.height < 20 * 20:
+            describe, to_verify = False, []
+        return _Job(c, to_verify, describe, verify_only=bool(to_verify) and not plain)
+
+    async def _run_vlm(self, media_id: str, vlm: Any, jobs: list[_Job], emit: Emit) -> None:
+        """Verify + describe crops in one request each; verify-only candidates that every check denies are rejected."""
+        if not jobs:
+            return
+        emit("stage", media_id=media_id, stage="describe", message=f"{vlm.spec}: {sum(1 for j in jobs if j.verify)} verification(s), {sum(1 for j in jobs if j.describe)} description(s)")
+        batch = [[user(j.cand.crop, build_crop_prompt(j.cand.det.label, [k.question or f"Is this {k.name}?" for k in j.verify], j.describe))] for j in jobs]
+        t = time.perf_counter()
+        replies = await vlm.complete_many(batch, max_tokens=self.s.vlm_max_tokens, json_mode=True)
+        failures = 0
+        for j, reply in zip(jobs, replies):
+            c = j.cand
+            if isinstance(reply, Exception):
+                failures += 1
+                continue
+            checks, summary, attrs = parse_crop_reply(reply, len(j.verify), j.describe)
+            yes = [(k, r) for k, (a, r) in zip(j.verify, checks) if a]
+            if yes:
+                c.verified, c.verify_reason = True, yes[0][1] or None
+                c.concept = yes[0][0].name
+            elif j.verify_only and any(a is not None for a, _ in checks):
+                # only verification concepts claimed this detection and they said no: kept (with the checked concept) but filtered out
+                c.verified = False
+                c.verify_reason = next((r for a, r in checks if r), None)
+                c.stage = "rejected"
+            if j.describe and summary:
+                c.description, c.attributes = summary, attrs
+                if c.stage == "detected":
+                    c.stage = "described"
+        if failures:
+            emit("log", level="warning", message=f"{failures} VLM request(s) failed")
+        emit("log", level="info", message=f"VLM finished {len(jobs)} crop(s) in {time.perf_counter() - t:.1f}s")
+
+    async def _process(
+        self, media_id: str, cands: list[Candidate], opts: AnalyzeOptions, plan: QueryPlan, models: dict[str, Any], emit: Emit,
+        cancel: Optional[threading.Event], extra: Sequence[asyncio.Task] = (), matched: Sequence[tuple[Candidate, Any]] = (),
+    ) -> Counts:
+        """Run the crop stages on new candidates and save them; re-check stored entities a scan detected again (``matched``)."""
+
         def check_cancel() -> None:
             if cancel is not None and cancel.is_set():
                 raise Cancelled()
 
         vlm = models["vlm"]
-        verify_mode = opts.verify
-        # 1) routing: concepts, low-confidence persons
-        jobs: list[tuple[Candidate, list[Concept], bool]] = []  # (cand, concepts to verify, describe?)
-        for c in cands:
-            concepts = plan.concepts_for_label(c.det.label) if plan.source != "default" else []
-            plain = [k for k in concepts if not k.verify]
-            to_verify = [k for k in concepts if k.verify] if verify_mode is not False else []
-            if verify_mode is True and not to_verify:
-                to_verify = [Concept(name=k.name, prompts=k.prompts, verify=True, question=f"Is this really a {c.det.label} (part of '{k.name}')?") for k in plain]
-                plain = []
-            c.concept = plain[0].name if plain else (None if (to_verify and vlm is not None) else (concepts[0].name if concepts else None))
-            if c.is_person and c.det.score < self.s.low_conf:
-                c.stage = "low_confidence"
-            # without a VLM we cannot verify: keep candidates, verification stays unknown
-            if vlm is None:
-                to_verify = []
-            if plain:
-                to_verify = [k for k in to_verify if k.kind == "person_attribute"] if c.is_person else []
-            describe = opts.describe == "all" or (opts.describe == "persons" and c.is_person)
-            describe = describe and c.stage != "low_confidence" and vlm is not None
-            if c.crop.width * c.crop.height < 20 * 20:
-                describe, to_verify = False, []
-            jobs.append((c, to_verify, describe))
+        # 1) routing: concepts, low-confidence persons; stored entities are only verified again (no description)
+        jobs = [self._route(c, plan, opts, vlm) for c in cands]
+        rechecks = [(self._route(c, plan, opts, vlm), e) for c, e in matched]
+        for j, _ in rechecks:
+            j.describe = False
 
         # cap the number of VLM calls (largest, most confident first)
-        vlm_jobs = [j for j in jobs if j[1] or j[2]]
+        vlm_jobs = [j for j in jobs + [j for j, _ in rechecks] if j.verify or j.describe]
         if len(vlm_jobs) > self.s.max_vlm_crops:
-            vlm_jobs.sort(key=lambda j: (bool(j[1]), j[0].det.score * math.sqrt(j[0].det.area)), reverse=True)
-            dropped = vlm_jobs[self.s.max_vlm_crops :]
+            vlm_jobs.sort(key=lambda j: (bool(j.verify), j.cand.det.score * math.sqrt(j.cand.det.area)), reverse=True)
+            emit("log", level="warning", message=f"{len(vlm_jobs) - self.s.max_vlm_crops} crop(s) not sent to the VLM (OVP_MAX_VLM_CROPS={self.s.max_vlm_crops})")
             vlm_jobs = vlm_jobs[: self.s.max_vlm_crops]
-            emit("log", level="warning", message=f"{len(dropped)} crop(s) not sent to the VLM (OVP_MAX_VLM_CROPS={self.s.max_vlm_crops})")
         check_cancel()
-
-        async def run_vlm() -> None:
-            if not vlm_jobs:
-                return
-            n_verify = sum(1 for j in vlm_jobs if j[1])
-            emit("stage", media_id=media_id, stage="describe", message=f"{vlm.spec}: {n_verify} verification(s), {sum(1 for j in vlm_jobs if j[2])} description(s)")
-            batch = [[user(c.crop, build_crop_prompt(c.det.label, [k.question or f"Is this {k.name}?" for k in vs], d))] for c, vs, d in vlm_jobs]
-            t = time.perf_counter()
-            replies = await vlm.complete_many(batch, max_tokens=self.s.vlm_max_tokens, json_mode=True)
-            failures = 0
-            for (c, vs, d), reply in zip(vlm_jobs, replies):
-                if isinstance(reply, Exception):
-                    failures += 1
-                    continue
-                checks, summary, attrs = parse_crop_reply(reply, len(vs), d)
-                if vs:
-                    yes = [(k, r) for k, (a, r) in zip(vs, checks) if a]
-                    unknown = all(a is None for a, _ in checks)
-                    if yes:
-                        c.verified, c.verify_reason = True, yes[0][1] or None
-                        c.concept = yes[0][0].name
-                    elif not unknown and c.concept is None:
-                        # only verification concepts claimed this detection and all said no → filtered out
-                        c.verified = False
-                        c.verify_reason = next((r for a, r in checks if r), None)
-                        c.stage = "rejected"
-                if d and summary:
-                    c.description, c.attributes = summary, attrs
-                    if c.stage == "detected":
-                        c.stage = "described"
-            if failures:
-                emit("log", level="warning", message=f"{failures} VLM request(s) failed")
-            emit("log", level="info", message=f"VLM finished {len(vlm_jobs)} crop(s) in {time.perf_counter() - t:.1f}s")
 
         async def run_clip() -> None:
             clip = models["clip"]
-            if clip is None:
-                return
-            todo = [c for c in cands]
-            if not todo:
+            if clip is None or not cands:
                 return
             try:
-                vecs = await clip.embed_images([c.crop for c in todo])
-                for c, v in zip(todo, vecs):
+                vecs = await clip.embed_images([c.crop for c in cands])
+                for c, v in zip(cands, vecs):
                     c.image_embedding = v
             except Exception as e:
                 emit("log", level="warning", message=f"CLIP embedding failed: {e}")
 
         async def run_reid() -> None:
             reid = models["reid"]
-            people = [c for c in cands if c.is_person and c.stage != "low_confidence"]
+            people = [c for c in cands if c.is_person and c.stage != "low_confidence" and c.reid_embedding is None]  # stitched tracks already have one
             if reid is None or not people:
                 return
             emit("stage", media_id=media_id, stage="embed", message=f"Re-ID embeddings for {len(people)} person crop(s)")
@@ -618,7 +708,7 @@ class Analyzer:
             except Exception as e:
                 emit("log", level="warning", message=f"Re-ID failed: {e}")
 
-        results = await asyncio.gather(run_vlm(), run_clip(), run_reid(), *[t for t in extra if t], return_exceptions=True)
+        results = await asyncio.gather(self._run_vlm(media_id, vlm, vlm_jobs, emit), run_clip(), run_reid(), *extra, return_exceptions=True)
         for r in results:
             if isinstance(r, Exception):
                 if isinstance(r, Cancelled):
@@ -627,12 +717,20 @@ class Analyzer:
                 emit("log", level="error", message=f"stage failed: {r}")
         check_cancel()
 
-        # rejected candidates are kept (for transparency) but excluded from identity linking
+        # rejected and low-confidence candidates are kept (for transparency) but excluded from identity linking
         for c in cands:
-            if c.stage == "rejected":
+            if c.stage in ("rejected", "low_confidence"):
                 c.reid_embedding = None
+        if cands:
+            await self._save(media_id, cands, models, emit)
+        n_rejected = sum(1 for c in cands if c.stage == "rejected")
+        counts = {"accepted": len(cands) - n_rejected, "rejected": n_rejected, "updated": 0}
+        for key, n in (await self._apply_rechecks(rechecks, emit)).items():
+            counts[key] += n
+        return counts
 
-        # 2) text embeddings of descriptions
+    async def _save(self, media_id: str, cands: list[Candidate], models: dict[str, Any], emit: Emit) -> None:
+        """Text-embed descriptions, store the candidates in one transaction, link person sightings to identities."""
         temb = models["text"]
         described = [c for c in cands if c.description]
         if temb is not None and described:
@@ -647,8 +745,8 @@ class Analyzer:
             except Exception as e:
                 emit("log", level="warning", message=f"text embedding failed: {e}")
 
-        # 3) persist
-        emit("stage", media_id=media_id, stage="save", message=f"Saving {len(cands)} entities")
+        n_rejected = sum(1 for c in cands if c.stage == "rejected")
+        emit("stage", media_id=media_id, stage="save", message=f"Saving {len(cands)} entities" + (f" ({n_rejected} rejected by verification)" if n_rejected else ""))
         rows, embs = [], []
         for c in cands:
             c.entity_id = new_id("e")
@@ -669,10 +767,9 @@ class Analyzer:
                 embs.append((c.entity_id, temb.space, c.text_embedding))
             if c.reid_embedding is not None:
                 embs.append((c.entity_id, models["reid"].space, c.reid_embedding))
-        await self.db.insert_entities(rows, embs)
+        await self.db.insert_entities(rows, embs)  # type: ignore[arg-type]
 
-        # 4) identity
-        people = [(c.entity_id, c.reid_embedding) for c in cands if c.reid_embedding is not None and c.stage != "rejected"]
+        people = [(c.entity_id, c.reid_embedding) for c in cands if c.reid_embedding is not None]
         if people and models["reid"] is not None:
             emit("stage", media_id=media_id, stage="identity", message=f"Linking {len(people)} person sighting(s)")
             conflicts = None
@@ -687,15 +784,55 @@ class Analyzer:
         for row in await self.db.get_entities([c.entity_id for c in cands]):  # type: ignore[misc]
             emit("entity", entity=serialize.entity(row))
 
+    async def _apply_rechecks(self, rechecks: list[tuple[_Job, Any]], emit: Emit) -> Counts:
+        """Re-label / re-verify stored entities a scan detected again.
+
+        A stored entity matching the scan's concepts is ``accepted`` (and ``updated`` when its concept or
+        verification changed). A stored entity that only verification concepts claimed and that the VLM
+        denied counts as ``rejected`` but is left untouched: it is still a valid detection, it just does
+        not match this query. Unknown verification changes nothing.
+        """
+        counts = {"accepted": 0, "rejected": 0, "updated": 0}
+        changed_ids = []
+        for j, e in rechecks:
+            c = j.cand
+            if c.concept is None:  # the scan's plan has no concept for this label (e.g. the default vocabulary)
+                continue
+            if c.stage == "rejected":
+                counts["rejected"] += 1
+                continue
+            if c.verified:
+                fields: dict[str, Any] = {"concept": c.concept, "verified": True, "verify_reason": c.verify_reason}
+            elif not j.verify_only:
+                fields = {"concept": c.concept}
+            else:
+                continue
+            if e["stage"] == "rejected":  # rejected for an earlier query's concept, matches this one
+                fields["stage"] = "described" if e["description"] else "detected"
+                fields.setdefault("verified", None)
+                fields.setdefault("verify_reason", None)
+            counts["accepted"] += 1
+            changes = {k: v for k, v in fields.items() if e[k] != v}
+            if changes:
+                await self.db.update_entity(e["id"], **changes)
+                changed_ids.append(e["id"])
+        counts["updated"] = len(changed_ids)
+        for row in await self.db.get_entities(changed_ids) if changed_ids else []:
+            emit("entity", entity=serialize.entity(row))
+        return counts
+
     # ── video ─────────────────────────────────────────────────────────────────
-    async def analyze_video(self, path: Path, name: str, opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event] = None) -> str:
+    async def analyze_video(
+        self, path: Path, name: str, opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event] = None, move: bool = False,
+    ) -> str:
+        """Analyse a video file; ``move`` moves it into storage instead of copying (temporary uploads)."""
         from ..runtime import get_runtime
 
         info = await get_runtime().run_cpu(_probe_video, path)
         if info is None:
             raise RuntimeError(f"cannot decode video {name}")
         media_id = new_id("m")
-        stored = await self.store.import_file(media_id, path, path.suffix or ".mp4")
+        stored = await self.store.import_file(media_id, path, path.suffix or ".mp4", move=move)
         await self.store.save_thumb(media_id, info.poster)
         await self.db.insert_media(
             id=media_id, kind="video", name=name, path=str(stored), thumb_path=str(self.store.thumb_path(media_id)), width=info.width, height=info.height,
@@ -706,68 +843,60 @@ class Analyzer:
             await self._video_entities(media_id, stored, info.fps, info.frame_count, opts, plan, emit, cancel, existing=None)
             await self.db.update_media(media_id, status="done")
         except Cancelled:
-            await self.db.update_media(media_id, status="cancelled")  # the stored video can still be scanned later
+            await self.db.update_media(media_id, status="cancelled")
             raise
         except BaseException:
             await self.db.update_media(media_id, status="error")
             raise
         return media_id
 
-    async def _video_entities(self, media_id: str, path: Path, fps: float, n: int, opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event], existing: Optional[list[Any]]) -> int:
+    async def _video_entities(self, media_id: str, path: Path, fps: float, n: int, opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event], existing: Optional[list[Any]]) -> Counts:
         from ..runtime import get_runtime
 
         models = await self._models(opts, plan)
         det = models["detector"]
-        if not getattr(det, "supports_tracking", False):
-            raise RuntimeError(f"detector {det.spec} cannot track video; use a YOLO/YOLOE/YOLO-World detector")
         prompts = self._detector_supports(det, plan)
         if not prompts:
             emit("detections", media_id=media_id, count=0, labels={}, frames=0)
-            return 0
+            return {"accepted": 0, "rejected": 0, "updated": 0}
         sample_fps = min(fps, opts.video_fps or self.s.video_fps)
         max_frames = max(1, opts.max_frames or self.s.max_frames)
         step = max(1, round(fps / max(0.1, sample_fps)))
         if n and math.ceil(n / step) > max_frames:
             step = math.ceil(n / max_frames)
         total = min(math.ceil(n / step), max_frames) if n else None
-        conf = opts.conf if opts.conf is not None else self.s.detection_conf
-        if plan.source == "default":
-            conf = min(conf, 0.2)  # same recall as images for the default "everything" vocabulary
+        tracker = _ByteTracker(self._conf(opts, plan), fps / step)
+        det_prompts = prompts if (det.open_vocab or plan.source != "default") else None
         ratio = self.s.expand_ratio
         tracks: dict[int, _Track] = {}
         sampled = 0
-        loop = asyncio.get_running_loop()
         last_emit = 0.0
-
-        def on_frame(idx: int, t: float, frame: np.ndarray, dets: list[Detection]) -> None:  # runs on the device thread
-            nonlocal sampled, last_emit
-            sampled += 1
-            for d in dets:
-                if d.track_id is not None:
-                    tracks.setdefault(d.track_id, _Track(d.track_id)).add(idx, t, frame, d, ratio)
-            now = time.monotonic()
-            if now - last_emit > 0.5:
-                last_emit = now
-                msg = f"Tracking frame {sampled}" + (f"/{total}" if total else "") + f" · {len(tracks)} track(s)"
-                loop.call_soon_threadsafe(lambda: emit("stage", media_id=media_id, stage="track", message=msg, frames=sampled, total=total))
 
         emit("stage", media_id=media_id, stage="track", message=f"Tracking {len(prompts)} prompt(s) at ~{fps / step:.1f} fps with {det.spec}")
         t0 = time.perf_counter()
         reader = _FrameReader(path, fps, step, max_frames)
+        frames = iter(reader)
         try:
-            await get_runtime().run_model(
-                det.track_frames_sync, reader, prompts if (det.open_vocab or plan.source != "default") else None, conf, on_frame,
-                (lambda: cancel.is_set()) if cancel is not None else (lambda: False), fps / step,
-            )
+            while (item := await get_runtime().run_cpu(next, frames, None)) is not None:
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled()
+                idx, t, frame = item
+                # one device call per frame (tracker state lives here), so interactive model calls never wait for a whole video
+                dets = await det.detect(_bgr_to_image(frame), det_prompts, tracker.low)
+                for d in tracker.update(cross_label_nms(dets, self.s.nms_iou, protect=_is_person), frame.shape[:2]):
+                    tracks.setdefault(d.track_id, _Track(d.track_id)).add(idx, t, frame, d, ratio)  # type: ignore[arg-type]
+                sampled += 1
+                now = time.monotonic()
+                if now - last_emit > 0.5:
+                    last_emit = now
+                    msg = f"Tracking frame {sampled}" + (f"/{total}" if total else "") + f" · {len(tracks)} track(s)"
+                    emit("stage", media_id=media_id, stage="track", message=msg, frames=sampled, total=total)
         finally:
             reader.close()
-        if cancel is not None and cancel.is_set():
-            raise Cancelled()
         if not n and reader.reached_end:  # the container did not state its length; now we know it
             await self.db.update_media(media_id, frame_count=reader.frame_count, duration=round(reader.duration, 3))
         min_hits = self.s.min_track_hits if sampled >= 6 else 1
         good = [t for t in tracks.values() if len(t.hits) >= min_hits and t.best_crop is not None]
-        emit("detections", media_id=media_id, count=len(good), labels=_count(t.label for t in good), frames=sampled, elapsed=round(time.perf_counter() - t0, 2))
 
         cands: list[Candidate] = []
         for tr in good:
@@ -777,14 +906,16 @@ class Analyzer:
             c.trajectory = _thin_traj([[hh[0], *hh[1]] for hh in tr.hits], MAX_TRAJECTORY_POINTS)
             c.reid_crops = [im for _, im in tr.reid]
             cands.append(c)
-        if existing:  # library scan: skip tracks already stored (same label, overlapping in time and space)
-            cands = [c for c in cands if not any(_same_track(c, e) for e in existing)]
+        cands, matched = _split_existing(cands, existing, _same_track)
+        emit("detections", media_id=media_id, count=len(cands), labels=_count(c.det.label for c in cands), frames=sampled, elapsed=round(time.perf_counter() - t0, 2))
         cands = await self._stitch(cands, models)
-        await self._process(media_id, cands, opts, plan, models, emit, cancel)
-        return len(cands)
+        return await self._process(media_id, cands, opts, plan, models, emit, cancel, matched=matched)
 
     async def _stitch(self, cands: list[Candidate], models: dict[str, Any]) -> list[Candidate]:
-        """Merge person tracks that are the same person re-entering (never visible at the same time)."""
+        """Merge person tracks that are the same person re-entering (never visible at the same time).
+
+        The person candidates keep the Re-ID embeddings computed here; the main stage reuses them.
+        """
         reid = models["reid"]
         people = [c for c in cands if c.is_person and c.reid_crops]
         if reid is None or len(people) < 2:
@@ -811,21 +942,27 @@ class Analyzer:
                     a.reid_crops = (a.reid_crops + b.reid_crops)[:12]
                     a.reid_embedding = l2n(a.reid_embedding + b.reid_embedding)  # type: ignore[operator]
                     merged.add(id(b))
-        out = [c for c in cands if id(c) not in merged]
-        for c in out:  # the main stage computes Re-ID from the (merged) crops
-            c.reid_embedding = None
-        return out
+        return [c for c in cands if id(c) not in merged]
 
     # ── library scan ──────────────────────────────────────────────────────────
-    async def scan_media(self, media_id: str, opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event] = None) -> int:
-        m = await self.db.get_media(media_id)
-        if m is None:
-            raise KeyError(media_id)
-        existing = await self.db.media_entities(media_id)
-        if m["kind"] == "video":
-            return await self._video_entities(media_id, Path(m["path"]), m["fps"] or 25.0, m["frame_count"] or 0, opts, plan, emit, cancel, existing)
-        img = await self.store.open_image(m["path"])
-        return await self._image_entities(media_id, img, opts, plan, emit, cancel, existing)
+    async def scan_media(self, media_id: str, opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event] = None) -> Counts:
+        """Look for the plan's concepts in stored media: new detections are added, stored entities detected
+        again are re-labelled / re-verified (see ``_apply_rechecks``). Scans of one media are serialised."""
+        async with self._media_lock(media_id):
+            m = await self.db.get_media(media_id)
+            if m is None:
+                raise KeyError(media_id)
+            existing = await self.db.media_entities(media_id)
+            if m["kind"] == "video":
+                return await self._video_entities(media_id, Path(m["path"]), m["fps"] or 25.0, m["frame_count"] or 0, opts, plan, emit, cancel, existing)
+            img = await self.store.open_image(m["path"])
+            return await self._image_entities(media_id, img, opts, plan, emit, cancel, existing)
+
+    def _media_lock(self, media_id: str) -> asyncio.Lock:
+        lock = self._media_locks.get(media_id)
+        if lock is None:
+            lock = self._media_locks[media_id] = asyncio.Lock()
+        return lock
 
     # ── Q&A ───────────────────────────────────────────────────────────────────
     async def ask_entity(self, entity_id: str, question: str, scope: str = "crop", vlm_spec: Optional[str] = None) -> str:

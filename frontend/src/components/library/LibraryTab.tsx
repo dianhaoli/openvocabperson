@@ -1,20 +1,36 @@
 import { useEffect, useState } from 'react';
-import { api } from '../../api/client';
+import { ApiError, api, errorMessage } from '../../api/client';
 import { useActions, useAppState } from '../../context/hooks';
 import { useApi } from '../../hooks/useApi';
 import { TERMINAL_STATUSES } from '../../hooks/useJobTracker';
 import { useWorkspaceJob } from '../../hooks/useWorkspaceJob';
-import type { Job, Media, MediaKind } from '../../types';
+import type { Job, Media, MediaKind, MediaStatus } from '../../types';
 import { cn } from '../../utils/cn';
-import { relativeTime, shortId } from '../../utils/format';
+import { jobSummaryText, relativeTime, shortId } from '../../utils/format';
 import { Img } from '../common/Img';
 import { JobPanel, StatusBadge } from '../jobs/JobPanel';
 import { Button } from '../ui/Button';
-import { EmptyState, ErrorState, Loading, Section, Segmented, inputClass } from '../ui/Misc';
+import { Badge, EmptyState, ErrorState, Loading, Section, Segmented, inputClass } from '../ui/Misc';
 import { ConfirmModal } from '../ui/Modal';
 
 const PAGE = 24;
 type Tri = 'auto' | 'on' | 'off';
+
+const MEDIA_STATUS: Record<Exclude<MediaStatus, 'done'>, { tone: 'accent' | 'error' | 'warning'; title: string }> = {
+  processing: { tone: 'accent', title: 'Still being analyzed' },
+  error: { tone: 'error', title: 'Analysis failed' },
+  cancelled: { tone: 'warning', title: 'Analysis was cancelled' },
+};
+
+function MediaStatusBadge({ status }: { status: MediaStatus }) {
+  if (status === 'done') return null;
+  const s = MEDIA_STATUS[status];
+  return (
+    <Badge tone={s.tone} title={s.title} className="ml-auto">
+      {status}
+    </Badge>
+  );
+}
 
 function MediaCard({ m, active, onOpen, onDelete }: { m: Media; active: boolean; onOpen: () => void; onDelete: () => void }) {
   return (
@@ -33,6 +49,7 @@ function MediaCard({ m, active, onOpen, onDelete }: { m: Media; active: boolean;
           <div className="absolute bottom-0 inset-x-0 flex gap-1 px-1 py-0.5 bg-gradient-to-t from-black/85 to-transparent text-[10px]">
             <span title="entities">◻ {m.entity_count}</span>
             {m.person_count > 0 && <span title="persons">👤 {m.person_count}</span>}
+            <MediaStatusBadge status={m.status} />
           </div>
         </div>
         <div className="px-1.5 py-1">
@@ -57,6 +74,7 @@ export function LibraryTab() {
   const { libraryVersion, currentMediaId } = useAppState();
   const actions = useActions();
   const scanJob = useWorkspaceJob('Scan', { autoOpen: false });
+  const analysisJob = useWorkspaceJob('Analysis', { autoOpen: false });
 
   const [kind, setKind] = useState<'all' | MediaKind>('all');
   const [offset, setOffset] = useState(0);
@@ -66,6 +84,10 @@ export function LibraryTab() {
   const [toDelete, setToDelete] = useState<Media | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [openingJob, setOpeningJob] = useState<string | null>(null);
+  const [paths, setPaths] = useState('');
+  const [pathsQuery, setPathsQuery] = useState('');
+  const [importing, setImporting] = useState(false);
+  const [pathsError, setPathsError] = useState<string | null>(null);
 
   const mediaQ = useApi(`media:${kind}:${offset}:${libraryVersion}`, (s) =>
     api.listMedia({ limit: PAGE, offset, kind: kind === 'all' ? null : kind }, s),
@@ -99,6 +121,31 @@ export function LibraryTab() {
     }
   };
 
+  const analyzePaths = async () => {
+    const list = paths
+      .split('\n')
+      .map((p) => p.trim())
+      .filter(Boolean);
+    if (!list.length) return;
+    setImporting(true);
+    setPathsError(null);
+    try {
+      const res = await api.analyzePaths(list, { query: pathsQuery.trim() || null });
+      analysisJob.track(res.job.id, res.job);
+      jobsQ.reload();
+    } catch (err) {
+      // 403: path imports are disabled (OVP_IMPORT_ROOTS unset) or a path is outside the allowed roots
+      const msg = errorMessage(err);
+      setPathsError(
+        err instanceof ApiError && err.status === 403
+          ? `${msg}${msg.includes('OVP_IMPORT_ROOTS') ? '' : ' (only folders under OVP_IMPORT_ROOTS can be imported)'}. Or upload the files in the Analyze tab.`
+          : msg,
+      );
+    } finally {
+      setImporting(false);
+    }
+  };
+
   const confirmDelete = async () => {
     if (!toDelete) return;
     setDeleting(true);
@@ -119,7 +166,7 @@ export function LibraryTab() {
 
   const openJob = async (job: Job) => {
     if (!TERMINAL_STATUSES.includes(job.status)) {
-      scanJob.track(job.id, job);
+      (job.kind === 'scan' ? scanJob : analysisJob).track(job.id, job);
       return;
     }
     setOpeningJob(job.id);
@@ -168,6 +215,36 @@ export function LibraryTab() {
           </div>
         </form>
         {scanJob.state.jobId && <JobPanel state={scanJob.state} onCancel={scanJob.cancel} onDismiss={scanJob.reset} />}
+      </Section>
+
+      <Section title="Analyze server paths">
+        <form
+          className="flex flex-col gap-2 rounded-[12px] border border-border bg-bg-card p-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void analyzePaths();
+          }}
+        >
+          <div className="text-[11px] text-text-muted">
+            Import images and videos that are already on the server (files or folders, searched recursively). Only folders under
+            OVP_IMPORT_ROOTS are allowed.
+          </div>
+          <textarea
+            className={cn(inputClass, 'min-h-[56px] font-mono text-[11px]')}
+            value={paths}
+            onChange={(e) => {
+              setPaths(e.target.value);
+              setPathsError(null);
+            }}
+            placeholder={'One path per line, e.g.\n/data/camera1\n/data/photos/IMG_0042.jpg'}
+          />
+          <input className={inputClass} value={pathsQuery} onChange={(e) => setPathsQuery(e.target.value)} placeholder="Query (optional, default vocabulary if empty)" />
+          {pathsError && <div className="text-[11px] text-error whitespace-pre-wrap">{pathsError}</div>}
+          <Button type="submit" size="sm" className="self-end" loading={importing} disabled={!paths.trim() || analysisJob.state.streaming}>
+            Analyze paths
+          </Button>
+        </form>
+        {analysisJob.state.jobId && <JobPanel state={analysisJob.state} onCancel={analysisJob.cancel} onDismiss={analysisJob.reset} />}
       </Section>
 
       <Section
@@ -247,7 +324,7 @@ export function LibraryTab() {
                 <StatusBadge status={j.status} />
                 <span className="text-text-secondary">{j.kind}</span>
                 <span className="truncate flex-1 text-text-muted">
-                  {j.options?.query ? `“${j.options.query}”` : ''} {j.media_ids.length ? `· ${j.media_ids.length} media` : ''}
+                  {[j.options?.query ? `“${j.options.query}”` : '', running ? '' : jobSummaryText(j)].filter(Boolean).join(' · ')}
                 </span>
                 {running && j.progress && j.progress.total > 0 && (
                   <span className="font-mono text-[10px] text-text-muted">

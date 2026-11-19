@@ -114,6 +114,10 @@ class LocalVLM(ChatModel):
     async def warmup(self) -> None:
         await get_runtime().run_model(self._load)
 
+    def unload(self) -> None:
+        with self._lock:
+            self._model, self._processor = None, None
+
     async def grounding_frame(self, image: Image.Image) -> Optional[tuple[int, int]]:
         """(width, height) of the image as the model sees it, for models that answer boxes in absolute
         pixels of their resized input (Qwen2-VL / Qwen2.5-VL); None for models using relative coordinates."""

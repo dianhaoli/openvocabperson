@@ -1,6 +1,9 @@
 # API reference
 
 All endpoints are served by the FastAPI backend (`uvicorn app:app`). JSON in, JSON out unless noted.
+Errors are `{"detail": "..."}` with the usual status codes (400 bad input, 403 path not allowed, 404 unknown id,
+413 upload too large, 503 required model not configured). There is no authentication; cross-origin browser
+calls are allowed only from `OVP_CORS_ORIGINS`.
 Times are epoch seconds (float). Boxes are `[x1, y1, x2, y2]` in pixel coordinates of the original
 image (or the video frame size for videos).
 
@@ -48,12 +51,16 @@ A single detection (image) or a single track (video).
   "url": "/api/media/m_.../file",   // original file (videos support Range requests)
   "thumb_url": "/api/media/m_.../thumb",
   "query": "dangerous things",      // query used at analysis time (null = default)
-  "status": "done",                 // "processing" | "done" | "error"
+  "status": "done",                 // "processing" | "done" | "error" | "cancelled"
   "entity_count": 7,
   "person_count": 3,
   "created_at": 1731900000.0
 }
 ```
+`status`: `processing` while a job analyses it, `done` when finished, `error` when the analysis failed (or the
+server stopped mid-analysis: leftovers are marked `error` at startup), `cancelled` when its job was cancelled.
+`GET /api/media` lists `done` and `processing` media; `GET /api/stats` and library-wide scans count only `done`.
+`error` and `cancelled` media are hidden there but still reachable by id (and can be deleted).
 `GET /api/media/{id}` returns `Media` plus `"entities": Entity[]` and `"plan": Plan | null`.
 
 ### Plan
@@ -76,21 +83,31 @@ How a free-text query is turned into detector prompts.
 ```
 
 ### Job
-Analysis always runs as a background job.
+Analysis always runs as a background job. Jobs are kept **in memory only**: they are lost when the server
+restarts (their media and entities stay in the database), and only the newest 100 finished jobs are kept.
 ```jsonc
 {
   "id": "j_1a2b3c4d",
   "kind": "analyze",                // "analyze" | "scan"
   "status": "running",              // "queued" | "running" | "done" | "error" | "cancelled"
-  "progress": {"done": 3, "total": 10, "stage": "describe", "message": "Describing 4 crops"},
+  "progress": {"done": 3, "total": 10, "stage": "describe", "message": "Describing 4 crops"},  // done counts finished media only (stays < total after a cancel)
   "media_ids": ["m_..."],
   "error": null,
   "created_at": 1731900000.0, "finished_at": null,
   "options": { /* AnalyzeOptions */ },
   "plan": { /* Plan */ },           // null until planning finished
-  "summary": {"media": 1, "entities": 7, "failed": 0}  // scan: {scanned, media_with_hits, entities}
+  "summary": {"media": 1, "entities": 7, "failed": 0}  // {} until the job finishes; scan jobs: see below
 }
 ```
+Summary of a finished `scan` job:
+```jsonc
+{"scanned": 120,          // media items scanned
+ "media_with_hits": 4,    // media with at least one accepted entity (listed in media_ids)
+ "accepted": 9,           // entities matching the query: newly stored ones plus stored ones detected again
+ "rejected": 3,           // candidates the VLM verification denied (new ones are stored with stage "rejected")
+ "updated": 2}            // stored entities whose concept / verification the scan changed
+```
+A cancelled or failed job has no summary (`{}`).
 
 ### AnalyzeOptions
 All fields optional.
@@ -120,7 +137,7 @@ All fields optional.
 | GET | `/api/health` | `{status, ready, device, db, capabilities, version}`; `ready` turns true once default models finished loading |
 | GET | `/health` | Legacy alias: the same plus `pipeline_ready`, `reid_ready` |
 | GET | `/api/models` | Providers per role, availability and current defaults (see below) |
-| PATCH | `/api/config` | `{detector?, segmenter?, vlm?, llm?, embedder?, text_embedder?, reid?}` change runtime defaults (`"auto"` re-resolves). All-or-nothing: if any model fails to load nothing changes → 400. Returns the `/api/models` payload |
+| PATCH | `/api/config` | `{detector?, segmenter?, vlm?, llm?, embedder?, text_embedder?, reid?}` change runtime defaults (`"auto"` re-resolves). Atomic: every new default is loaded first; if any fails to load, none of them changes and the response is 400 with the reason. Returns the `/api/models` payload. Detector `vlm:<vlm spec>` asks the VLM for boxes: use Gemini or Qwen-VL, OpenAI models return coarse boxes |
 | GET | `/api/stats` | `{media, images, videos, entities, persons, watchlist, pending, labels: [{label, count}]}` (`pending` = sightings awaiting review) |
 
 `GET /api/models`:
@@ -144,9 +161,9 @@ All fields optional.
 | Method | Path | Body | Returns |
 |---|---|---|---|
 | POST | `/api/plan` | `{query, expand?, llm?}` | `Plan` (preview, no detection) |
-| POST | `/api/analyze` | multipart: `files` (1..n images/videos), `options` (JSON string of AnalyzeOptions), optional `query` form field (used when `options.query` is unset). Query `?wait=true` blocks and returns the finished job with `media` | `{job: Job}` or `{job, media: MediaDetail[]}` |
-| POST | `/api/analyze/paths` | `{paths: [server-side files or folders, searched recursively], options}`; `?wait=true` as above | `{job}` |
-| POST | `/api/scan` | `{query, media_ids?: string[], limit?: int, options?}` re-run open-vocab detection over already stored media (all if omitted) and add new entities; `describe` defaults to `"none"`; `?wait=true` as above | `{job}` |
+| POST | `/api/analyze` | multipart: `files` (1..n images/videos), `options` (JSON string of AnalyzeOptions), optional `query` form field (used when `options.query` is unset). The whole request may be at most `OVP_MAX_UPLOAD_MB` (413 otherwise). Query `?wait=true` blocks and returns the finished job with `media` | `{job: Job}` or `{job, media: MediaDetail[]}` |
+| POST | `/api/analyze/paths` | `{paths: [server-side files or folders, searched recursively], options}`; `?wait=true` as above. Paths must lie inside `OVP_IMPORT_ROOTS` (403 otherwise, and always 403 when it is unset); 400 when no media is found | `{job}` |
+| POST | `/api/scan` | `{query, media_ids?: string[], limit?: int, options?}` re-run open-vocab detection over already stored media (all `done` media if omitted): new matches are stored as entities, stored entities detected again are re-labelled / re-verified for the query (see the scan summary); `describe` defaults to `"none"`; `?wait=true` as above | `{job}` |
 | GET | `/api/jobs` | | `{jobs: Job[]}` (most recent first) |
 | GET | `/api/jobs/{id}` | | `{job, media: MediaDetail[]}` |
 | GET | `/api/jobs/{id}/events` | | **SSE** stream (replays past events first) |
@@ -170,16 +187,16 @@ Job SSE events (`data: {...}\n\n`, each has `type`, `job_id`, `ts`):
 ### Media & entities
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/media?limit=50&offset=0&kind=image\|video` | `{media: Media[], total}` |
+| GET | `/api/media?limit=50&offset=0&kind=image\|video` | `{media: Media[], total}`: `done` and `processing` media, newest first |
 | GET | `/api/media/{id}` | `MediaDetail` |
 | DELETE | `/api/media/{id}` | Deletes files, entities, and updates person clusters → `{success, media_id, persons_updated}` |
-| GET | `/api/media/{id}/file` | Original image / video (Range supported) |
-| GET | `/api/media/{id}/thumb` | JPEG thumbnail |
+| GET, HEAD | `/api/media/{id}/file` | Original image / video (Range supported) |
+| GET, HEAD | `/api/media/{id}/thumb` | JPEG thumbnail |
 | POST | `/api/media/{id}/ask` | `{question, vlm?}` → `{answer, elapsed}` (VLM over the full image / video keyframes); persisted. 503 without a VLM |
 | GET | `/api/media/{id}/qa` | `{qa: [{question, answer, created_at}]}` media-level Q&A history |
 | GET | `/api/entities/{id}` | `Entity` + `media` + `qa: [{question, answer, scope, created_at}]` |
 | DELETE | `/api/entities/{id}` | |
-| GET | `/api/entities/{id}/crop` | JPEG crop |
+| GET, HEAD | `/api/entities/{id}/crop` | JPEG crop |
 | POST | `/api/entities/{id}/ask` | `{question, scope: "crop"\|"scene", vlm?}` (legacy `use_full_scene: true` = `"scene"`) → `{answer, elapsed, scope}`; Q&A is persisted. 503 without a VLM |
 | POST | `/api/entities/{id}/assign` | `{person_id: string \| null}` (null = create a new person) → `Entity` |
 | POST | `/api/entities/{id}/review` | `{action: "accept" \| "new" \| "reject"}` resolve a pending match → `Entity` |
@@ -204,7 +221,7 @@ person Re-ID.
 |---|---|---|
 | GET | `/api/persons?watchlist=false&q=&limit=100&offset=0&order=recent\|sightings` | `{persons: Person[], total}` |
 | GET | `/api/persons/{id}` | `Person` + `sightings: (Entity & {media: Media})[]` |
-| PATCH | `/api/persons/{id}` | `{label?, is_watchlist?, notes?}` → `Person` |
+| PATCH | `/api/persons/{id}` | `{label?, is_watchlist?, notes?}` → `Person`. Omitted fields stay unchanged; `""` or `null` clears `label` / `notes` |
 | DELETE | `/api/persons/{id}` | unlinks sightings |
 | POST | `/api/persons/{id}/merge` | `{other_id}` → `Person` |
 | POST | `/api/persons/search?limit=15&min_similarity=0.2` | multipart `file` → `{results: [{person: Person, similarity}]}` (the largest detected person in the photo is embedded); 503 without Re-ID |
@@ -229,7 +246,8 @@ person Re-ID.
 - `ping` `{}` keep-alive every 15 s while a tool runs (ignore)
 
 The turn keeps running if the client disconnects, so the conversation stays consistent;
-turns of one conversation run one at a time. An unavailable `llm` spec → 400.
+turns of one conversation run one at a time. An unavailable `llm` spec → 400. Like jobs, conversations live in
+memory and are lost on restart. The agent's `analyze_paths` tool obeys `OVP_IMPORT_ROOTS` like `/api/analyze/paths`.
 
 `GET /api/agent/conversations` → `{conversations: [{id, title, created_at, updated_at, message_count}]}` (most recent first)
 

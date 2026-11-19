@@ -65,6 +65,10 @@ class UltralyticsSegmenter(Segmenter):
                 log.info("loaded segmenter %s", self.spec)
             return self._model
 
+    def unload(self) -> None:
+        with self._lock:
+            self._model = None
+
     def _segment_sync(self, image: Image.Image, dets: list[Detection]) -> None:
         if not dets:
             return

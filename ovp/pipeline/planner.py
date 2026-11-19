@@ -2,7 +2,7 @@
 
 Examples
 * ``"people, dogs"``            → literal prompts ``person``, ``dog``
-* ``"dangerous things"``        → knife, gun, rifle, scissors, fire, ... (+ VLM verification)
+* ``"dangerous things"``        → knife, gun, rifle, scissors, fire, ... (+ VLM verification; objects only)
 * ``"menacing people"``         → detect ``person``, then ask the VLM "Does this person appear menacing?"
 * ``"all living things"``       → person, dog, cat, bird, horse, plant, tree, ...
 
@@ -28,7 +28,6 @@ LEXICON: dict[str, dict[str, Any]] = {
         "prompts": ["knife", "gun", "pistol", "rifle", "scissors", "axe", "machete", "sword", "baseball bat", "hammer",
                     "fire", "flame", "explosive", "syringe", "broken glass", "chainsaw"],
         "question": "Is this a potentially dangerous object (weapon, sharp, burning, or otherwise hazardous)?",
-        "people": True,
     },
     "weapon": {
         "prompts": ["gun", "pistol", "handgun", "rifle", "shotgun", "knife", "machete", "sword", "axe", "baseball bat", "crowbar", "taser"],
@@ -163,6 +162,16 @@ def lexicon_concept(term: str, key: str) -> Concept:
     return Concept(name=term, prompts=list(entry["prompts"]), kind="object", verify=q is not None, question=q)
 
 
+def may_involve_people(query: str) -> bool:
+    """Whether a request can be about people: it names them, uses a people-flagged lexicon category
+    ("suspicious"), or uses words the lexicon does not reduce to object categories (e.g. "fighting")."""
+    for t in split_terms(query):
+        key = _lexicon_key(t)
+        if _person_term(t) or key is None or LEXICON[key].get("people"):
+            return True
+    return False
+
+
 def needs_llm(terms: list[str]) -> bool:
     for t in terms:
         words = re.findall(r"[a-z]+", t)
@@ -181,7 +190,8 @@ Rules:
 - One concept per distinct thing the user asked for, named with the user's words.
 - "prompts" are short concrete noun phrases a detector can see (e.g. "kitchen knife", "handgun", "rifle", "candle"). Expand abstract categories into 4-15 specific, visually distinct objects. Never use adjectives alone. Use singular nouns.
 - If the concept is about people with some property (behaviour, clothing, emotion, role, age, e.g. "menacing people", "people wearing red", "kids", "police officers"), use kind "person_attribute" with prompts ["person"] and a precise yes/no question about one person crop.
-- If the request also implies people (e.g. "dangerous things" includes menacing or armed people), add a separate person_attribute concept for that.
+- Add a person_attribute concept only when the request mentions people or a human behaviour ("armed people", "someone fighting", "suspicious activity"). Object categories such as "dangerous things" or "weapons" are objects only: no person concept.
+- Each comma-separated item is its own concept. An item naming a wearable or carried object ("sunglasses", "hat", "backpack") is an object concept with that object as its prompt, even when another item is about people ("person wearing a tie, sunglasses" → a person_attribute concept for the tie and an object concept "sunglasses" with prompt "sunglasses").
 - Set verify=true when detector prompts could produce false positives for the user's intent (abstract, subjective, or broad categories) and write "question" as a yes/no question about a single image crop. Use verify=false for plain concrete objects ("dogs", "cars", "people").
 - Do NOT expand concrete objects the user named ("ties" → ["tie"], "red cars" → ["car"] with verify=true and question "Is this car red?"). Only expand categories.
 - Interpret categories the way a safety / security analyst would: "dangerous things" means weapons (gun, knife, rifle, machete, axe, baseball bat), sharp objects, fire/flames, explosives, hazardous tools — not wild animals unless the user mentions animals. "Alive / living things" means people, animals and plants.
@@ -205,7 +215,7 @@ class QueryPlanner:
         used_lexicon = False
         for t in terms:
             key = _lexicon_key(t)
-            if key and not (_person_term(t) and key not in ("dangerous", "suspicious")):
+            if key and not _person_term(t):  # "armed men", "dangerous people" are about people
                 concepts.append(lexicon_concept(t, key))
                 used_lexicon = True
                 if LEXICON[key].get("people"):
@@ -220,8 +230,8 @@ class QueryPlanner:
             return self.default_plan()
         query = query.strip()
         terms = split_terms(query)
-        use_llm = llm is not None and (expand is True or (expand == "auto" and needs_llm(terms)))
-        if expand is False or not use_llm:
+        use_llm = expand is True or (expand == "auto" and needs_llm(terms))
+        if expand is False or llm is None or not use_llm:
             plan = self.offline_plan(query)
             if expand is False:
                 # literal: no lexicon expansion, but keep person-attribute handling
@@ -237,7 +247,7 @@ class QueryPlanner:
                 max_tokens=900,
                 json_mode=True,
             )
-            plan = self._parse(query, extract_json(text))
+            plan = self._parse(query, extract_json(text), allow_people=may_involve_people(query))
         except Exception as e:
             log.warning("LLM planning failed (%s); using offline lexicon", e)
             return self.offline_plan(query)
@@ -247,7 +257,8 @@ class QueryPlanner:
         return plan
 
     @staticmethod
-    def _parse(query: str, data: Any) -> QueryPlan:
+    def _parse(query: str, data: Any, allow_people: bool = True) -> QueryPlan:
+        """Validate the LLM's concepts; ``allow_people=False`` drops person concepts it added to an object-only request."""
         items = data.get("concepts", []) if isinstance(data, dict) else data
         concepts: list[Concept] = []
         total = 0
@@ -255,6 +266,8 @@ class QueryPlanner:
             if not isinstance(it, dict) or total >= MAX_PLAN_PROMPTS:
                 continue
             kind = "person_attribute" if it.get("kind") == "person_attribute" else "object"
+            if kind == "person_attribute" and not allow_people:
+                continue
             prompts = [str(p).strip().lower() for p in (it.get("prompts") or []) if str(p).strip()]
             if kind == "person_attribute":
                 prompts = ["person"]

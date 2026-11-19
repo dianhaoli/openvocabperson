@@ -48,7 +48,7 @@ Choosing tools:
 - "What is happening in m_..." or any question about the content of one photo/video or detection: `ask_image`.
 - People: `list_persons` (order "sightings" for who appears most), `get_person`, `find_person_sightings`, `name_person`, `set_watchlist`, `merge_persons` (only when the user asks or the evidence is strong — say why), `recluster_persons`.
 
-Answers: refer to items by id (e_..., m_..., p_...) so the UI can link them; the UI already shows galleries of the returned items, so do not repeat every field. Keep answers concise with short bullet lists, and state uncertainty honestly (Re-ID matches and VLM judgements are probabilistic)."""
+Answers: refer to people by name, or as "an unnamed person" (with a distinguishing detail) when they have no name, and to photos/videos by file name. Do not show raw ids (e_..., m_..., p_..., j_...) unless the user asks for them: the UI already shows clickable galleries of the returned items, so do not repeat every field either. Keep answers concise with short bullet lists, and state uncertainty honestly (Re-ID matches and VLM judgements are probabilistic)."""
 
 SUMMARIZE_PROMPT = "Tool budget exhausted. Without calling more tools, summarize for the user what you found so far."
 
@@ -75,10 +75,11 @@ class ToolOutput:
     media: list[dict] = field(default_factory=list)
     persons: list[dict] = field(default_factory=list)
     job_id: Optional[str] = None
+    is_error: bool = False  # the tool failed (providers that support it are told so)
 
 
 def _fail(message: str) -> ToolOutput:
-    return ToolOutput(message, {"error": message})
+    return ToolOutput(message, {"error": message}, is_error=True)
 
 
 def _obj(props: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
@@ -160,13 +161,11 @@ class Agent:
             data: dict[str, Any] = {
                 "plan": [{"concept": c["name"], "prompts": c["prompts"][:12], "verified_by_vlm": c["verify"]} for c in concepts],
                 "scanned_media": len(ids),
-                "new_candidates": job.summary.get("entities", 0),
+                **{k: job.summary.get(k, 0) for k in ("accepted", "rejected", "updated")},  # this scan's candidates
                 "hits": len(ents),
                 "media_with_hits": len(hit_media),
-                "found": [serialize.compact_entity(e) for e in ents[:60]],
+                "found": _named(ents[:60], media),
             }
-            if not ents and any(c.get("kind") == "person_attribute" for c in concepts):
-                data["note"] = "people detected before this scan are not re-verified by it; check them with `search` (VLM descriptions) or `ask_image`"
             return ToolOutput(f"scanned {len(ids)} media, {len(ents)} hit(s)", data, ents, media, job_id=job.id)
 
         @t("plan_query", "Preview how a query would be expanded into detector prompts and VLM checks (no detection).", {"query": S}, ["query"])
@@ -225,8 +224,9 @@ class Agent:
             if p is None:
                 return _fail(f"person {person_id} not found")
             sights = [serialize.entity(r) for r in await db.person_sightings(person_id, 100)]
+            media = [serialize.media(m) for m in await db.get_media_many(list({e["media_id"] for e in sights}))]
             pd = serialize.person(p)
-            return ToolOutput(f"{pd['label'] or person_id}: {len(sights)} sighting(s)", {"person": _compact_person(pd), "sightings": [serialize.compact_entity(e) for e in sights[:40]]}, sights, persons=[pd])
+            return ToolOutput(f"{pd['label'] or person_id}: {len(sights)} sighting(s)", {"person": _compact_person(pd), "sightings": _named(sights[:40], media)}, sights, media, [pd])
 
         @t("name_person", "Give a person cluster a name/label (and optional notes).", {"person_id": S, "name": S, "notes": S}, ["person_id", "name"])
         async def name_person(person_id: str, name: str, notes: Optional[str] = None) -> ToolOutput:
@@ -281,7 +281,7 @@ class Agent:
             pd = serialize.person(p)
             sights = [serialize.entity(r) for r in await db.person_sightings(person_id, 200)]
             media = [serialize.media(m) for m in await db.get_media_many(list({e["media_id"] for e in sights}))]
-            data = {"person": _compact_person(pd), "media": [{"id": m["id"], "name": m["name"], "kind": m["kind"]} for m in media], "sightings": [serialize.compact_entity(e) for e in sights[:50]]}
+            data = {"person": _compact_person(pd), "media": [{"id": m["id"], "name": m["name"], "kind": m["kind"]} for m in media], "sightings": _named(sights[:50], media)}
             return ToolOutput(f"{len(sights)} sighting(s) in {len(media)} media", data, sights, media, [pd])
 
         @t("stats", "Library statistics: media/entity/person counts and the count of every detected label.", {})
@@ -294,7 +294,10 @@ class Agent:
         async def analyze_paths(paths: list[str], query: Optional[str] = None, wait: bool = True) -> ToolOutput:
             from ..pipeline.analyzer import AnalyzeOptions
 
-            items = self.ctx.jobs.collect_paths(paths)
+            try:
+                items = await self.ctx.jobs.collect_paths(paths)
+            except PermissionError as e:  # outside OVP_IMPORT_ROOTS, or server-side imports disabled
+                return _fail(str(e))
             if not items:
                 return _fail("no images/videos at those paths")
             job = self.ctx.jobs.submit_analyze(items, AnalyzeOptions(query=query))
@@ -368,8 +371,7 @@ class Agent:
                             await emit("error", message=f"{llm.spec} returned an empty reply")
                         return
                     outs = await asyncio.gather(*(self._call(tc, emit) for tc in resp.tool_calls))
-                    for tc, out in zip(resp.tool_calls, outs):
-                        conv.messages.append({"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": out})
+                    conv.messages.extend(outs)
                 # Tools stay declared (providers such as Anthropic reject tool blocks without them);
                 # any further tool calls are ignored.
                 final = await llm.chat(_trim(conv.messages) + [{"role": "user", "content": SUMMARIZE_PROMPT}], specs, max_tokens=800)
@@ -379,7 +381,8 @@ class Agent:
             finally:
                 conv.updated_at = time.time()
 
-    async def _call(self, tc: ToolCall, emit: Emit) -> str:
+    async def _call(self, tc: ToolCall, emit: Emit) -> dict[str, Any]:
+        """Run a tool call and return its tool message for the transcript."""
         await emit("tool_call", id=tc.id, name=tc.name, arguments=tc.arguments)
         t0 = time.perf_counter()
         out = await self._invoke(tc)
@@ -388,7 +391,9 @@ class Agent:
             entities=out.entities[:60], media=out.media[:40], persons=out.persons[:40], job_id=out.job_id,
         )
         payload = json.dumps(out.data, default=str)
-        return payload if len(payload) <= MAX_TOOL_RESULT_CHARS else payload[:MAX_TOOL_RESULT_CHARS] + "…(truncated)"
+        if len(payload) > MAX_TOOL_RESULT_CHARS:
+            payload = payload[:MAX_TOOL_RESULT_CHARS] + "…(truncated)"
+        return {"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": payload, "is_error": out.is_error}
 
     async def _invoke(self, tc: ToolCall) -> ToolOutput:
         entry = self.tools.get(tc.name)
@@ -444,7 +449,7 @@ def _close_dangling_tool_calls(messages: list[dict[str, Any]]) -> None:
             i += 1
         for tc in calls:
             if tc.id not in answered:
-                out.append({"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": json.dumps({"error": "interrupted before the tool finished"})})
+                out.append({"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": json.dumps({"error": "interrupted before the tool finished"}), "is_error": True})
     messages[:] = out
 
 
@@ -479,6 +484,12 @@ def _uniq(items: list[dict]) -> list[dict]:
     for it in items:
         seen.setdefault(it["id"], it)
     return list(seen.values())
+
+
+def _named(entities: list[dict], media: list[dict]) -> list[dict]:
+    """Compact entities with their photo/video file name, so answers can name the file."""
+    names = {m["id"]: m["name"] for m in media}
+    return [{**serialize.compact_entity(e), "media_name": names.get(e["media_id"])} for e in entities]
 
 
 def _compact_person(p: dict) -> dict:

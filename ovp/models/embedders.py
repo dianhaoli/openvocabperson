@@ -89,6 +89,10 @@ class ClipEmbedder:
                 self.dim = int(model.encode_text(self._tokenizer(["a photo"]).to(device)).shape[-1])
             log.info("CLIP embedder %s ready (%s, dim=%s)", self.model_name, self._backend, self.dim)
 
+    def unload(self) -> None:
+        with self._lock:
+            self._model = self._preprocess = self._tokenizer = None
+
     def _images_sync(self, images: list[Image.Image]) -> np.ndarray:
         import torch
 
@@ -253,6 +257,9 @@ class OSNetReID(ReIDModel):
         self._model = model.eval().to(device)
         self._tf = T.Compose([T.Resize((256, 128)), T.ToTensor(), T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
 
+    def unload(self) -> None:
+        self._model = None
+
     def _sync(self, images: list[Image.Image]) -> np.ndarray:
         import torch
 
@@ -276,6 +283,11 @@ class ClipReID(ReIDModel):
     def __init__(self, clip: ClipEmbedder):
         self.clip = clip
 
+    @property
+    def space(self) -> str:
+        # vectors of different CLIP models are not comparable, even at the same dimension
+        return f"reid:clip:{self.clip.model_name}"
+
     async def embed(self, images: list[Image.Image]) -> np.ndarray:
         arr = await self.clip.embed_images(images)
         self.dim = arr.shape[1] if arr.size else self.dim
@@ -283,31 +295,49 @@ class ClipReID(ReIDModel):
 
 
 class ColorReID(ReIDModel):
-    """Dependency-free appearance descriptor: HSV histograms over 6 horizontal body stripes.
+    """Dependency-free appearance descriptor: colour histograms over 6 horizontal body stripes.
 
-    It is the classic hand-crafted Re-ID baseline: robust to pose, weak against clothing
-    changes. Used only when neither OSNet nor CLIP is installed.
-    """
+    It is the classic hand-crafted Re-ID baseline: robust to pose and mirroring, weak against
+    clothing changes. Used only when neither OSNet nor CLIP is installed. Per stripe:
+
+    * only the central half of the width, since box crops carry background at the sides;
+    * hue (16 bins) and saturation/value (4 each) of *chromatic* pixels, and 8 grey levels for
+      dark or unsaturated pixels, whose hue is noise (dark suits otherwise look "coloured");
+    * square-rooted (Hellinger) and mean-centred: all-positive histograms give every pair a high
+      cosine, centring spreads them so thresholds can separate people.
+
+    Tuned on person crops of photos and videos made from them (image vs. video of the same
+    person >= 0.90, different people <= 0.85; see ``REID_THRESHOLDS["color"]``)."""
 
     kind = "color"
     STRIPES = 6
-    dim = STRIPES * (16 + 4 + 4)
+    HUE_BINS, SV_BINS, GREY_BINS = 16, 4, 8
+    MIN_SAT, MIN_VAL = 50, 40  # below either, a pixel counts as grey
+    dim = STRIPES * (HUE_BINS + 2 * SV_BINS + GREY_BINS)
+
+    @property
+    def space(self) -> str:
+        return "reid:color:v2"  # v1 (plain HSV histograms) vectors are not comparable
 
     @classmethod
     def describe(cls, img: Image.Image) -> np.ndarray:
         import cv2
 
         arr = np.asarray(img.convert("RGB").resize((64, 128), Image.Resampling.BILINEAR))
-        hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+        hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)[:, 16:48].astype(np.int32)
+        rows = hsv.shape[0] // cls.STRIPES
         feats = []
-        h = hsv.shape[0]
         for s in range(cls.STRIPES):
-            band = hsv[s * h // cls.STRIPES : (s + 1) * h // cls.STRIPES, 8:56]  # trim background at the sides
-            hh = cv2.calcHist([band], [0], None, [16], [0, 180]).ravel()
-            ss = cv2.calcHist([band], [1], None, [4], [0, 256]).ravel()
-            vv = cv2.calcHist([band], [2], None, [4], [0, 256]).ravel()
-            v = np.concatenate([hh, ss, vv])
-            feats.append(np.sqrt(v / (v.sum() + 1e-6)))
+            h, sat, val = hsv[s * rows : (s + 1) * rows].reshape(-1, 3).T
+            chroma = (sat >= cls.MIN_SAT) & (val >= cls.MIN_VAL)
+            v = np.concatenate([
+                np.bincount(h[chroma] * cls.HUE_BINS // 180, minlength=cls.HUE_BINS),
+                np.bincount(sat[chroma] * cls.SV_BINS // 256, minlength=cls.SV_BINS),
+                np.bincount(val[chroma] * cls.SV_BINS // 256, minlength=cls.SV_BINS),
+                np.bincount(val[~chroma] * cls.GREY_BINS // 256, minlength=cls.GREY_BINS),
+            ]).astype(np.float32)
+            v = np.sqrt(v / (v.sum() + 1e-6))
+            feats.append(v - v.mean())
         return l2n(np.concatenate(feats))
 
     async def embed(self, images: list[Image.Image]) -> np.ndarray:

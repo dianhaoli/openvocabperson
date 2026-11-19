@@ -21,6 +21,9 @@ clip @ git+https://github.com/ultralytics/CLIP.git
 # embeddings: CLIP crops (text->image and image->image search), OSNet person Re-ID
 open_clip_torch>=2.24
 torchreid>=0.2.5
+# torchreid imports scipy and tensorboard at import time but does not declare them
+scipy>=1.11
+tensorboard>=2.15
 gdown>=5.1
 
 # API / storage

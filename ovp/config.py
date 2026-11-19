@@ -50,6 +50,10 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_list(name: str, default: str = "") -> list[str]:
+    return [x.strip() for x in _env(name, default).split(",") if x.strip()]
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = _env(name)
     if raw is None:
@@ -161,6 +165,19 @@ class Settings:
         default_factory=lambda: float(v) if (v := _env("OVP_REID_REVIEW")) else None
     )
 
+    # ── server / security ──
+    # Server-side folders that POST /api/analyze/paths (and the agent) may import from; empty
+    # disables server-side path imports. Paths are resolved, so symlinks cannot escape a root.
+    import_roots: list[Path] = field(
+        default_factory=lambda: [Path(p).expanduser().resolve() for p in _env_list("OVP_IMPORT_ROOTS")]
+    )
+    # Browser origins allowed to call the API cross-origin (the UI served by the API itself is
+    # same-origin and needs no entry); "*" allows any origin.
+    cors_origins: list[str] = field(
+        default_factory=lambda: _env_list("OVP_CORS_ORIGINS", "http://localhost:5173,http://localhost:3000")
+    )
+    max_upload_mb: int = field(default_factory=lambda: _env_int("OVP_MAX_UPLOAD_MB", 2048))
+
     # ── misc ──
     load_models_on_startup: bool = field(default_factory=lambda: _env_bool("OVP_PRELOAD", True))
     frontend_dist: Path = field(
@@ -174,6 +191,10 @@ class Settings:
             review=self.reid_review_threshold if self.reid_review_threshold is not None else base.review,
         )
 
+    @property
+    def max_upload_bytes(self) -> int:
+        return self.max_upload_mb * 1024 * 1024
+
     def public(self) -> dict:
         """Settings safe to expose (no secrets)."""
         data = asdict(self)
@@ -183,6 +204,7 @@ class Settings:
         data["storage_dir"] = str(self.storage_dir)
         data["weights_dir"] = str(self.weights_dir)
         data["frontend_dist"] = str(self.frontend_dist)
+        data["import_roots"] = [str(p) for p in self.import_roots]
         data.pop("database_url", None)
         return data
 

@@ -42,6 +42,9 @@ export interface Entity {
   created_at: number;
 }
 
+/** Listings show 'done' and in-flight 'processing' media; 'error' / 'cancelled' are hidden there. */
+export type MediaStatus = 'processing' | 'done' | 'error' | 'cancelled';
+
 export interface Media {
   id: string;
   kind: MediaKind;
@@ -53,6 +56,7 @@ export interface Media {
   url: string;
   thumb_url: string;
   query: string | null;
+  status: MediaStatus;
   entity_count: number;
   person_count: number;
   created_at: number;
@@ -132,6 +136,20 @@ export interface Job {
   created_at: number;
   finished_at: number | null;
   options: AnalyzeOptions | null;
+  plan: Plan | null;
+  summary: JobSummary;
+}
+
+/** Set when a job finishes: analyze jobs fill the first group, scan jobs the second ({} before that). */
+export interface JobSummary {
+  media?: number;
+  entities?: number;
+  failed?: number;
+  scanned?: number;
+  media_with_hits?: number;
+  accepted?: number;
+  rejected?: number;
+  updated?: number;
 }
 
 // ---------- Job SSE events ----------

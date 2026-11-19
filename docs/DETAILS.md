@@ -41,7 +41,7 @@ The LLM is the configured LLM, or the VLM when no LLM is set. Plans are cached p
 `Analyzer.analyze_image` in `ovp/pipeline/analyzer.py`:
 
 1. **Store.** The original (EXIF-rotated, saved as JPEG) and a thumbnail are written, and a `media` row is created with status `processing`.
-2. **Detect.** The detector runs with the plan's prompts. Closed-set detectors (YOLO11) only receive the prompts that are COCO classes. If the query needs open vocabulary and the default detector is closed-set, the analyzer switches automatically to an open-vocabulary one: an already loaded one first, then YOLOE, YOLO-World, and finally VLM grounding. This does not happen when a detector was requested explicitly. Cross-prompt NMS (`OVP_NMS_IOU`) then removes duplicate boxes from overlapping prompts. Person boxes are protected from being suppressed by object boxes, so a person holding a bag keeps both.
+2. **Detect.** The detector runs with the plan's prompts. Closed-set detectors (YOLO11) only receive the prompts that are COCO classes. If the query needs open vocabulary and the default detector is closed-set, the analyzer switches automatically to an open-vocabulary one: an already loaded one first, then YOLOE, YOLO-World, and finally VLM grounding (`vlm:<vlm spec>`: its boxes are only as precise as the VLM; Gemini and Qwen-VL are trained for grounding, OpenAI models give coarse boxes). This does not happen when a detector was requested explicitly. Cross-prompt NMS (`OVP_NMS_IOU`) then removes duplicate boxes from overlapping prompts. Person boxes are protected from being suppressed by object boxes, so a person holding a bag keeps both.
 3. **Route.** Each detection becomes a candidate crop, padded by `OVP_EXPAND_RATIO`.
    - Concepts with `verify` get VLM questions.
    - `describe` selects which crops get described: `persons`, `all` or `none`.
@@ -136,9 +136,11 @@ All answers are stored in the `qa` table.
 
 - **Every analysis is a job**: uploads, server paths, library scans, CLI runs and agent tool calls. Upload handlers spool files to `OVP_STORAGE_DIR/tmp` and return at once, and the job runs on its own. Use `?wait=true` to block until it finishes.
 - **Concurrency.** Up to `OVP_JOB_CONCURRENCY` jobs run at once, and up to `OVP_MEDIA_CONCURRENCY` media items per job. Local models are still serialized on the device thread, while cloud VLM calls overlap.
-- **Events.** They are kept per job, up to 20 000. A late SSE subscriber (`GET /api/jobs/{id}/events`) gets a full replay first. That is how the UI reattaches to running jobs after a reload.
-- **Cancellation** is cooperative: it is checked between stages and between video frames.
-- **Memory.** Jobs live in memory; the newest 200 are kept. Their results (media and entities) are in PostgreSQL.
+- **Events.** They are kept per job, up to 5 000 (the final `job_done` always). A late SSE subscriber (`GET /api/jobs/{id}/events`) gets a replay first. That is how the UI reattaches to running jobs after a reload. Finished jobs beyond the newest 20 keep only `job_done`, and a subscriber that falls 2 000 events behind is disconnected (it can reconnect and replay).
+- **Cancellation** is cooperative: it is checked between stages and between video frames. The media being processed is stored with status `cancelled` and hidden from the library; items that did not finish are not counted in `progress.done`.
+- **Summary.** A finished analyze job reports `{media, entities, failed}`; a scan reports `{scanned, media_with_hits, accepted, rejected, updated}` (`accepted`: entities that match the query, newly stored or already stored; `rejected`: candidates the VLM verification denied; `updated`: stored entities whose concept or verification the scan changed).
+- **Memory.** Jobs live in memory only and are lost on restart; the newest 100 finished jobs are kept. Their results (media and entities) are in PostgreSQL. On startup, media left in `processing` by a previous run are marked `error`, and the upload spool is emptied. On shutdown, running jobs are cancelled and awaited (up to 10 s) before the database closes.
+- **Server paths.** `POST /api/analyze/paths` and the agent's `analyze_paths` only read inside `OVP_IMPORT_ROOTS` (resolved, so symlinks cannot escape; symlinks inside a walked folder are skipped). Without it they return 403. The CLI reads any path.
 
 ## Analyst agent
 
@@ -274,10 +276,14 @@ The tests use fake models (`tests/fakes.py`) against a real PostgreSQL. Cloud pr
 | `vlm: false` in `/api/health` and no descriptions | No VLM is configured. Set a provider key, `OVP_COMPAT_BASE_URL`, or use `qwen:` on a GPU |
 | Agent returns 503 | No LLM is configured. Set a key, or `OVP_LLM=compat:<model>` |
 | "detector … cannot track video" | Videos need a YOLO, YOLOE or YOLO-World detector |
-| Persons never matched across uploads / `reid: color` | OSNet weights could not load (Google Drive). Install `torchreid gdown` and make sure the download works, or accept the CLIP or colour fallback with its stricter thresholds |
+| Persons never matched across uploads / `reid: color` | OSNet could not load. `torchreid` also needs `scipy` and `tensorboard` to import (both in requirements.txt), and its weights come from Google Drive. Install `torchreid gdown scipy tensorboard` and make sure the download works, or accept the CLIP or colour fallback with its stricter thresholds |
 | Too many `pending` reviews, or different people merged | Tune `OVP_REID_MATCH` / `OVP_REID_REVIEW`, then run `POST /api/persons/recluster` |
 | Some crops not described | More than `OVP_MAX_VLM_CROPS` candidates in one media item. A `log` warning says how many were skipped |
 | Slow on CPU | Use `OVP_DETECTOR=yoloe:yoloe-11s-seg.pt`, MobileSAM, a cloud VLM, and lower `OVP_VIDEO_FPS` |
 | Out of GPU memory | Use a smaller detector or SAM, `OVP_VLM_QUANT=4bit`, `OVP_VLM_BATCH=1` |
+| "Analyze server paths" or the agent's `analyze_paths` fails with 403 | Server-side imports are off. Set `OVP_IMPORT_ROOTS` to the folders the server may read, or upload the files instead |
+| Upload fails with 413 | The request is larger than `OVP_MAX_UPLOAD_MB` (all files together). Raise it, or upload in smaller batches |
+| The UI on another origin gets CORS errors | Add its origin to `OVP_CORS_ORIGINS` (the UI served by the API itself and the Vite dev proxy need no entry) |
+| Library shows a media item as `processing` forever | The server stopped mid-analysis. The next start marks it `error` (hidden from the library); delete it or analyze the file again |
 | UI shows "The React UI is not built" | Run `cd frontend && npm ci && npm run build`, or set `OVP_FRONTEND_DIST` |
 | `cannot connect to PostgreSQL` | Check `DATABASE_URL`. The database also needs the `vector` extension, which the server creates if it has the rights to |

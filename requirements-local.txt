@@ -3,7 +3,7 @@
 #   owlv2:... / grounding-dino:...      Hugging Face open-vocabulary detectors
 #   st:all-MiniLM-L6-v2                 local text embeddings for semantic search
 -r requirements.txt
-transformers>=4.49
+transformers>=4.50
 accelerate>=0.33
 sentence-transformers>=3.0
 # OVP_VLM_QUANT=8bit|4bit (CUDA only)

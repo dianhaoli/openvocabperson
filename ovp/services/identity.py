@@ -32,6 +32,27 @@ def reid_kind_of(space: str) -> str:
     return parts[1] if len(parts) > 1 else parts[0]
 
 
+def presence_segments(trajectory: Optional[list[Any]], t_start: Optional[float], t_end: Optional[float]) -> list[tuple[float, float]]:
+    """Time segments in which a video track is actually visible (a stitched track has gaps).
+    ``trajectory`` points start with their timestamp."""
+    times = [float(p[0]) for p in (trajectory or [])]
+    if len(times) < 2:
+        start = t_start or 0.0
+        return [(start, t_end if t_end is not None else start)]
+    max_gap = 2.5 * float(np.median(np.diff(times)))  # tolerate a missed detection or two
+    segments = [[times[0], times[0]]]
+    for t in times[1:]:
+        if t - segments[-1][1] > max_gap:
+            segments.append([t, t])
+        else:
+            segments[-1][1] = t
+    return [(a, b) for a, b in segments]
+
+
+def segments_overlap(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> bool:
+    return any(s1 <= e2 and s2 <= e1 for s1, e1 in a for s2, e2 in b)
+
+
 LEADER_CLUSTERING_ABOVE = 4000  # sightings; beyond this the O(n²) similarity matrix gets too large
 
 
@@ -116,26 +137,42 @@ class IdentityService:
         space: str,
         conflicts: Optional[Callable[[str, str], bool]] = None,
     ) -> dict[str, dict[str, Any]]:
-        """Link the person sightings of ONE media item. Returns entity_id → result.
+        """Link the (already stored) person sightings of ONE media item. Returns entity_id → result.
 
-        ``conflicts(a, b)`` says whether two sightings cannot be the same person; by default all
-        sightings in one image conflict, for video only temporally overlapping tracks do.
+        Two sightings that co-occur in a media item are never linked to the same person; this
+        also holds against sightings the media already had (e.g. when a library scan adds people).
+        ``conflicts(a, b)`` decides it for two sightings of ``items`` (default: always, as in an
+        image); stored sightings conflict with everything in an image and, in a video, when
+        their tracks are visible at the same time.
         """
-        conflicts = conflicts or (lambda a, b: True)
+        batch_conflicts = conflicts or (lambda a, b: True)
         if not items:
             return {}
         th = self.thresholds(space)
         results: dict[str, dict[str, Any]] = {}
+        batch = {eid for eid, _ in items}
         async with self.lock:
+            rows = await self.db.media_sightings(list(batch))
+            video = any(r["t_start"] is not None for r in rows)
+            presence = {r["id"]: presence_segments(r["trajectory"], r["t_start"], r["t_end"]) for r in rows}
+            owners: dict[str, list[str]] = {}  # person → sightings of this media linked to it
+            for r in rows:
+                if r["id"] not in batch:
+                    owners.setdefault(r["person_id"], []).append(r["id"])
+
+            def clash(a: str, b: str) -> bool:
+                if a in batch and b in batch:
+                    return batch_conflicts(a, b)
+                return not video or segments_overlap(presence[a], presence[b])
+
+            def free(pid: str, eid: str) -> bool:
+                return all(not clash(eid, o) for o in owners.get(pid, []))
+
             cands: list[tuple[float, str, str]] = []
             for eid, vec in items:
                 cands += [(s, eid, pid) for pid, s in await self.db.match_persons(space, vec, k=8)]
             cands.sort(reverse=True)
-            owners: dict[str, list[str]] = {}  # person → sightings of this media linked to it
             done: set[str] = set()
-
-            def free(pid: str, eid: str) -> bool:
-                return all(not conflicts(eid, o) for o in owners.get(pid, []))
 
             for s, eid, pid in cands:
                 if s < th.match:
@@ -181,9 +218,20 @@ class IdentityService:
         elif action == "new":
             await self.assign(entity_id, None)
         elif action == "reject":
-            await self.db.link_entity(entity_id, None, None, None)
+            async with self.lock:
+                await self.db.link_entity(entity_id, None, None, None)
         else:
             raise ValueError(f"unknown action {action!r}")
+
+    async def merge(self, keep: str, other: str) -> bool:
+        """Merge person ``other`` into ``keep`` (serialised with matching, so a concurrent
+        analysis never links a sighting to the person being removed)."""
+        async with self.lock:
+            return await self.db.merge_persons(keep, other)
+
+    async def delete(self, person_id: str) -> bool:
+        async with self.lock:
+            return await self.db.delete_person(person_id)
 
     async def _entity_space(self, entity_id: str) -> Optional[str]:
         assert self.db.pool

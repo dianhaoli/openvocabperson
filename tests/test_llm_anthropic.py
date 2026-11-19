@@ -98,6 +98,9 @@ async def test_tool_results_followed_by_a_user_message_in_the_same_turn() -> Non
     history = AGENT_HISTORY[:7] + [{"role": "user", "content": "Summarize."}]
     await model.chat(history, [ToolSpec("stats", "s", {"type": "object", "properties": {}})])
     roles = [m["role"] for m in sent[0]["messages"]]
-    assert roles[-2:] == ["user", "user"]  # consecutive user turns: the API merges them
-    assert sent[0]["messages"][-1]["content"] == [{"type": "text", "text": "Summarize."}]
+    assert roles[-2:] == ["assistant", "user"]  # roles alternate: the text joins the tool-result turn
+    assert sent[0]["messages"][-1]["content"] == [
+        {"type": "tool_result", "tool_use_id": "toolu_c", "content": '{"media": 0}'},
+        {"type": "text", "text": "Summarize."},
+    ]
     await model.aclose()

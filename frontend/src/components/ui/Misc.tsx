@@ -107,14 +107,16 @@ export function Segmented<T extends string>({
   );
 }
 
-export function ProgressBar({ value, indeterminate }: { value: number; indeterminate?: boolean }) {
+const BAR_FILL = { warning: 'bg-warning/70', error: 'bg-error/70' } as const;
+
+export function ProgressBar({ value, indeterminate, tone }: { value: number; indeterminate?: boolean; tone?: keyof typeof BAR_FILL }) {
   return (
     <div className="h-1.5 w-full rounded-full bg-bg-primary overflow-hidden border border-border">
       {indeterminate ? (
         <div className="h-full w-1/4 gradient-accent animate-indeterminate" />
       ) : (
         <div
-          className="h-full gradient-accent transition-[width] duration-300"
+          className={cn('h-full transition-[width] duration-300', tone ? BAR_FILL[tone] : 'gradient-accent')}
           style={{ width: `${Math.max(0, Math.min(1, value)) * 100}%` }}
         />
       )}

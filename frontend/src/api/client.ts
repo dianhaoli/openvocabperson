@@ -221,6 +221,8 @@ export const api = {
     form.append('options', JSON.stringify(options));
     return request<{ job: Job }>('/api/analyze', { method: 'POST', form });
   },
+  analyzePaths: (paths: string[], options: AnalyzeOptions) =>
+    request<{ job: Job }>('/api/analyze/paths', { method: 'POST', json: { paths, options } }),
   scan: (body: { query: string; media_ids?: string[]; limit?: number; options?: AnalyzeOptions }) =>
     request<{ job: Job }>('/api/scan', { method: 'POST', json: body }),
   jobs: (signal?: AbortSignal) => request<{ jobs: Job[] }>('/api/jobs', { signal }),

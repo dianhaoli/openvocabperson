@@ -200,6 +200,12 @@ class UltralyticsDetector(Detector):
                 self._model = model_cls(self._path())
             return self._model
 
+    def unload(self) -> None:
+        """Drop the weights (the registry evicted this model); the next call reloads them."""
+        with self._lock:
+            self._model, self._classes = None, None
+            self._pe_cache.clear()
+
     def _set_vocab(self, prompts: Optional[list[str]]) -> Optional[set[str]]:
         """Configure vocabulary. Returns the label whitelist for closed-set models."""
         model = self._load()
@@ -346,6 +352,9 @@ class HFZeroShotDetector(Detector):
 
         self._processor = AutoProcessor.from_pretrained(self.weights)
         self._model = AutoModelForZeroShotObjectDetection.from_pretrained(self.weights).to(get_runtime().device).eval()
+
+    def unload(self) -> None:
+        self._model, self._processor = None, None
 
     def _detect_sync(self, image: Image.Image, prompts: Optional[list[str]], conf: float) -> list[Detection]:
         import torch

@@ -48,13 +48,13 @@ def test_literal_concepts_for_people() -> None:
     assert multiword.prompts == ["cell phone"] and not multiword.verify
 
 
-def test_offline_plan_lexicon_expansion_adds_people_concept() -> None:
+def test_offline_plan_lexicon_expansion() -> None:
     plan = QueryPlanner().offline_plan("dangerous things")
     assert plan.source == "lexicon" and plan.expanded
-    objects, people = plan.concepts
+    (objects,) = plan.concepts  # an object category: no person concept
     assert "knife" in objects.prompts and "gun" in objects.prompts and objects.verify
+    objects, people = QueryPlanner().offline_plan("suspicious things").concepts  # "suspicious" also covers people
     assert people.kind == "person_attribute" and people.prompts == ["person"] and people.verify
-    assert plan.prompts[-1] == "person"
 
 
 def test_offline_plan_person_words_override_lexicon() -> None:
@@ -100,14 +100,14 @@ async def test_plan_auto_uses_llm_only_for_abstract_queries() -> None:
     concrete = await planner.plan("dogs", llm=llm)
     assert concrete.source == "literal" and llm.calls == 0
 
-    plan = await planner.plan("dangerous things", llm=llm)
+    plan = await planner.plan("dangerous things, menacing people", llm=llm)
     assert plan.source == "llm" and plan.expanded and llm.calls == 1
     danger, menacing, dogs = plan.concepts
     assert danger.prompts == ["kitchen knife", "handgun"] and danger.verify
     assert menacing.prompts == ["person"] and menacing.verify and "menacing people" in (menacing.question or "")
     assert dogs.prompts == ["dog"] and not dogs.verify  # verify without a question is dropped
 
-    again = await planner.plan("Dangerous Things ", llm=llm)
+    again = await planner.plan("Dangerous Things, Menacing People ", llm=llm)
     assert again is plan and llm.calls == 1  # cached per (query, llm)
 
 

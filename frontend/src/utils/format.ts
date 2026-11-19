@@ -1,4 +1,4 @@
-import type { PersonRef, Person } from '../types';
+import type { Job, PersonRef, Person } from '../types';
 
 export function pct(score: number | null | undefined, digits = 0): string {
   if (score == null || Number.isNaN(score)) return '–';
@@ -50,4 +50,20 @@ export function formatJson(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+/** One-line result of a finished job from its `summary` ('' while it runs). */
+export function jobSummaryText(job: Pick<Job, 'kind' | 'summary'>): string {
+  const s = job.summary ?? {};
+  if (job.kind === 'scan') {
+    if (s.scanned == null) return '';
+    const parts = [`${s.scanned} media scanned`, `${s.media_with_hits ?? 0} with hits`, `${s.accepted ?? 0} matches`];
+    if (s.updated) parts.push(`${s.updated} updated`);
+    if (s.rejected) parts.push(`${s.rejected} rejected`);
+    return parts.join(' · ');
+  }
+  if (s.media == null) return '';
+  const parts = [`${s.media} media`, `${s.entities ?? 0} ${s.entities === 1 ? 'entity' : 'entities'}`];
+  if (s.failed) parts.push(`${s.failed} failed`);
+  return parts.join(' · ');
 }

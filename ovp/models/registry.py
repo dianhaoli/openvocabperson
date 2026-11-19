@@ -5,8 +5,12 @@ what is available on this machine. ``auto`` picks the best option for the hardwa
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
+import os
 import re
+from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Optional
 
 from ..config import Settings, get_settings
@@ -19,6 +23,8 @@ from . import segmenters as S
 log = logging.getLogger("ovp.registry")
 
 ROLES = ("detector", "segmenter", "vlm", "llm", "embedder", "text_embedder", "reid")
+MAX_EXTRA_MODELS = 4  # loaded models beyond the defaults (per-request specs) kept in memory, least recently used evicted
+MAX_ERRORS = 64  # remembered load failures
 
 
 def _has(module: str) -> bool:
@@ -47,13 +53,123 @@ class ModelUnavailable(RuntimeError):
         self.role, self.spec, self.reason = role, spec, reason
 
 
+class InvalidSpec(ModelUnavailable):
+    """A model spec that names an unknown provider/kind or weights outside the allowed folders."""
+
+
+# ── spec validation ───────────────────────────────────────────────────────────
+# Specs can arrive per request (analysis options, agent, PATCH /api/config), so they are checked
+# before anything is built: a known provider/kind, and weights that are either a plain file name,
+# a Hugging Face repo id ("org/name", where the backend loads from the Hub) or a path inside
+# OVP_WEIGHTS_DIR or the working directory. Ultralytics/torch weights are pickles: loading an
+# arbitrary file would run arbitrary code.
+
+_FILE_NAME = re.compile(r"^[\w.+-]+$")
+_REPO_ID = re.compile(r"^[\w.-]+/[\w.-]+$")
+_MODEL_NAME = re.compile(r"^[\w.:/@+-]{1,200}$")  # cloud model ids: never touch the file system
+_OSNET_NAME = re.compile(r"^osnet\w*$")
+
+DETECTOR_KINDS = ("yoloe", "yolo-world", "yolo", "owlv2", "grounding-dino", "vlm")
+HF_DETECTORS = ("owlv2", "grounding-dino")
+SEGMENTER_KINDS = {"sam": "sam", "sam2": "sam", "mobilesam": "sam", "fastsam": "fastsam", "detector": "detector"}
+TEXT_EMBEDDER_PROVIDERS = ("openai", "gemini", "ollama", "compat", "st", "clip")
+REID_KINDS = ("osnet", "clip", "color")
+
+
+def _allowed_roots(s: Settings) -> list[Path]:
+    return [Path(os.path.abspath(Path.cwd())), Path(os.path.abspath(s.weights_dir.expanduser()))]
+
+
+def _check_weights(role: str, spec: str, weights: str, s: Settings, repo_id: bool = False) -> str:
+    """Canonical weights reference, or ``InvalidSpec``. Paths are compared lexically (``..`` is
+    refused outright), so weights symlinked into an allowed folder keep working."""
+    if not weights:
+        return weights
+    parts = weights.replace("\\", "/").split("/")
+    if ".." in parts:
+        raise InvalidSpec(role, spec, "'..' is not allowed in model weights")
+    if _FILE_NAME.match(weights) and weights != ".":
+        return weights
+    if repo_id and _REPO_ID.match(weights) and "." not in parts:
+        return weights
+    path = Path(os.path.abspath(Path(weights).expanduser()))
+    roots = _allowed_roots(s)
+    if not any(path == r or path.is_relative_to(r) for r in roots):
+        raise InvalidSpec(role, spec, "local weights must be inside OVP_WEIGHTS_DIR or the working directory")
+    cwd, wdir = roots
+    # a plain file name resolves to the working directory first, then OVP_WEIGHTS_DIR (see the loaders)
+    if path.parent == cwd or (path.parent == wdir and not (cwd / path.name).exists()):
+        return path.name
+    return str(path)
+
+
+def _check_name(role: str, spec: str, model: str, pattern: re.Pattern[str] = _MODEL_NAME) -> str:
+    if model and not pattern.match(model):
+        raise InvalidSpec(role, spec, "invalid model name")
+    return model
+
+
+def _join(kind: str, rest: str) -> str:
+    return f"{kind}:{rest}" if rest else kind
+
+
+def normalize_spec(role: str, spec: str, s: Settings) -> str:
+    """Validate a model spec for ``role`` and return its canonical spelling (the cache key)."""
+    raw = spec
+    spec = spec.strip()
+    kind, _, rest = spec.partition(":")
+    kind, rest = kind.strip().lower(), rest.strip()
+    if spec in ("", "none"):
+        return "none"
+    if role == "detector":
+        if kind not in DETECTOR_KINDS:
+            raise InvalidSpec(role, raw, f"unknown detector {kind!r}")
+        if kind == "vlm":
+            return _join(kind, normalize_spec("vlm", rest, s) if rest else "")
+        return _join(kind, _check_weights(role, raw, rest or D.DEFAULT_WEIGHTS[kind], s, repo_id=kind in HF_DETECTORS))
+    if role == "segmenter":
+        canon = SEGMENTER_KINDS.get(kind)
+        if canon is None:
+            raise InvalidSpec(role, raw, f"unknown segmenter {kind!r}")
+        if canon == "detector":
+            return canon
+        default = "mobile_sam.pt" if kind == "mobilesam" else S.DEFAULT_SEG_WEIGHTS[canon]
+        return _join(canon, _check_weights(role, raw, rest or default, s))
+    if role in ("vlm", "llm"):
+        if kind not in L.CLOUD_PROVIDERS + L.LOCAL_PROVIDERS:
+            raise InvalidSpec(role, raw, f"unknown model provider {kind!r}")
+        if kind in L.LOCAL_PROVIDERS:
+            return _join(kind, _check_weights(role, raw, rest, s, repo_id=True))
+        return _join(kind, _check_name(role, raw, rest))
+    if role == "embedder":
+        if kind != "clip":
+            raise InvalidSpec(role, raw, f"unknown embedder {kind!r}")
+        return _join(kind, _check_name(role, raw, rest or "ViT-B-32", _FILE_NAME))
+    if role == "text_embedder":
+        if kind not in TEXT_EMBEDDER_PROVIDERS:
+            raise InvalidSpec(role, raw, f"unknown text embedder {kind!r}")
+        if kind == "st":
+            return _join(kind, _check_weights(role, raw, rest, s, repo_id=True))
+        if kind == "clip":
+            return _join(kind, _check_name(role, raw, rest, _FILE_NAME))
+        return _join(kind, _check_name(role, raw, rest))
+    if role == "reid":
+        if kind not in REID_KINDS:
+            raise InvalidSpec(role, raw, f"unknown Re-ID model {kind!r}")
+        if kind == "osnet":
+            return _join(kind, _check_name(role, raw, rest or "osnet_x1_0", _OSNET_NAME))
+        return kind  # clip wraps the default CLIP embedder, color has no weights
+    raise KeyError(role)
+
+
 class ModelRegistry:
     def __init__(self, settings: Optional[Settings] = None):
         self.s = settings or get_settings()
-        self._cache: dict[tuple[str, str], Any] = {}
-        self.errors: dict[str, str] = {}
+        self._cache: OrderedDict[tuple[str, str], Any] = OrderedDict()  # least recently used first
+        self.errors: OrderedDict[str, str] = OrderedDict()  # "role|spec" -> reason, oldest first
         self.defaults: dict[str, str] = {}
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._releases: set[asyncio.Task] = set()
         self.resolve_defaults()
 
     # ── defaults ──────────────────────────────────────────────────────────────
@@ -129,12 +245,24 @@ class ModelRegistry:
     def resolve_defaults(self) -> None:
         for role in ROLES:
             raw = getattr(self.s, role)
-            self.defaults[role] = self._auto(role) if raw in (None, "", "auto") else raw
+            if raw in (None, "", "auto"):
+                self.defaults[role] = self._auto(role)
+                continue
+            try:
+                self.defaults[role] = normalize_spec(role, raw, self.s)
+            except InvalidSpec:  # configured by the operator (environment), so trusted as written
+                self.defaults[role] = raw.strip()
 
-    def set_default(self, role: str, spec: str) -> None:
+    def resolve(self, role: str, spec: Optional[str] = None) -> str:
+        """The canonical spec for ``role``: the default for None/""/"auto", else ``spec`` validated
+        (``InvalidSpec``). The current default is accepted as configured."""
         if role not in ROLES:
             raise KeyError(role)
-        self.defaults[role] = self._auto(role) if spec == "auto" else spec
+        if spec is None or spec.strip() in ("", "auto"):
+            return self.defaults.get(role, "none")
+        if spec.strip() == self.defaults.get(role):
+            return self.defaults[role]
+        return normalize_spec(role, spec, self.s)
 
     # ── construction ──────────────────────────────────────────────────────────
     def _build(self, role: str, spec: str) -> Any:
@@ -179,34 +307,81 @@ class ModelRegistry:
         raise KeyError(role)
 
     def get(self, role: str, spec: Optional[str] = None) -> Any:
-        """Return a model for a role or ``None`` when the role is disabled/unavailable."""
-        spec = spec or self.defaults.get(role, "none")
-        if not spec or spec == "none":
+        """Return a model for a role or ``None`` when the role is disabled/unavailable.
+
+        Raises ``InvalidSpec`` for a spec that must not be loaded (see ``normalize_spec``)."""
+        spec = self.resolve(role, spec)
+        if spec == "none" or f"{role}|{spec}" in self.errors:
             return None
         key = (role, spec)
-        if f"{role}|{spec}" in self.errors:
-            return None
         inst = self._cache.get(key)
-        if inst is None:
-            try:
-                inst = self._build(role, spec)
-            except Exception as e:
-                self.errors[f"{role}|{spec}"] = describe_error(e)
-                log.warning("cannot create %s %s: %s", role, spec, e)
-                return None
-            self._cache[key] = inst
+        if inst is not None:
+            self._cache.move_to_end(key)
+            return inst
+        try:
+            inst = self._build(role, spec)
+        except Exception as e:
+            self._set_error(role, spec, e)
+            log.warning("cannot create %s %s: %s", role, spec, e)
+            return None
+        self._cache[key] = inst
+        self._evict()
         return inst
 
+    def _set_error(self, role: str, spec: str, err: Exception | str) -> None:
+        key = f"{role}|{spec}"
+        self.errors.pop(key, None)
+        self.errors[key] = describe_error(err)
+        while len(self.errors) > MAX_ERRORS:
+            self.errors.popitem(last=False)
+
     def mark_failed(self, role: str, spec: str, err: Exception | str) -> None:
-        self.errors[f"{role}|{spec}"] = describe_error(err)
+        self._set_error(role, spec, err)
         self._cache.pop((role, spec), None)
 
     def clear_error(self, role: str, spec: str) -> None:
         self.errors.pop(f"{role}|{spec}", None)
 
+    # ── memory: per-request models are evicted, least recently used first ──
+    def _evict(self) -> None:
+        protected = set(self.defaults.items())
+        extra = [key for key in self._cache if key not in protected]
+        for key in extra[: max(0, len(extra) - MAX_EXTRA_MODELS)]:
+            inst = self._cache.pop(key)
+            lock = self._locks.get(key)
+            if lock is not None and not lock.locked():
+                del self._locks[key]
+            log.info("unloading %s %s (least recently used)", *key)
+            self._release(inst)
+
+    def _release(self, inst: Any) -> None:
+        """Free an evicted model's weights. Jobs still holding it keep working: local models reload
+        lazily. HTTP clients of cloud models are left to the garbage collector, since a request
+        may still be in flight on them."""
+        unload = getattr(inst, "unload", None)
+        if unload is None:
+            return
+
+        def free() -> None:
+            unload()
+            gc.collect()
+            if self.device.startswith("cuda"):
+                import torch
+
+                torch.cuda.empty_cache()
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # no event loop (synchronous use): nothing else can be on the device thread
+            free()
+            return
+        task = loop.create_task(get_runtime().run_model(free))  # serialized with inference
+        self._releases.add(task)
+        task.add_done_callback(self._releases.discard)
+
     async def ensure(self, role: str, spec: Optional[str] = None) -> Any:
         """Get a model and make sure it actually loads (weights downloaded etc.)."""
-        spec = spec or self.defaults.get(role, "none")
+        spec = self.resolve(role, spec)
         inst = self.get(role, spec)
         if inst is None:
             return None
@@ -244,10 +419,11 @@ class ModelRegistry:
         Raises ``ModelUnavailable`` naming the first role that could not be loaded.
         """
         previous = dict(self.defaults)
-        for role, spec in changes.items():
-            self.clear_error(role, spec)  # allow retrying a model that failed earlier
-            self.set_default(role, spec)
         try:
+            for role, spec in changes.items():
+                spec = self._auto(role) if spec.strip() == "auto" else self.resolve(role, spec)
+                self.clear_error(role, spec)  # allow retrying a model that failed earlier
+                self.defaults[role] = spec
             for role in changes:
                 spec = self.defaults[role]
                 if spec == "none":
@@ -322,7 +498,7 @@ class ModelRegistry:
                 if role == "llm" and local:
                     continue
                 if local and self.device == "cpu":
-                    note = (note or "") + " (CPU: very slow)"
+                    note = f"{note} (CPU: very slow)" if note else "CPU: very slow"
                 out[role].append(self._status(role, vspec, vspec, ok, note, local=local or provider == "ollama"))
 
         clip_ok = E.clip_available()

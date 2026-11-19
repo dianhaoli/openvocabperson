@@ -61,12 +61,17 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_BASE_URL: ${GEMINI_BASE_URL:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       # Ollama on the host machine
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
       OVP_COMPAT_BASE_URL: ${OVP_COMPAT_BASE_URL:-}
       OVP_COMPAT_API_KEY: ${OVP_COMPAT_API_KEY:-}
+      # container folders the UI / API / agent may import from (empty = path import disabled),
+      # e.g. /data/storage/inbox, or a host folder you mount under volumes
+      OVP_IMPORT_ROOTS: ${OVP_IMPORT_ROOTS:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

@@ -3,6 +3,7 @@ import { useActions, useAppState } from '../../context/hooks';
 import { TERMINAL_STATUSES, type JobTrackerState } from '../../hooks/useJobTracker';
 import type { JobStatus } from '../../types';
 import { cn } from '../../utils/cn';
+import { jobSummaryText } from '../../utils/format';
 import { Img } from '../common/Img';
 import { Button } from '../ui/Button';
 import { Badge, ProgressBar } from '../ui/Misc';
@@ -43,6 +44,15 @@ export function JobPanel({ state, onCancel, onDismiss }: Props) {
   const status = state.status ?? 'queued';
   const terminal = TERMINAL_STATUSES.includes(status);
   const frac = state.total > 0 ? state.done / state.total : 0;
+  const statusLine = !terminal
+    ? [state.stage, state.current].filter(Boolean).join(' · ')
+    : status === 'error'
+      ? (state.job?.error ?? 'Job failed')
+      : status === 'cancelled'
+        ? 'Cancelled before finishing'
+        : state.job
+          ? jobSummaryText(state.job)
+          : '';
 
   const cancel = async () => {
     setCancelling(true);
@@ -76,9 +86,15 @@ export function JobPanel({ state, onCancel, onDismiss }: Props) {
       </div>
 
       <div className="flex flex-col gap-1">
-        <ProgressBar value={terminal && status === 'done' ? 1 : frac} indeterminate={!terminal && state.total === 0} />
+        <ProgressBar
+          value={status === 'done' ? 1 : frac}
+          indeterminate={!terminal && state.total === 0}
+          tone={status === 'cancelled' ? 'warning' : status === 'error' ? 'error' : undefined}
+        />
         <div className="flex justify-between gap-2 text-[11px] text-text-muted">
-          <span className="truncate">{terminal ? (state.job?.error ?? '') : [state.stage, state.current].filter(Boolean).join(' · ')}</span>
+          <span className={cn('truncate', status === 'error' && 'text-error')} title={statusLine}>
+            {statusLine}
+          </span>
           {state.total > 0 && (
             <span className="font-mono shrink-0">
               {state.done}/{state.total}

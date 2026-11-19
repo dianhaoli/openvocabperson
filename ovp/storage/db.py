@@ -49,6 +49,11 @@ def parse_vec(s: Any) -> Optional[np.ndarray]:
     return np.asarray(json.loads(s), dtype=np.float32)
 
 
+def like_escape(s: str) -> str:
+    """Escape LIKE wildcards so user input matches literally (default ESCAPE character '\\')."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def lit(s: str) -> str:
     """SQL string literal (used for embedding-space names so partial indexes are usable)."""
     return "'" + s.replace("'", "''") + "'"
@@ -319,8 +324,10 @@ class Database:
         assert self.pool
         return await self.pool.fetch(MEDIA_SELECT + " WHERE m.id = ANY($1::text[])", list(ids))
 
+    # Library listings, counts, stats and scans cover finished media only ('pending', 'error' and
+    # 'cancelled' rows are hidden); list_media also shows media still being analysed.
     async def list_media(self, limit: int = 50, offset: int = 0, kind: Optional[str] = None, ids: Optional[Sequence[str]] = None) -> list[asyncpg.Record]:
-        where, args = ["m.status <> 'pending'"], []
+        where, args = ["m.status IN ('done', 'processing')"], []
         if kind:
             args.append(kind)
             where.append(f"m.kind = ${len(args)}")
@@ -336,8 +343,8 @@ class Database:
     async def count_media(self, kind: Optional[str] = None) -> int:
         assert self.pool
         if kind:
-            return await self.pool.fetchval("SELECT COUNT(*) FROM media WHERE kind = $1 AND status <> 'pending'", kind)
-        return await self.pool.fetchval("SELECT COUNT(*) FROM media WHERE status <> 'pending'")
+            return await self.pool.fetchval("SELECT COUNT(*) FROM media WHERE kind = $1 AND status = 'done'", kind)
+        return await self.pool.fetchval("SELECT COUNT(*) FROM media WHERE status = 'done'")
 
     async def all_media_ids(self, kind: Optional[str] = None, limit: Optional[int] = None) -> list[str]:
         assert self.pool
@@ -346,6 +353,12 @@ class Database:
             q += f" LIMIT {int(limit)}"
         rows = await (self.pool.fetch(q, kind) if kind else self.pool.fetch(q))
         return [r["id"] for r in rows]
+
+    async def fail_interrupted_media(self) -> int:
+        """Mark media left 'processing' by a previous run (crash or shutdown) as 'error'."""
+        assert self.pool
+        r = await self.pool.execute("UPDATE media SET status = 'error' WHERE status = 'processing'")
+        return int(r.split()[-1])
 
     async def delete_media(self, media_id: str) -> Optional[dict[str, Any]]:
         """Delete media; returns file paths to remove. Person clusters are recomputed."""
@@ -495,7 +508,7 @@ class Database:
     async def label_match(self, terms: list[str], limit: int, filters: dict[str, Any]) -> list[tuple[str, float]]:
         if not terms:
             return []
-        args: list[Any] = [[t.lower() for t in terms], [f"%{t.lower()}%" for t in terms]]
+        args: list[Any] = [[t.lower() for t in terms], [f"%{like_escape(t.lower())}%" for t in terms]]
         where = self._filters(filters, args)
         args.append(limit)
         assert self.pool
@@ -550,6 +563,19 @@ class Database:
             pid, label, space, vec_literal(centroid) if centroid is not None else None, representative,
         )
         return pid
+
+    async def media_sightings(self, entity_ids: Sequence[str]) -> list[asyncpg.Record]:
+        """``entity_ids`` plus the person-linked sightings that share a media item with them
+        (id, person_id and the timing columns used to tell whether two sightings co-occur)."""
+        assert self.pool
+        return await self.pool.fetch(
+            """
+            SELECT e.id, e.person_id, e.t_start, e.t_end, e.trajectory FROM entities e
+            WHERE e.media_id IN (SELECT media_id FROM entities WHERE id = ANY($1::text[]))
+              AND (e.id = ANY($1::text[]) OR (e.person_id IS NOT NULL AND e.stage <> 'rejected'))
+            """,
+            list(entity_ids),
+        )
 
     async def link_entity(self, entity_id: str, person_id: Optional[str], status: Optional[str], score: Optional[float], suggested: Optional[str] = None) -> None:
         assert self.pool
@@ -616,7 +642,7 @@ class Database:
         if watchlist:
             where.append("p.is_watchlist")
         if q:
-            args.append(f"%{q.lower()}%")
+            args.append(f"%{like_escape(q.lower())}%")
             where.append(f"(lower(coalesce(p.label, '')) LIKE ${len(args)} OR lower(coalesce(p.notes, '')) LIKE ${len(args)} OR p.id LIKE ${len(args)})")
         w = " AND ".join(where)
         assert self.pool
@@ -626,8 +652,17 @@ class Database:
         rows = await self.pool.fetch(PERSON_SELECT + f" WHERE {w} ORDER BY {order_sql} LIMIT ${len(args) - 1} OFFSET ${len(args)}", *args)
         return rows, int(total)
 
-    async def update_person(self, person_id: str, **f: Any) -> bool:
-        f = {k: v for k, v in f.items() if v is not None}
+    async def find_persons_by_label(self, label: str) -> list[asyncpg.Record]:
+        """Persons whose label equals ``label`` (case-insensitive, surrounding spaces ignored)."""
+        assert self.pool
+        return await self.pool.fetch(PERSON_SELECT + " WHERE lower(p.label) = lower(trim($1)) ORDER BY p.sighting_count DESC", label)
+
+    async def update_person(self, person_id: str, label: Optional[str] = None, notes: Optional[str] = None, is_watchlist: Optional[bool] = None) -> bool:
+        """Update the given fields; ``None`` leaves a field unchanged and an empty string clears
+        ``label``/``notes``. Returns whether the person exists."""
+        f: dict[str, Any] = {k: (v or None) for k, v in (("label", label), ("notes", notes)) if v is not None}
+        if is_watchlist is not None:
+            f["is_watchlist"] = is_watchlist
         if not f:
             return await self.get_person(person_id) is not None
         sets = ", ".join(f"{k} = ${i + 2}" for i, k in enumerate(f))
@@ -714,9 +749,9 @@ class Database:
         assert self.pool
         row = await self.pool.fetchrow(
             """
-            SELECT (SELECT COUNT(*) FROM media WHERE status <> 'pending') AS media,
-                   (SELECT COUNT(*) FROM media WHERE kind = 'image' AND status <> 'pending') AS images,
-                   (SELECT COUNT(*) FROM media WHERE kind = 'video' AND status <> 'pending') AS videos,
+            SELECT (SELECT COUNT(*) FROM media WHERE status = 'done') AS media,
+                   (SELECT COUNT(*) FROM media WHERE kind = 'image' AND status = 'done') AS images,
+                   (SELECT COUNT(*) FROM media WHERE kind = 'video' AND status = 'done') AS videos,
                    (SELECT COUNT(*) FROM entities WHERE stage <> 'rejected') AS entities,
                    (SELECT COUNT(*) FROM persons) AS persons,
                    (SELECT COUNT(*) FROM persons WHERE is_watchlist) AS watchlist,
