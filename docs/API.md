@@ -48,6 +48,7 @@ A single detection (image) or a single track (video).
   "url": "/api/media/m_.../file",   // original file (videos support Range requests)
   "thumb_url": "/api/media/m_.../thumb",
   "query": "dangerous things",      // query used at analysis time (null = default)
+  "status": "done",                 // "processing" | "done" | "error"
   "entity_count": 7,
   "person_count": 3,
   "created_at": 1731900000.0
@@ -85,7 +86,9 @@ Analysis always runs as a background job.
   "media_ids": ["m_..."],
   "error": null,
   "created_at": 1731900000.0, "finished_at": null,
-  "options": { /* AnalyzeOptions */ }
+  "options": { /* AnalyzeOptions */ },
+  "plan": { /* Plan */ },           // null until planning finished
+  "summary": {"media": 1, "entities": 7, "failed": 0}  // scan: {scanned, media_with_hits, entities}
 }
 ```
 
@@ -101,6 +104,7 @@ All fields optional.
   "detector": null,                 // model spec override, e.g. "yoloe:yoloe-11l-seg.pt"
   "segmenter": null,                // e.g. "sam:sam2.1_b.pt"
   "vlm": null,                      // e.g. "openai:gpt-4.1-mini", "anthropic:claude-haiku-5-5", "qwen:Qwen/Qwen2.5-VL-3B-Instruct"
+  "llm": null,                      // LLM used to expand the query (falls back to the VLM)
   "conf": 0.25,                     // detector confidence threshold
   "video_fps": 2.0,                 // frames per second sampled from videos
   "max_frames": 600,
@@ -113,10 +117,11 @@ All fields optional.
 ### System
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/health` | `{status, ready, device, db, capabilities, version}` |
+| GET | `/api/health` | `{status, ready, device, db, capabilities, version}`; `ready` turns true once default models finished loading |
+| GET | `/health` | Legacy alias: the same plus `pipeline_ready`, `reid_ready` |
 | GET | `/api/models` | Providers per role, availability and current defaults (see below) |
-| PATCH | `/api/config` | `{detector?, segmenter?, vlm?, llm?, embedder?, reid?}` change runtime defaults; returns `/api/models` payload |
-| GET | `/api/stats` | `{media, images, videos, entities, persons, watchlist, labels: [{label, count}]}` |
+| PATCH | `/api/config` | `{detector?, segmenter?, vlm?, llm?, embedder?, text_embedder?, reid?}` change runtime defaults (`"auto"` re-resolves). All-or-nothing: if any model fails to load nothing changes → 400. Returns the `/api/models` payload |
+| GET | `/api/stats` | `{media, images, videos, entities, persons, watchlist, pending, labels: [{label, count}]}` (`pending` = sightings awaiting review) |
 
 `GET /api/models`:
 ```jsonc
@@ -130,18 +135,18 @@ All fields optional.
                    "local": true, "open_vocab": true, "masks": true, "note": null}, ...],
     "segmenter": [...], "vlm": [...], "llm": [...], "embedder": [...], "reid": [...]
   },
-  "capabilities": {"vlm": true, "llm": true, "segmentation": true, "clip": false, "text_search": true,
-                   "reid": "osnet", "video": true, "agent": true}
+  "capabilities": {"detector": true, "open_vocab": true, "vlm": true, "llm": true, "agent": true,
+                   "segmentation": true, "clip": false, "text_search": true, "reid": "osnet", "video": true}
 }
 ```
 
 ### Planning & analysis
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| POST | `/api/plan` | `{query, expand}` | `Plan` (preview, no detection) |
-| POST | `/api/analyze` | multipart: `files` (1..n images/videos), `options` (JSON string of AnalyzeOptions). Query `?wait=true` blocks and returns the finished job with `media` | `{job: Job}` or `{job, media: MediaDetail[]}` |
-| POST | `/api/analyze/paths` | `{paths: [server-side files or folders], options}` | `{job}` |
-| POST | `/api/scan` | `{query, media_ids?: string[], limit?: int, options?}` re-run open-vocab detection over already stored media (all if omitted) and add new entities | `{job}` |
+| POST | `/api/plan` | `{query, expand?, llm?}` | `Plan` (preview, no detection) |
+| POST | `/api/analyze` | multipart: `files` (1..n images/videos), `options` (JSON string of AnalyzeOptions), optional `query` form field (used when `options.query` is unset). Query `?wait=true` blocks and returns the finished job with `media` | `{job: Job}` or `{job, media: MediaDetail[]}` |
+| POST | `/api/analyze/paths` | `{paths: [server-side files or folders, searched recursively], options}`; `?wait=true` as above | `{job}` |
+| POST | `/api/scan` | `{query, media_ids?: string[], limit?: int, options?}` re-run open-vocab detection over already stored media (all if omitted) and add new entities; `describe` defaults to `"none"`; `?wait=true` as above | `{job}` |
 | GET | `/api/jobs` | | `{jobs: Job[]}` (most recent first) |
 | GET | `/api/jobs/{id}` | | `{job, media: MediaDetail[]}` |
 | GET | `/api/jobs/{id}/events` | | **SSE** stream (replays past events first) |
@@ -153,11 +158,13 @@ Job SSE events (`data: {...}\n\n`, each has `type`, `job_id`, `ts`):
 - `media_started` `{index, total, name, kind}`
 - `media_created` `{media}` (media row exists, file viewable)
 - `stage` `{media_id, stage, message}` stage in `detect|track|segment|verify|describe|embed|identity|save`
-- `detections` `{media_id, count, labels: {label: count}}`
+- `detections` `{media_id, count, labels: {label: count}, elapsed}`
 - `entity` `{entity}` (emitted as each entity is finalized)
 - `media_done` `{media: MediaDetail}`
 - `progress` `{done, total}`
 - `log` `{level: info|warning|error, message}`
+- `error` `{message}` the job failed (followed by `job_done`)
+- `ping` `{}` keep-alive every 15 s (ignore)
 - `job_done` `{job}` — final event (also sent for error/cancel)
 
 ### Media & entities
@@ -165,21 +172,23 @@ Job SSE events (`data: {...}\n\n`, each has `type`, `job_id`, `ts`):
 |---|---|---|
 | GET | `/api/media?limit=50&offset=0&kind=image\|video` | `{media: Media[], total}` |
 | GET | `/api/media/{id}` | `MediaDetail` |
-| DELETE | `/api/media/{id}` | Deletes files, entities, and updates person clusters |
+| DELETE | `/api/media/{id}` | Deletes files, entities, and updates person clusters → `{success, media_id, persons_updated}` |
 | GET | `/api/media/{id}/file` | Original image / video (Range supported) |
 | GET | `/api/media/{id}/thumb` | JPEG thumbnail |
-| POST | `/api/media/{id}/ask` | `{question}` → `{answer, elapsed}` (VLM over the full image / video keyframes) |
-| GET | `/api/entities/{id}` | `Entity` + `media` + `qa: [{question, answer, created_at}]` |
+| POST | `/api/media/{id}/ask` | `{question, vlm?}` → `{answer, elapsed}` (VLM over the full image / video keyframes); persisted. 503 without a VLM |
+| GET | `/api/media/{id}/qa` | `{qa: [{question, answer, created_at}]}` media-level Q&A history |
+| GET | `/api/entities/{id}` | `Entity` + `media` + `qa: [{question, answer, scope, created_at}]` |
 | DELETE | `/api/entities/{id}` | |
 | GET | `/api/entities/{id}/crop` | JPEG crop |
-| POST | `/api/entities/{id}/ask` | `{question, scope: "crop"\|"scene"}` → `{answer, elapsed}`; Q&A is persisted |
+| POST | `/api/entities/{id}/ask` | `{question, scope: "crop"\|"scene", vlm?}` (legacy `use_full_scene: true` = `"scene"`) → `{answer, elapsed, scope}`; Q&A is persisted. 503 without a VLM |
 | POST | `/api/entities/{id}/assign` | `{person_id: string \| null}` (null = create a new person) → `Entity` |
 | POST | `/api/entities/{id}/review` | `{action: "accept" \| "new" \| "reject"}` resolve a pending match → `Entity` |
 
 ### Search
 `POST /api/search` — multipart **or** JSON.
 - JSON: `{text, labels?: string[], media_id?, person_id?, kind?: "image"|"video", limit?: 30}`
-- multipart: `text` (optional), `file` (optional image), `limit`.
+- multipart: `text` (optional), `file` (optional image), `limit`, `media_id`, `person_id`, `kind`.
+- `text_query` is accepted as an alias of `text`; `limit` is clamped to 1..200. Neither text nor image → 400.
 
 Text search fuses (reciprocal-rank fusion) full-text over descriptions/labels, semantic description
 embeddings, and CLIP text→image similarity when available. An image query uses CLIP image→image and
@@ -193,14 +202,14 @@ person Re-ID.
 ### Persons (identity clusters)
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/persons?watchlist=false&q=&limit=100&offset=0` | `{persons: Person[], total}` |
+| GET | `/api/persons?watchlist=false&q=&limit=100&offset=0&order=recent\|sightings` | `{persons: Person[], total}` |
 | GET | `/api/persons/{id}` | `Person` + `sightings: (Entity & {media: Media})[]` |
 | PATCH | `/api/persons/{id}` | `{label?, is_watchlist?, notes?}` → `Person` |
 | DELETE | `/api/persons/{id}` | unlinks sightings |
 | POST | `/api/persons/{id}/merge` | `{other_id}` → `Person` |
-| POST | `/api/persons/search` | multipart `file` → `{results: [{person: Person, similarity}]}` |
-| POST | `/api/persons/recluster` | `{threshold?: float}` → `{persons: int, changed: int}` re-cluster all person sightings |
-| GET | `/api/persons/review` | `{pending: Entity[]}` sightings waiting for review |
+| POST | `/api/persons/search?limit=15&min_similarity=0.2` | multipart `file` → `{results: [{person: Person, similarity}]}` (the largest detected person in the photo is embedded); 503 without Re-ID |
+| POST | `/api/persons/recluster` | `{threshold?: float}` → `{persons: int, changed: int, sightings: int}` re-cluster all person sightings; 503 without Re-ID |
+| GET | `/api/persons/review?limit=200` | `{pending: Entity[]}` sightings waiting for review |
 
 `Person`:
 ```jsonc
@@ -213,10 +222,16 @@ person Re-ID.
 `POST /api/agent/chat` `{message, conversation_id?, llm?}` → **SSE**:
 - `conversation` `{conversation_id}`
 - `tool_call` `{id, name, arguments}`
-- `tool_result` `{id, name, summary, entities?: Entity[], media?: Media[], persons?: Person[], job_id?: string}`
+- `tool_result` `{id, name, summary, elapsed, entities?: Entity[], media?: Media[], persons?: Person[], job_id?: string}`
 - `message` `{text}` assistant text (markdown); may appear multiple times
 - `done` `{}`
 - `error` `{message}`
+- `ping` `{}` keep-alive every 15 s while a tool runs (ignore)
+
+The turn keeps running if the client disconnects, so the conversation stays consistent;
+turns of one conversation run one at a time. An unavailable `llm` spec → 400.
+
+`GET /api/agent/conversations` → `{conversations: [{id, title, created_at, updated_at, message_count}]}` (most recent first)
 
 `GET /api/agent/conversations/{id}` → `{id, messages: [{role, text, tool_calls?}]}`
 

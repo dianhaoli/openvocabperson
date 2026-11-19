@@ -32,6 +32,8 @@ export interface AppState {
   personsVersion: number;
   /** Bumped whenever the media library / jobs may have changed */
   libraryVersion: number;
+  /** Media currently being analyzed by a job followed in this tab (entities still streaming in). */
+  processingMediaIds: string[];
 }
 
 export const initialState: AppState = {
@@ -47,6 +49,7 @@ export const initialState: AppState = {
   healthError: false,
   personsVersion: 0,
   libraryVersion: 0,
+  processingMediaIds: [],
 };
 
 export type Action =
@@ -66,7 +69,8 @@ export type Action =
   | { type: 'dismissToast'; id: number }
   | { type: 'setHealth'; health: Health | null; error: boolean }
   | { type: 'bumpPersons' }
-  | { type: 'bumpLibrary' };
+  | { type: 'bumpLibrary' }
+  | { type: 'setProcessing'; mediaIds: string[]; processing: boolean };
 
 function upsertInList(list: Entity[], entity: Entity): Entity[] {
   const idx = list.findIndex((e) => e.id === entity.id);
@@ -162,6 +166,10 @@ export function reducer(state: AppState, action: Action): AppState {
       return { ...state, personsVersion: state.personsVersion + 1 };
     case 'bumpLibrary':
       return { ...state, libraryVersion: state.libraryVersion + 1 };
+    case 'setProcessing': {
+      const rest = state.processingMediaIds.filter((id) => !action.mediaIds.includes(id));
+      return { ...state, processingMediaIds: action.processing ? [...rest, ...action.mediaIds] : rest };
+    }
     default:
       return state;
   }
@@ -186,6 +194,7 @@ export interface AppActions {
   setHealth: (health: Health | null, error: boolean) => void;
   bumpPersons: () => void;
   bumpLibrary: () => void;
+  setProcessing: (mediaIds: string[], processing: boolean) => void;
 }
 
 export const StateContext = createContext<AppState | null>(null);

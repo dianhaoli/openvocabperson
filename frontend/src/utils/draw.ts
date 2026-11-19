@@ -1,9 +1,11 @@
 import type { Entity } from '../types';
 import { personName } from './format';
-
+/** Canvas tag text: label and score, plus the person when it is named or on the watchlist. */
 export function entityCaption(e: Entity): string {
   const base = `${e.label} ${Math.round(e.score * 100)}%`;
-  return e.person ? `${base} · ${personName(e.person)}` : base;
+  const person = e.person;
+  if (!person || (!person.label?.trim() && !person.is_watchlist)) return base;
+  return `${base} · ${person.is_watchlist ? '★ ' : ''}${personName(person)}`;
 }
 
 /** Draws a label tag at (x, y) top-left of a box, flipping inside when near the top edge. */

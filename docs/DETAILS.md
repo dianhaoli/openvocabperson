@@ -1,604 +1,283 @@
 # Details
 
-Reference material moved out of the top-level README: Re-ID matching, project layout, API, configuration, schema, development and troubleshooting.
+This file covers how each part works and how to run it. The HTTP contract is in [API.md](API.md). Setup, the model matrix and every environment variable are in the [README](../README.md).
 
-## Contents
-
-- [Cross-upload matching](#cross-upload-matching-re-id--centroids)
-- [Hierarchical routing](#hierarchical-routing)
-- [Project structure](#project-structure)
-- [API reference](#api-reference)
-- [Configuration](#configuration)
-- [Performance notes](#performance-notes)
-- [Models](#models-used)
-- [Development](#development)
-- [Docker](#docker-deployment)
-- [Troubleshooting](#troubleshooting)
+- [Query planning](#query-planning)
+- [Image pipeline](#image-pipeline)
+- [Video pipeline](#video-pipeline)
+- [Identity (Re-ID clusters)](#identity-re-id-clusters)
+- [Search](#search)
+- [Q&A](#qa)
+- [Jobs](#jobs)
+- [Analyst agent](#analyst-agent)
+- [Model registry and runtime](#model-registry-and-runtime)
 - [Database schema](#database-schema)
+- [CLI](#cli)
+- [Docker](#docker)
+- [Development and tests](#development-and-tests)
+- [Troubleshooting](#troubleshooting)
 
-## Cross-upload matching (Re-ID + centroids)
+## Query planning
 
-VLM embeddings continue to power **text and image-semantic** search. **Identity** across uploads uses **torchreid OSNet** (`osnet_x1_0`, MSMT17 weights): greedy cosine similarity against each person’s **running-mean centroid**; new sightings update the centroid. Defaults: **matched** if best similarity ≥ `reid_match_threshold` (0.75), **new** auto-cluster if the best score is below `reid_review_threshold` (0.60), **pending** in between (needs review). Tune per scene in `PipelineConfig`. If Re-ID fails to initialize (e.g. missing deps), the pipeline disables it and analysis still runs.
+`ovp/pipeline/planner.py` turns the free-text query into a `Plan`, a list of concepts. Each concept has detector prompts, and optionally a VLM yes/no question for verification.
 
-```mermaid
-flowchart LR
-    Upload[New image] --> YOLO[YOLO person crops]
-    YOLO --> VLM[VLM + 1536-d embedding]
-    YOLO --> ReID[OSNet 512-d Re-ID]
-    ReID --> Match{Cosine vs centroids}
-    Match -->|sim >= 0.75| Link[Link person]
-    Match -->|sim < 0.6| NewId[New cluster]
-    Match -->|0.6 - 0.75| Pending[Pending review]
-    Link --> UpdateCentroid[Update centroid mean]
-    NewId --> UpdateCentroid
-    UpdateCentroid --> Response[Badges in API/UI]
-```
+| Query | Source | Result |
+|---|---|---|
+| *(empty)* | `default` | The 80 COCO classes. The detector runs its own vocabulary, with confidence capped at 0.2 |
+| `people, dogs` | `literal` / `lexicon` | `person`, `dog` (COCO synonyms are normalised) |
+| `dangerous things` | `llm` or `lexicon` | knife, gun, scissors, fire, … plus the check "Is this a potentially dangerous object…?" |
+| `menacing people` | `llm` or `lexicon` | Detect `person`, then ask the VLM "Does this person appear menacing?" (a `person_attribute` concept) |
 
-## Hierarchical routing
+`expand` controls when the LLM is used:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Input Image                               │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 1: YOLO Detection (Fast)                                  │
-│  • YOLO11-Large for object detection                             │
-│  • Returns bounding boxes + class + confidence                   │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 2: Hierarchical Routing (Instant)                         │
-│  ┌─────────────────┬────────────────────┬─────────────────────┐ │
-│  │ Non-Priority    │ Low Confidence     │ Priority + High     │ │
-│  │ (car, dog...)   │ (person <0.3)      │ (person ≥0.3)       │ │
-│  │       ↓         │        ↓           │        ↓            │ │
-│  │   YOLO_ONLY     │  LOW_CONFIDENCE    │     VLM_FULL        │ │
-│  │   (skip VLM)    │  (minimal proc)    │   (full analysis)   │ │
-│  └─────────────────┴────────────────────┴─────────────────────┘ │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 3: VLM Analysis (Only Priority Detections)                │
-│  • Qwen2.5-VL-3B-Instruct                                        │
-│  • Batched inference with size-aware batching                    │
-│  • Extracts: actions, clothing, objects, visibility              │
-│  • Generates embeddings for similarity search                    │
-│  • OSNet Re-ID (512-d) on full-VLM person crops only             │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Storage: PostgreSQL + pgvector                                  │
-│  • Sessions & entities with image paths                          │
-│  • Full-text search index (GIN)                                  │
-│  • Vector similarity index (HNSW)                                │
-│  • Person clusters: centroid (Re-ID) + optional watchlist flag   │
-└─────────────────────────────────────────────────────────────────┘
-```
+- `"auto"` (the default) asks the LLM only for abstract terms.
+- `true` always asks the LLM.
+- `false` takes the query literally.
 
-## Project Structure
+The LLM is the configured LLM, or the VLM when no LLM is set. Plans are cached per (query, model). If the LLM fails or none is configured, the built-in lexicon is used, so planning also works offline. `POST /api/plan` previews a plan without running detection.
 
-```
-.
-├── app.py                  # FastAPI server (REST + SSE streaming)
-├── pipeline.py             # Hierarchical detection/analysis pipeline
-├── database.py             # PostgreSQL + pgvector hybrid search
-├── embeddings.py           # Image embedding extraction from VLM
-├── reid.py                 # OSNet Re-ID extractor (512-d, mirrors embeddings API shape)
-├── person_matcher.py       # Threshold rules: matched / new / pending vs top centroid matches
-├── storage_utils.py        # Image storage utilities
-├── demo.py                 # CLI demo for testing
-├── model.ipynb             # Development notebook
-├── requirements.txt        # Python dependencies
-├── Dockerfile              # Backend Docker image
-├── docker-compose.yml      # Full stack orchestration
-├── .dockerignore           # Docker build exclusions
-├── .gitignore              # Git exclusions
-│
-├── frontend/               # React + TypeScript frontend
-│   ├── src/
-│   │   ├── api/            # Typed API client functions
-│   │   ├── components/     # React components
-│   │   │   ├── canvas/     # Canvas with bounding boxes
-│   │   │   ├── entity/     # Entity panel and Q&A
-│   │   │   ├── layout/     # Header, Sidebar, MainLayout
-│   │   │   ├── results/    # Results grid and cards
-│   │   │   ├── sidebar/    # Upload, Search, History tabs
-│   │   │   └── ui/         # Reusable UI components
-│   │   ├── context/        # React Context for global state
-│   │   ├── hooks/          # Custom React hooks
-│   │   ├── types/          # TypeScript type definitions
-│   │   └── utils/          # Utility functions
-│   ├── public/             # Static assets
-│   ├── Dockerfile          # Frontend Docker image
-│   ├── nginx.conf          # Nginx configuration
-│   ├── package.json        # Node dependencies
-│   ├── tsconfig.json       # TypeScript configuration
-│   └── vite.config.ts      # Vite build configuration
-│
-├── static/                 # Legacy static frontend served at /
-│   └── index.html          # Upload, search, Persons watchlist / auto-clusters, match badges
-│
-└── storage/                # Image storage (gitignored)
-    ├── sessions/           # Full session images
-    └── crops/              # Cropped person images
-```
+## Image pipeline
 
-## Environment variables
+`Analyzer.analyze_image` in `ovp/pipeline/analyzer.py`:
 
-The backend reads `DATABASE_URL` (default `postgresql://postgres:postgres@localhost:5432/vision_analysis`). It also loads a `.env` file if present (python-dotenv). Model choices are set in `PipelineConfig` (see below), not via environment variables.
+1. **Store.** The original (EXIF-rotated, saved as JPEG) and a thumbnail are written, and a `media` row is created with status `processing`.
+2. **Detect.** The detector runs with the plan's prompts. Closed-set detectors (YOLO11) only receive the prompts that are COCO classes. If the query needs open vocabulary and the default detector is closed-set, the analyzer switches automatically to an open-vocabulary one: an already loaded one first, then YOLOE, YOLO-World, and finally VLM grounding. This does not happen when a detector was requested explicitly. Cross-prompt NMS (`OVP_NMS_IOU`) then removes duplicate boxes from overlapping prompts. Person boxes are protected from being suppressed by object boxes, so a person holding a bag keeps both.
+3. **Route.** Each detection becomes a candidate crop, padded by `OVP_EXPAND_RATIO`.
+   - Concepts with `verify` get VLM questions.
+   - `describe` selects which crops get described: `persons`, `all` or `none`.
+   - Persons below `OVP_LOW_CONF` are kept as `low_confidence`, with no description and no Re-ID.
+   - Crops smaller than 20×20 px are not sent to the VLM.
+   - At most `OVP_MAX_VLM_CROPS` crops go to the VLM, ranked with verification first, then by confidence × √area.
+4. **Run concurrently.**
+   - VLM: one JSON request per crop that answers the questions (`checks`) and fills the description fields (summary, actions, clothing, held objects, appearance for people; summary, colour, details for objects). If every verification answers "no", the candidate becomes `rejected`. It stays visible, but is excluded from identity and from counts.
+   - Segmentation: one SAM call per image with box prompts, or masks taken from YOLOE-seg. This only runs when `segment=true`.
+   - CLIP embeddings of all crops.
+   - Re-ID embeddings of person crops.
+5. **Embed descriptions** with the text embedder, as `label. summary key: value. …`.
+6. **Persist** crops, entities and all embeddings in one transaction.
+7. **Link identities** (see below), then emit an `entity` event per entity.
 
-## API Reference
+Entity `stage` values:
 
-### Core Endpoints
+- `detected`: not described
+- `described`
+- `low_confidence`
+- `rejected`: failed verification
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Web frontend (legacy static HTML) |
-| `/health` | GET | Health check with session count |
-| `/analyze` | POST | Analyze image, return JSON with object IDs |
-| `/analyze/full-stream` | POST | SSE streaming with progress events |
-| `/object/{id}/ask` | POST | Ask follow-up question about detected person (`use_full_scene` to answer from the full image) |
-| `/session/{id}` | GET | Session lookup |
+## Video pipeline
 
-### Search Endpoints
+`Analyzer.analyze_video`:
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/search` | POST | Hybrid search (text + image; `text_weight` / `vector_weight` default 0.5 each) |
-| `/api/search/text` | GET | Text-only search on analysis |
-| `/api/search/image` | POST | Image similarity search |
+- **Sampling.** Frames are decoded on a background reader thread at `min(native fps, OVP_VIDEO_FPS)`, up to `OVP_MAX_FRAMES` frames. Longer videos are sampled more sparsely.
+- **Tracking.** The detector tracks with ByteTrack across the sampled frames. This needs a YOLO, YOLOE or YOLO-World detector; VLM and HF detectors cannot track. Each track keeps:
+  - the majority label
+  - a thinned trajectory (`[t, x1, y1, x2, y2]`, at most 240 points)
+  - the best-quality crop and its frame index
+  - up to 8 Re-ID crops
+- **Filtering.** Tracks with fewer than `OVP_MIN_TRACK_HITS` hits are dropped.
+- **Stitching.** Person tracks that are never visible at the same time and whose mean Re-ID embeddings are similar are merged. The threshold is the match threshold + 0.03, because this merge is not reviewable. This reconnects a person who leaves the frame and comes back.
+- **Processing.** The tracks then go through the same crop processing as images: one entity per track, with `t_start`, `t_end`, `frame_index` and `trajectory`.
+- **Cancellation.** It is checked inside the tracking loop.
 
-### Session Management
+A library scan (`POST /api/scan`, the agent's `find_in_library`) re-runs detection with a new query over stored media. It only adds entities that do not overlap existing ones (same label, IoU > 0.7, or the same time span for tracks).
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/sessions` | GET | List all sessions |
-| `/api/session/{id}` | GET | Get session details |
-| `/api/session/{id}` | DELETE | Delete session and entities |
-| `/api/entity/{object_id}` | DELETE | Delete a single entity |
-| `/api/image/{type}/{id}` | GET | Serve stored images (type: `session` or `crop`) |
+## Identity (Re-ID clusters)
 
-### Person identity (Re-ID clusters)
+`ovp/services/identity.py`. Each person cluster stores a centroid (mean Re-ID embedding) in its Re-ID space, such as `reid:osnet:osnet_x1_0`. pgvector computes it with `AVG` and recomputes it whenever membership changes, including on deletes and merges.
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/persons` | GET | List clusters; `watchlist=true` for named suspects only (`limit`, `offset`) |
-| `/api/persons/{person_id}` | GET | Detail + all linked sightings |
-| `/api/persons/{person_id}` | PATCH | Set `label`, `is_watchlist`, `notes` (promote auto-cluster → suspect) |
-| `/api/persons/{person_id}` | DELETE | Remove person row (entity links cleared) |
-| `/api/persons/{person_id}/merge` | POST | Body `{ "other_id" }` — merge another cluster into this one |
-| `/api/entity/{object_id}/assign` | POST | Body `{ "person_id" }` — manual correction / reassignment |
-| `/api/persons/search` | POST | Upload query image; rank persons by Re-ID similarity (“look up by photo”) |
+**Linking one media item.** All sightings of one media item are matched together, under a process-wide lock so that concurrent uploads cannot create duplicate clusters:
 
-### Request/Response Examples
+1. The k = 8 nearest centroids are fetched for every sighting, and all (score, sighting, person) pairs are sorted best first.
+2. Pairs are assigned greedily when `score ≥ match`. Two sightings that *conflict* can never go to the same person. In an image, every pair of sightings conflicts; in a video, only tracks that overlap in time do.
+3. Any sighting left over whose best free candidate is `≥ review` becomes `pending`, with a `suggested_person`. Otherwise a new cluster is created and the sighting is marked `new`.
 
-#### Analyze Image
+**Thresholds (match / review).** Each embedding space has its own:
 
-```bash
-curl -X POST -F "file=@image.jpg" http://localhost:8000/analyze
-```
+| Backend | Match | Review |
+|---|---|---|
+| OSNet | 0.75 | 0.60 |
+| CLIP | 0.88 | 0.80 |
+| Colour histogram | 0.93 | 0.86 |
 
-**Response:**
-```json
-{
-  "success": true,
-  "session_id": "8f71a028-cf5",
-  "elapsed_seconds": 2.34,
-  "num_detections": 3,
-  "results": [
-    {
-      "object_id": "18a7b3ba",
-      "class": "person",
-      "confidence": 0.87,
-      "stage": "vlm_full",
-      "analysis": "A. Standing, walking. B. Holding phone. C. Dark jacket, jeans. D. Face partially obscured. E. Good visibility.",
-      "box": [120, 50, 280, 400],
-      "crop_image": "data:image/jpeg;base64,...",
-      "person_id": "p_01hx…",
-      "person_label": "Suspect A",
-      "is_watchlist": true,
-      "match_score": 0.87,
-      "match_status": "matched"
-    }
-  ]
-}
-```
+`OVP_REID_MATCH` and `OVP_REID_REVIEW` override them.
 
-`match_status` is one of `matched`, `new`, or `pending` (ambiguous band). Non-person or non–VLM-full rows omit Re-ID linkage fields when Re-ID is disabled or not applicable.
+**Review.** `POST /api/entities/{id}/review` takes `accept` (link to the suggestion), `new` (create a cluster) or `reject` (unlink). `assign` sets the person by hand (`manual`).
 
-#### Streaming Analysis (SSE)
+**Re-cluster.** `POST /api/persons/recluster` runs centroid-linkage agglomerative clustering over all sightings, with a cannot-link constraint inside the same media. Above 4000 sightings it switches to single-pass leader clustering. Named, watch-listed and manually confirmed clusters are anchors: they keep their sightings and absorb similar clusters. Existing cluster ids are reused where possible.
 
-```bash
-curl -X POST -F "file=@image.jpg" http://localhost:8000/analyze/full-stream
-```
+**Photo lookup.** `POST /api/persons/search` embeds the largest detected person in the photo and returns the nearest clusters.
 
-Returns Server-Sent Events with progress updates:
-```
-event: progress
-data: {"stage": "yolo", "message": "Running YOLO detection..."}
+## Search
 
-event: progress
-data: {"stage": "vlm", "message": "Analyzing 3 detections..."}
+`ovp/services/search.py` runs every available signal concurrently and fuses them with weighted reciprocal-rank fusion (k = 60). Signals with incomparable scales therefore combine sensibly:
 
-event: result
-data: {"success": true, "session_id": "...", ...}
-```
+| Signal | Source | Weight | Min. similarity |
+|---|---|---|---|
+| `fts` | Postgres full text. Label and concept are weight A, the description is weight B | 1.0 | – |
+| `label` | Label/concept match with offline lexicon expansion ("weapons" → knife, gun, …) | 1.2 | – |
+| `semantic` | Text embedding of the query vs description embeddings | 1.0 | 0.2 |
+| `clip` | CLIP text → crop image embeddings | 0.8 | 0.18 |
+| `image` | CLIP image → image (photo query) | 1.0 | 0.5 |
+| `reid` | Person Re-ID (photo query) | 1.2 | 0.3 |
 
-#### Ask Follow-up Question
+Each embedding space has its own HNSW cosine index, a partial index per `(space, dimension)` created on demand. You can filter by `labels`, `media_id`, `person_id` and `kind`. Each result includes the raw per-signal scores (`scores`), so a ranking can be explained.
 
-```bash
-curl -X POST http://localhost:8000/object/18a7b3ba/ask \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What color is their jacket?", "use_full_scene": false}'
-```
+## Q&A
 
-**Response:**
-```json
-{
-  "success": true,
-  "answer": "The person is wearing a dark blue jacket.",
-  "object_id": "18a7b3ba"
-}
-```
+- `POST /api/entities/{id}/ask` with `scope: "crop"` answers from the crop only, under a grounded prompt: answer from visible evidence and say when unsure.
+- `scope: "scene"` uses the full image, or the entity's video frame, with the entity outlined in red.
+- `POST /api/media/{id}/ask` asks about a whole image, or about six evenly spaced, timestamped keyframes of a video.
 
-#### Hybrid Search
+All answers are stored in the `qa` table.
 
-```bash
-curl -X POST http://localhost:8000/api/search \
-  -F "file=@reference.jpg" \
-  -F 'json={"text_query": "red jacket", "text_weight": 0.3, "vector_weight": 0.7, "limit": 10}'
-```
+## Jobs
 
-**Response:**
-```json
-{
-  "success": true,
-  "results": [
-    {
-      "entity": {
-        "object_id": "18a7b3ba",
-        "session_id": "8f71a028-cf5",
-        "class_name": "person",
-        "confidence": 0.87,
-        "initial_analysis": "...",
-        "crop_image_path": "storage/crops/18a7b3ba.jpg"
-      },
-      "text_score": 0.85,
-      "vector_score": 0.92,
-      "hybrid_score": 0.90
-    }
-  ]
-}
-```
+`ovp/jobs.py`:
 
-#### Text-Only Search
+- **Every analysis is a job**: uploads, server paths, library scans, CLI runs and agent tool calls. Upload handlers spool files to `OVP_STORAGE_DIR/tmp` and return at once, and the job runs on its own. Use `?wait=true` to block until it finishes.
+- **Concurrency.** Up to `OVP_JOB_CONCURRENCY` jobs run at once, and up to `OVP_MEDIA_CONCURRENCY` media items per job. Local models are still serialized on the device thread, while cloud VLM calls overlap.
+- **Events.** They are kept per job, up to 20 000. A late SSE subscriber (`GET /api/jobs/{id}/events`) gets a full replay first. That is how the UI reattaches to running jobs after a reload.
+- **Cancellation** is cooperative: it is checked between stages and between video frames.
+- **Memory.** Jobs live in memory; the newest 200 are kept. Their results (media and entities) are in PostgreSQL.
+
+## Analyst agent
+
+`ovp/agent/agent.py`. A tool-calling LLM (`OVP_LLM`, or `llm` per request) answers in markdown, with up to 12 tool steps per turn.
+
+**Tools:**
+
+- `search`
+- `find_in_library`: an open-vocabulary scan of stored media
+- `plan_query`
+- `list_media`, `get_media`
+- `ask_image`
+- `list_persons`, `get_person`, `name_person`, `set_watchlist`, `merge_persons`, `recluster_persons`, `find_person_sightings`
+- `stats`
+- `analyze_paths`: server-side files or folders
+- `job_status`
+
+**Results.** Tool results sent to the LLM are compact: no polygons or trajectories, at most 14 000 characters. The SSE `tool_result` event carries the full entities, media and persons for the UI's tool cards.
+
+**Turns** run independently of the HTTP response: a client disconnect stops the stream, not the turn. Turns of one conversation are serialized. Conversations live in memory; the 200 most recent are kept.
+
+## Model registry and runtime
+
+**Specs.** `ovp/models/registry.py` resolves `provider:model` specs into instances. It builds each one lazily, caches it, and warms it up (`ensure`) under a per-model lock.
+
+**Failures.** A model that fails to load, for example because its weights cannot be downloaded, is recorded with a short reason. It then shows up as unavailable in `GET /api/models` instead of failing requests. `PATCH /api/config` clears that error and retries.
+
+**Switching defaults.** `PATCH /api/config` is all-or-nothing: every new default must load, otherwise the previous defaults stay.
+
+**Startup warm-up.** The server loads the detector, image embedder, Re-ID and text embedder in the background, and `GET /api/health` reports `ready`. The CLI does the same warm-up before it runs. If Re-ID fails, it falls back from OSNet to CLIP to the colour histogram.
+
+**Runtime** (`ovp/runtime.py`):
+
+- `OVP_DEVICE=auto` picks CUDA, then MPS, then CPU.
+- All local inference runs on a single device thread, which serializes GPU work and never blocks the event loop.
+- Image encode/decode runs on a small CPU pool.
+- Cloud chat models use `httpx` with `OVP_VLM_CONCURRENCY` parallel requests per model and a timeout of `OVP_REQUEST_TIMEOUT`.
+
+Provider notes:
+
+- **OpenAI, Gemini, OpenRouter, Ollama and `compat`** all use the OpenAI-compatible Chat Completions API. Gemini goes through its `/v1beta/openai` endpoint.
+- **Anthropic** uses the native Messages API.
+- **Local Qwen-VL** (`qwen:` / `hf:`) uses transformers. It batches `OVP_VLM_BATCH` crops, supports bitsandbytes 8/4-bit (`OVP_VLM_QUANT`), and uses flash-attention when it is installed. It does not support tool calling, so it cannot drive the agent.
+
+## Database schema
+
+`ovp/storage/db.py` creates and migrates the schema on start, under an advisory lock. An old-layout database (`sessions` and `entities.initial_analysis`) is renamed to `legacy_*` and copied into the new schema.
+
+| Table | Contents |
+|---|---|
+| `media` | `id`, `kind` (image/video), `name`, `path`, `thumb_path`, size, `duration`/`fps`/`frame_count`, `query`, `plan` and `options` (JSONB), `status`, `created_at` |
+| `entities` | One detection or track: `label`, `concept`, `score`, box `x1..y2`, `polygon`, `mask_area`, `crop_path`, `description`, `attributes`, `verified`/`verify_reason`, `stage`, video fields (`track_id`, `t_start`, `t_end`, `frame_index`, `trajectory`), identity (`person_id`, `match_status`, `match_score`, `suggested_person_id`), and a generated `tsv` (GIN index) |
+| `embeddings` | `(entity_id, space) → vec`. Spaces are model-specific, e.g. `clip:ViT-B-32` or `reid:osnet:osnet_x1_0`. Each (space, dimension) pair has a partial HNSW index |
+| `persons` | `label`, `is_watchlist`, `notes`, `space`, `centroid`, `sighting_count`, `representative_entity_id`, timestamps |
+| `qa` | Questions and answers per media or entity, with `scope` (`crop`, `scene`, `media`) |
+| `ovp_meta` | `schema_version` |
+
+Files live under `OVP_STORAGE_DIR`: `media/` for originals, `thumbs/`, `crops/`, and `tmp/` for the upload spool.
+
+## CLI
+
+`python -m ovp` (`ovp/cli.py`) creates the same `AppContext` as the server: the same database, storage, registry and job manager. Analyses therefore appear in the UI, and searches see everything the UI analyzed.
+
+| Command | What it does |
+|---|---|
+| `serve [--host --port --reload --log-level]` | Runs uvicorn with `ovp.api.app:app` |
+| `analyze PATH... [--query Q] [--describe persons\|all\|none] [--segment] [--expand/--verify auto\|true\|false] [--detector/--segmenter/--vlm/--llm SPEC] [--conf] [--video-fps] [--max-frames] [--no-reid] [--quiet] [--json]` | Analyzes files and folders (folders recursively) as one job. Progress goes to stderr. The result is a table or `{job, media: MediaDetail[]}` |
+| `search [TEXT] [--image FILE] [--limit] [--label L]... [--kind] [--media ID] [--person ID] [--json]` | Hybrid search. JSON output has the same shape as `POST /api/search` |
+| `models [--check] [--json]` | Shows providers, availability and defaults. `--check` loads every default model. This command needs no database |
+
+Everything that libraries print, including C-level output, is redirected to stderr, so stdout holds only the result. Exit codes:
+
+- 0: success
+- 1: the job failed
+- 2: usage error, missing path, or the database is unreachable
+- 130: interrupted
+
+## Docker
+
+The `Dockerfile` is multi-stage:
+
+1. `node:22-alpine` builds the React UI.
+2. `python:3.12-slim` installs CPU torch, then `requirements.txt`, including the ultralytics CLIP package from GitHub, and copies in the UI build. A single container serves the UI and the API on :8000.
+
+Build arguments:
+
+- `TORCH_INDEX_URL`: the torch wheel index. The default is `https://download.pytorch.org/whl/cpu`; use `…/cu124` for CUDA.
+- `REQUIREMENTS`: `requirements.txt`, or `requirements-local.txt` to add Qwen-VL, OWLv2, Grounding DINO and sentence-transformers.
+
+Volumes and paths:
+
+- `/data/storage`: media, thumbnails, crops
+- `/data/weights`: the working directory. Ultralytics downloads weights there, so they persist
+- `/data/cache`: Hugging Face, torch hub (OSNet) and ultralytics config
+
+`docker-compose.yml` services:
+
+- **`postgres`** runs `pgvector/pgvector:pg16` with a health check. It is not published to the host.
+- **`backend`** takes model specs and provider keys from the shell or `.env`. Everything in `.env` is also passed in.
+- **`frontend`** is an optional nginx service under the `nginx` profile, on :3000. Its config proxies `/api` with SSE buffering disabled.
+
+`docker-compose.gpu.yml` adds the NVIDIA device reservation and builds with CUDA torch and the local extras.
 
 ```bash
-curl "http://localhost:8000/api/search/text?q=red+jacket&limit=10"
+docker compose up -d --build                     # CPU
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+docker compose exec backend python -m ovp models # CLI inside the container
+docker compose exec backend python -m ovp analyze /data/storage/inbox --query "forklifts"
+docker compose down -v                           # also deletes the database and volumes
 ```
 
-#### Image Similarity Search
+Ollama on the host is reachable as `http://host.docker.internal:11434/v1`, which is the default in compose.
+
+## Development and tests
 
 ```bash
-curl -X POST http://localhost:8000/api/search/image \
-  -F "file=@reference.jpg" \
-  -F "limit=10"
+pip install -r requirements-dev.txt
+createdb ovp_test && psql ovp_test -c "CREATE EXTENSION vector"
+pytest                                     # OVP_TEST_DATABASE_URL overrides the test DB
+python -m ovp serve --reload               # backend with auto-reload
+cd frontend && npm run dev                 # UI on :5173, proxies /api to :8000
+cd frontend && npm run lint && npm run build
 ```
 
-
-## Configuration
-
-Edit settings in `pipeline.py`:
-
-```python
-PipelineConfig(
-    # Models
-    yolo_model="yolo11l.pt",
-    vlm_model_id="Qwen/Qwen2.5-VL-3B-Instruct",
-    
-    # Detection
-    detection_confidence=0.1,      # Min YOLO confidence
-    high_confidence_threshold=0.3, # Route to VLM above this
-    priority_classes=("person",),  # Classes for VLM analysis
-    detection_iou=0.5,             # NMS IoU threshold
-    expand_ratio=0.1,              # Expand bounding boxes by 10%
-    
-    # Optimization
-    use_quantization=True,         # INT8 quantization
-    quantization_bits=8,           # 8 for quality, 4 for speed
-    use_torch_compile=True,        # PyTorch 2.0 compile (disabled with quantization)
-    
-    # Batching
-    batch_size=4,                  # VLM batch size
-    reference_area=512*512,        # Area budget per batch
-    
-    # Device
-    device="auto",                # "auto", "cuda", "mps", or "cpu"
-    
-    # Person Re-ID (OSNet; only VLM_FULL person crops)
-    reid_model="osnet_x1_0",
-    reid_match_threshold=0.75,   # cosine ≥ this → link to existing cluster
-    reid_review_threshold=0.60,   # below this → new auto-cluster; between → pending
-    enable_reid=True,
-)
-```
-
-
-## Performance notes
-
-| Technique | Notes |
-|-----------|-------|
-| Hierarchical routing | VLM runs only on high-confidence priority-class (person) detections |
-| INT8 / INT4 quantization | bitsandbytes; INT8 is the default, INT4 trades quality for memory |
-| Size-aware batching | Packs crops into VLM batches by pixel-area budget |
-| SDPA attention | Used automatically on PyTorch 2.0+ |
-| torch.compile | Optional; disabled when quantization is on |
-| pgvector HNSW | Approximate nearest-neighbor search over embeddings |
-| OSNet Re-ID | Lightweight backbone, run on the same person crops as the VLM |
-
-Approximate VRAM (from development, not a formal benchmark):
-
-| Configuration | VRAM |
-|--------------|------|
-| FP16 (no quantization) | ~10GB |
-| INT8 quantization | ~6GB |
-| INT4 quantization | ~4GB |
-
-Tips: use CUDA or MPS where available; raise `batch_size` if you have spare VRAM; use INT4 on smaller GPUs.
-
-## Models Used
-
-| Model | Purpose | Size | Source |
-|-------|---------|------|--------|
-| [YOLO11-Large](https://docs.ultralytics.com/) | Object detection | 25M params | Ultralytics |
-| [Qwen2.5-VL-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) | Vision-language analysis | 3B params | Alibaba Qwen |
-| [OSNet x1.0](https://github.com/KaiyangZhou/deep-person-reid) (via [torchreid](https://github.com/KaiyangZhou/deep-person-reid)) | Person Re-ID embedding | ~2M params, 512-d | torchreid `pretrained=True` defaults |
-
-YOLO and Qwen load from Hugging Face / Ultralytics on first run; OSNet is pulled in by **torchreid** (see `requirements.txt`, including **gdown** when weights download is needed). All are initialized once at API startup and reused per request.
-
-## Development
-
-### Backend Development
-
-```bash
-# Run with hot reload
-uvicorn app:app --reload --port 8000
-
-# Run pipeline tests
-python pipeline.py test_image.jpg
-
-# Run CLI demo
-python demo.py                    # Uses default test image
-python demo.py path/to/image.jpg  # Custom image
-```
-
-### Frontend Development
-
-```bash
-cd frontend
-
-# Install dependencies
-npm install
-
-# Start development server
-npm run dev
-
-# Build for production
-npm run build
-
-# Preview production build
-npm run preview
-
-# Lint code
-npm run lint
-```
-
-### Database Development
-
-```bash
-# Connect to database
-psql vision_analysis
-
-# View tables
-\dt
-
-# View sessions
-SELECT * FROM sessions;
-
-# View entities
-SELECT * FROM entities;
-
-# Check pgvector extension
-SELECT * FROM pg_extension WHERE extname = 'vector';
-```
-
-### Testing
-
-```bash
-# Test API health
-curl http://localhost:8000/health
-
-# Test image analysis
-curl -X POST -F "file=@test_image.jpg" http://localhost:8000/analyze
-
-# Test search
-curl "http://localhost:8000/api/search/text?q=person"
-```
-
-## Docker Deployment
-
-### Building Images
-
-```bash
-# Build backend
-docker build -t vision-backend .
-
-# Build frontend
-cd frontend
-docker build -t vision-frontend .
-
-# Or use docker-compose
-docker compose build
-```
-
-### Running with Docker Compose
-
-```bash
-# Start all services
-docker compose up -d
-
-# View logs
-docker compose logs -f
-
-# Stop services
-docker compose down
-
-# Stop and remove volumes (clears database)
-docker compose down -v
-```
-
-### GPU Support (NVIDIA)
-
-To enable GPU support in Docker, uncomment the GPU section in `docker-compose.yml`:
-
-```yaml
-deploy:
-  resources:
-    reservations:
-      devices:
-        - driver: nvidia
-          count: 1
-          capabilities: [gpu]
-```
-
-Requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
-
-### Production Considerations
-
-1. **Environment Variables**: Use `.env` file or Docker secrets for sensitive data
-2. **Storage Volumes**: Persist `storage/` directory for images
-3. **Database Backups**: Set up regular PostgreSQL backups
-4. **Reverse Proxy**: Use nginx or Traefik for SSL/TLS termination
-5. **Resource Limits**: Set appropriate CPU/memory limits in docker-compose
+The tests use fake models (`tests/fakes.py`) against a real PostgreSQL. Cloud providers are mocked, so no keys or weights are needed.
 
 ## Troubleshooting
 
-### Common Issues
-
-#### Models Not Loading
-
-**Problem**: Models fail to download or load.
-
-**Solutions**:
-- Check internet connection (models download from Hugging Face)
-- Verify disk space (models are ~6GB total)
-- Check CUDA/GPU drivers if using GPU
-- Try running with `device="cpu"` to test
-
-#### Database Connection Errors
-
-**Problem**: Cannot connect to PostgreSQL.
-
-**Solutions**:
-- Verify PostgreSQL is running: `pg_isready`
-- Check `DATABASE_URL` environment variable
-- Ensure pgvector extension is installed: `CREATE EXTENSION vector;`
-- Check database credentials
-
-#### Out of Memory (OOM)
-
-**Problem**: GPU runs out of memory.
-
-**Solutions**:
-- Enable quantization (INT8 or INT4)
-- Reduce batch size in `PipelineConfig`
-- Use CPU mode: `device="cpu"` (slower but works)
-- Close other GPU applications
-
-#### Frontend Not Connecting to Backend
-
-**Problem**: Frontend shows connection errors.
-
-**Solutions**:
-- Verify backend is running on port 8000
-- Check CORS settings in `app.py`
-- Verify API proxy configuration in `vite.config.ts`
-- Check browser console for errors
-
-#### Search Not Working
-
-**Problem**: Search returns no results or errors.
-
-**Solutions**:
-- Verify pgvector extension is installed
-- Check that embeddings are being generated (check `has_embedding` in database)
-- Verify full-text search index exists
-- Check database logs for errors
-
-#### Person match / Re-ID unavailable
-
-**Problem**: Analyze responses lack `person_id` / `match_status`, or `/api/persons/search` returns 503.
-
-**Solutions**:
-- Install backend deps: `pip install -r requirements.txt` (includes **torchreid** and **gdown**)
-- Check API startup logs for `Initializing OSNet Re-ID...` vs `Warning: Re-ID disabled (...)`; on failure the server sets `enable_reid=False` and continues without identity linking
-
-## Database Schema
-
-### Sessions Table
-
-```sql
-CREATE TABLE sessions (
-    session_id VARCHAR PRIMARY KEY,
-    created_at TIMESTAMP DEFAULT NOW(),
-    full_image_path VARCHAR NOT NULL,
-    image_width INTEGER,
-    image_height INTEGER
-);
-```
-
-### Entities Table
-
-```sql
-CREATE TABLE entities (
-    object_id VARCHAR PRIMARY KEY,
-    session_id VARCHAR REFERENCES sessions(session_id) ON DELETE CASCADE,
-    class_name VARCHAR NOT NULL,
-    confidence FLOAT,
-    box_x1 INTEGER,
-    box_y1 INTEGER,
-    box_x2 INTEGER,
-    box_y2 INTEGER,
-    crop_image_path VARCHAR NOT NULL,
-    initial_analysis TEXT,
-    stage VARCHAR,
-    created_at TIMESTAMP DEFAULT NOW(),
-    has_embedding BOOLEAN DEFAULT FALSE,
-    embedding vector(1536)  -- pgvector column
-);
-
--- Full-text search index
-CREATE INDEX idx_entities_analysis ON entities USING GIN (to_tsvector('english', initial_analysis));
-
--- Vector similarity index
-CREATE INDEX idx_entities_embedding ON entities USING hnsw (embedding vector_cosine_ops);
-```
-
-### Persons table (identity clusters)
-
-Running schema is created in `database.py` (with pgvector optional). Conceptually:
-
-- **`persons`**: `id`, optional `label`, `is_watchlist`, `notes`, `sighting_count`, **Re-ID centroid** (`vector(512)` when pgvector is available, plus JSON fallback for portability), `representative_entity_id`, timestamps.
-- **`entities`** extensions: `reid_embedding` (512-d), `person_id` (FK), `match_score`, `match_status` (`matched`, `new`, `pending`).
-- **Indexes**: HNSW on person centroids (cosine), btree on `entities(person_id)`, partial index on watchlist flag.
-
-
-## Acknowledgments
-
-- [Qwen2.5-VL](https://github.com/QwenLM/Qwen2-VL) by Alibaba
-- [Ultralytics YOLO](https://github.com/ultralytics/ultralytics)
-- [torchreid / OSNet](https://github.com/KaiyangZhou/deep-person-reid)
-- [pgvector](https://github.com/pgvector/pgvector)
-- [FastAPI](https://fastapi.tiangolo.com/)
-- [React](https://react.dev/)
+| Symptom | Cause / fix |
+|---|---|
+| A model shows "model weights could not be downloaded" | The host is offline or blocked. Put the weight file in `OVP_WEIGHTS_DIR` or the working directory, or fill the HF/torch caches, then reselect the model (`PATCH /api/config` retries it) |
+| YOLOE / YOLO-World unavailable: "pip install git+https://github.com/ultralytics/CLIP.git" | The CLIP text encoder package is missing. Without it, `auto` falls back to closed-set YOLO11 |
+| `vlm: false` in `/api/health` and no descriptions | No VLM is configured. Set a provider key, `OVP_COMPAT_BASE_URL`, or use `qwen:` on a GPU |
+| Agent returns 503 | No LLM is configured. Set a key, or `OVP_LLM=compat:<model>` |
+| "detector … cannot track video" | Videos need a YOLO, YOLOE or YOLO-World detector |
+| Persons never matched across uploads / `reid: color` | OSNet weights could not load (Google Drive). Install `torchreid gdown` and make sure the download works, or accept the CLIP or colour fallback with its stricter thresholds |
+| Too many `pending` reviews, or different people merged | Tune `OVP_REID_MATCH` / `OVP_REID_REVIEW`, then run `POST /api/persons/recluster` |
+| Some crops not described | More than `OVP_MAX_VLM_CROPS` candidates in one media item. A `log` warning says how many were skipped |
+| Slow on CPU | Use `OVP_DETECTOR=yoloe:yoloe-11s-seg.pt`, MobileSAM, a cloud VLM, and lower `OVP_VIDEO_FPS` |
+| Out of GPU memory | Use a smaller detector or SAM, `OVP_VLM_QUANT=4bit`, `OVP_VLM_BATCH=1` |
+| UI shows "The React UI is not built" | Run `cd frontend && npm ci && npm run build`, or set `OVP_FRONTEND_DIST` |
+| `cannot connect to PostgreSQL` | Check `DATABASE_URL`. The database also needs the `vector` extension, which the server creates if it has the rights to |

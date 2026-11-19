@@ -23,6 +23,7 @@ from .. import __version__, serialize
 from ..config import get_settings
 from ..context import AppContext, create_context, get_context
 from ..jobs import InputItem
+from ..models.registry import ModelUnavailable
 from ..pipeline.analyzer import AnalyzeOptions
 from ..storage.files import media_kind
 
@@ -126,18 +127,10 @@ class ConfigPatch(BaseModel):
 @app.patch("/api/config")
 async def patch_config(body: ConfigPatch) -> dict[str, Any]:
     c = ctx()
-    changes = body.model_dump(exclude_none=True)
-    for role, spec in changes.items():
-        c.registry.clear_error(role, spec)
-        c.registry.set_default(role, spec)
-    for role in changes:
-        if role in ("detector", "embedder", "reid", "text_embedder") and c.registry.defaults[role] != "none":
-            inst = await c.registry.ensure(role)
-            if inst is None:
-                err = c.registry.errors.get(f"{role}|{c.registry.defaults[role]}", "unavailable")
-                raise HTTPException(400, f"{role} {c.registry.defaults[role]!r} failed to load: {err}")
-        elif c.registry.defaults[role] != "none" and c.registry.get(role) is None:
-            raise HTTPException(400, f"{role} {c.registry.defaults[role]!r}: {c.registry.errors.get(f'{role}|{c.registry.defaults[role]}', 'unavailable')}")
+    try:
+        await c.registry.switch_defaults(body.model_dump(exclude_none=True))
+    except ModelUnavailable as e:
+        raise HTTPException(400, str(e)) from e
     return c.registry.report()
 
 
@@ -455,6 +448,13 @@ async def review_entity(entity_id: str, body: ReviewRequest) -> dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _search_limit(raw: Any) -> int:
+    try:
+        return max(1, min(int(raw or 30), 200))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "limit must be an integer")
+
+
 @app.post("/api/search")
 async def search(request: Request) -> dict[str, Any]:
     c = ctx()
@@ -464,7 +464,7 @@ async def search(request: Request) -> dict[str, Any]:
     if ctype.startswith("multipart/form-data"):
         form = await request.form()
         text = form.get("text") or form.get("text_query") or None
-        limit = int(form.get("limit") or 30)
+        limit = _search_limit(form.get("limit"))
         f = form.get("file")
         if f is not None and hasattr(f, "read"):
             image = await read_upload_image(f)  # type: ignore[arg-type]
@@ -475,13 +475,17 @@ async def search(request: Request) -> dict[str, Any]:
         try:
             body = await request.json()
         except Exception:
-            raise HTTPException(400, "send JSON {text, ...} or multipart with text/file")
+            body = None
+        if not isinstance(body, dict):
+            raise HTTPException(400, "send a JSON object {text, ...} or multipart with text/file")
         text = body.get("text") or body.get("text_query")
-        limit = int(body.get("limit") or 30)
+        limit = _search_limit(body.get("limit"))
         filters = {k: body.get(k) for k in ("labels", "media_id", "person_id", "kind") if body.get(k)}
+        if isinstance(filters.get("labels"), str):
+            filters["labels"] = [filters["labels"]]
     if not (text and str(text).strip()) and image is None:
         raise HTTPException(400, "provide text and/or an image")
-    hits = await c.search.search(str(text) if text else None, image, filters, max(1, min(limit, 200)))
+    hits = await c.search.search(str(text) if text else None, image, filters, limit)
     results = await c.search.hydrate(hits)
     return {"results": results, "count": len(results), "query": {"text": text, "has_image": image is not None}}
 
@@ -601,43 +605,45 @@ async def agent_chat(body: ChatRequest) -> StreamingResponse:
     c = ctx()
     llm = await c.registry.ensure("llm", body.llm)
     if llm is None:
+        if body.llm:
+            reason = c.registry.errors.get(f"llm|{body.llm}", "not configured")
+            raise HTTPException(400, f"LLM {body.llm!r} is unavailable: {reason}")
         raise HTTPException(503, "no LLM configured for the agent – set OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY or OVP_COMPAT_BASE_URL")
     if not llm.supports_tools:
         raise HTTPException(400, f"{llm.spec} does not support tool calling")
     conv = c.agent.get_conversation(body.conversation_id)
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async def emit(type: str, **data: Any) -> None:
         await queue.put({"type": type, **data})
 
-    async def runner() -> None:
-        try:
-            await c.agent.run(conv, body.message, llm, emit)
-        except Exception as e:
-            log.exception("agent failed")
-            await queue.put({"type": "error", "message": str(e)})
-        finally:
-            await queue.put({"type": "done"})
+    def finished(task: asyncio.Task) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            log.error("agent turn failed", exc_info=task.exception())
+            queue.put_nowait({"type": "error", "message": str(task.exception())})
+        queue.put_nowait({"type": "done"})
 
     async def stream() -> AsyncIterator[dict[str, Any]]:
         yield {"type": "conversation", "conversation_id": conv.id}
-        task = asyncio.create_task(runner())
-        try:
-            while True:
-                try:
-                    ev = await asyncio.wait_for(queue.get(), timeout=15)
-                except asyncio.TimeoutError:
-                    yield {"type": "ping"}
-                    continue
-                yield ev
-                if ev["type"] == "done":
-                    break
-        finally:
-            if not task.done():
-                # client went away – let the agent finish its turn so the conversation stays consistent
-                pass
+        # The turn runs independently of this response: a client disconnect stops the stream,
+        # not the turn, so the conversation stays consistent.
+        c.agent.start_turn(conv, body.message, llm, emit).add_done_callback(finished)
+        while True:
+            try:
+                ev = await asyncio.wait_for(queue.get(), timeout=15)
+            except asyncio.TimeoutError:
+                yield {"type": "ping"}
+                continue
+            yield ev
+            if ev["type"] == "done":
+                break
 
     return sse(stream())
+
+
+@app.get("/api/agent/conversations")
+async def list_conversations() -> dict[str, Any]:
+    return {"conversations": ctx().agent.list_conversations()}
 
 
 @app.get("/api/agent/conversations/{conversation_id}")

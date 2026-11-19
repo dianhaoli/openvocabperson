@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any, Optional
 
 from ..config import Settings, get_settings
@@ -26,6 +27,24 @@ def _has(module: str) -> bool:
         return True
     except Exception:
         return False
+
+
+_NETWORK_ERRORS = ("Tunnel connection failed", "Max retries exceeded", "urlopen error", "ProxyError", "Name or service not known", "Temporary failure in name resolution")
+
+
+def describe_error(err: Exception | str) -> str:
+    """A short, user-facing reason for a model that failed to load."""
+    text = " ".join(str(err).split())
+    if any(marker in text for marker in _NETWORK_ERRORS):
+        host = re.search(r"host='([^']+)'", text)
+        return "model weights could not be downloaded (offline or host blocked" + (f": {host.group(1)}" if host else "") + ")"
+    return text[:500]
+
+
+class ModelUnavailable(RuntimeError):
+    def __init__(self, role: str, spec: str, reason: str):
+        super().__init__(f"{role} {spec!r} is unavailable: {reason}")
+        self.role, self.spec, self.reason = role, spec, reason
 
 
 class ModelRegistry:
@@ -96,6 +115,17 @@ class ModelRegistry:
             return "color"
         raise KeyError(role)
 
+    def open_vocab_fallbacks(self) -> list[str]:
+        """Open-vocabulary detector specs to try when the default detector is closed-set (best first)."""
+        # an open-vocab detector that is already loaded costs nothing to switch to
+        specs = [spec for (role, spec), inst in self._cache.items() if role == "detector" and inst.open_vocab and inst.local]
+        if _has("ultralytics") and D.clip_pkg_available():
+            specs += ["yoloe:yoloe-11l-seg.pt" if self.device == "cuda" else "yoloe:yoloe-11m-seg.pt", "yolo-world:yolov8l-worldv2.pt"]
+        vlm = self.defaults.get("vlm", "none")
+        if vlm != "none":
+            specs.append(f"vlm:{vlm}")
+        return list(dict.fromkeys(specs))
+
     def resolve_defaults(self) -> None:
         for role in ROLES:
             raw = getattr(self.s, role)
@@ -123,7 +153,7 @@ class ModelRegistry:
             if provider == "openai":
                 return E.ApiTextEmbedder("openai", model or "text-embedding-3-small", s.openai_base_url, s.openai_api_key)
             if provider == "gemini":
-                return E.ApiTextEmbedder("gemini", model or "gemini-embedding-001", "https://generativelanguage.googleapis.com/v1beta/openai", s.gemini_api_key)
+                return E.ApiTextEmbedder("gemini", model or "gemini-embedding-001", s.gemini_base_url, s.gemini_api_key)
             if provider == "ollama":
                 return E.ApiTextEmbedder("ollama", model or "nomic-embed-text", s.ollama_base_url, None)
             if provider == "compat":
@@ -161,14 +191,14 @@ class ModelRegistry:
             try:
                 inst = self._build(role, spec)
             except Exception as e:
-                self.errors[f"{role}|{spec}"] = str(e)
+                self.errors[f"{role}|{spec}"] = describe_error(e)
                 log.warning("cannot create %s %s: %s", role, spec, e)
                 return None
             self._cache[key] = inst
         return inst
 
     def mark_failed(self, role: str, spec: str, err: Exception | str) -> None:
-        self.errors[f"{role}|{spec}"] = str(err)[:500]
+        self.errors[f"{role}|{spec}"] = describe_error(err)
         self._cache.pop((role, spec), None)
 
     def clear_error(self, role: str, spec: str) -> None:
@@ -207,6 +237,31 @@ class ModelRegistry:
             await self.ensure("reid")
             if self.get("reid") is None:
                 self.defaults["reid"] = "color"
+
+    async def switch_defaults(self, changes: dict[str, str]) -> None:
+        """Change runtime defaults atomically: every new model must load, else nothing changes.
+
+        Raises ``ModelUnavailable`` naming the first role that could not be loaded.
+        """
+        previous = dict(self.defaults)
+        for role, spec in changes.items():
+            self.clear_error(role, spec)  # allow retrying a model that failed earlier
+            self.set_default(role, spec)
+        try:
+            for role in changes:
+                spec = self.defaults[role]
+                if spec == "none":
+                    continue
+                provider = spec.split(":", 1)[0]
+                if role in ("vlm", "llm"):
+                    ok, note = L.provider_available(provider, self.s)
+                    if not ok:
+                        raise ModelUnavailable(role, spec, note or "unavailable")
+                if await self.ensure(role, spec) is None:
+                    raise ModelUnavailable(role, spec, self.errors.get(f"{role}|{spec}", "unavailable"))
+        except ModelUnavailable:
+            self.defaults = previous
+            raise
 
     async def aclose(self) -> None:
         for inst in self._cache.values():

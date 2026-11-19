@@ -8,6 +8,7 @@ import { formatDate, relativeTime } from '../../utils/format';
 import { Img } from '../common/Img';
 import { Button } from '../ui/Button';
 import { Badge, Chip, EmptyState, ErrorState, Loading } from '../ui/Misc';
+import { Spinner } from '../ui/Spinner';
 import { EntityCard } from './EntityCard';
 import { Filmstrip } from './Filmstrip';
 import { ImageViewer } from './ImageViewer';
@@ -15,8 +16,20 @@ import { Legend } from './Legend';
 import { SceneQA } from './SceneQA';
 import { VideoViewer } from './VideoViewer';
 
+function emptyMessage(total: number, shown: number, rejected: number): { title: string; hint: string } {
+  if (total === 0) return { title: 'No entities detected', hint: 'Try another query, or lower the confidence threshold.' };
+  if (shown === 0 && rejected > 0) {
+    return {
+      title: 'No confirmed matches',
+      hint: `${rejected} candidate${rejected === 1 ? ' was' : 's were'} rejected by VLM verification. Tick “Show rejected” to inspect them.`,
+    };
+  }
+  return { title: 'All entities are hidden', hint: 'Toggle labels in the legend above.' };
+}
+
 function MediaView({ media, onReload, reloading }: { media: MediaDetail; onReload: () => void; reloading: boolean }) {
-  const { selectedEntityId } = useAppState();
+  const { selectedEntityId, processingMediaIds } = useAppState();
+  const processing = processingMediaIds.includes(media.id);
   const { selectEntity, closeMedia } = useActions();
   const [hidden, setHidden] = useState<Set<string>>(() => new Set());
   const [showRejected, setShowRejected] = useState(false);
@@ -54,6 +67,11 @@ function MediaView({ media, onReload, reloading }: { media: MediaDetail; onReloa
               {media.name}
             </h2>
             <Badge tone={media.kind === 'video' ? 'accent' : 'neutral'}>{media.kind}</Badge>
+            {processing && (
+              <Badge tone="warning">
+                <Spinner size={10} /> analyzing
+              </Badge>
+            )}
           </div>
           <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-text-muted mt-0.5">
             <span>
@@ -65,7 +83,7 @@ function MediaView({ media, onReload, reloading }: { media: MediaDetail; onReloa
             <span>query: {media.query ? `“${media.query}”` : 'default'}</span>
             <span title={formatDate(media.created_at)}>{relativeTime(media.created_at)}</span>
           </div>
-          {media.plan && media.plan.prompts.length > 0 && (
+          {media.plan && media.plan.source !== 'default' && media.plan.prompts.length > 0 && (
             <div className="flex flex-wrap gap-1 mt-1.5">
               {media.plan.prompts.slice(0, 20).map((p) => (
                 <Chip key={p} color={labelColor(p)} className="!py-0 !text-[10.5px]">
@@ -104,8 +122,10 @@ function MediaView({ media, onReload, reloading }: { media: MediaDetail; onReloa
         onToggleRejected={() => setShowRejected((v) => !v)}
       />
 
-      {cards.length === 0 ? (
-        <EmptyState icon="◻" title={all.length ? 'All entities are hidden' : 'No entities detected'} hint={all.length ? 'Toggle labels in the legend above.' : 'Try another query, or lower the confidence threshold.'} />
+      {cards.length === 0 && processing ? (
+        <Loading label="Analyzing… entities appear here as they are found" />
+      ) : cards.length === 0 ? (
+        <EmptyState icon="◻" {...emptyMessage(all.length, base.length, rejectedCount)} />
       ) : (
         <div className="grid gap-2.5 grid-cols-[repeat(auto-fill,minmax(150px,1fr))]">
           {cards.map((e) => (
@@ -120,9 +140,9 @@ function MediaView({ media, onReload, reloading }: { media: MediaDetail; onReloa
 }
 
 function Home() {
-  const { libraryVersion } = useAppState();
+  const { libraryVersion, personsVersion } = useAppState();
   const { openMedia, setTab, setCollection } = useActions();
-  const stats = useApi(`stats:${libraryVersion}`, (s) => api.stats(s));
+  const stats = useApi(`stats:${libraryVersion}:${personsVersion}`, (s) => api.stats(s));
   const recent = useApi(`recent:${libraryVersion}`, (s) => api.listMedia({ limit: 12 }, s));
   const st = stats.data ?? stats.stale;
   const rec = recent.data ?? recent.stale;
@@ -200,9 +220,10 @@ function Home() {
 }
 
 export function Workspace() {
-  const { currentMediaId, mediaCache } = useAppState();
+  const { currentMediaId, mediaCache, personsVersion } = useAppState();
   const { cacheMedia, closeMedia, toastError } = useActions();
-  const q = useApi(currentMediaId ? `media-detail:${currentMediaId}` : null, async (signal) => {
+  // personsVersion: person names / watchlist flags shown on entities may have changed.
+  const q = useApi(currentMediaId ? `media-detail:${currentMediaId}:${personsVersion}` : null, async (signal) => {
     try {
       const detail = await api.media(currentMediaId ?? '', signal);
       cacheMedia(detail);

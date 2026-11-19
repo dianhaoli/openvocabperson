@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import overload
 
 try:  # optional
     from dotenv import load_dotenv
@@ -18,6 +19,14 @@ try:  # optional
     load_dotenv()
 except Exception:  # pragma: no cover
     pass
+
+
+@overload
+def _env(name: str, default: str) -> str: ...
+
+
+@overload
+def _env(name: str, default: None = None) -> str | None: ...
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -29,14 +38,14 @@ def _env(name: str, default: str | None = None) -> str | None:
 
 def _env_float(name: str, default: float) -> float:
     try:
-        return float(_env(name, str(default)))  # type: ignore[arg-type]
+        return float(_env(name, str(default)))
     except ValueError:
         return default
 
 
 def _env_int(name: str, default: int) -> int:
     try:
-        return int(_env(name, str(default)))  # type: ignore[arg-type]
+        return int(_env(name, str(default)))
     except ValueError:
         return default
 
@@ -90,8 +99,12 @@ class Settings:
         default_factory=lambda: _env("OPENAI_BASE_URL", "https://api.openai.com/v1")
     )
     anthropic_api_key: str | None = field(default_factory=lambda: _env("ANTHROPIC_API_KEY"))
+    anthropic_base_url: str = field(default_factory=lambda: _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com"))
     gemini_api_key: str | None = field(
         default_factory=lambda: _env("GEMINI_API_KEY", _env("GOOGLE_API_KEY"))
+    )
+    gemini_base_url: str = field(
+        default_factory=lambda: _env("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
     )
     openrouter_api_key: str | None = field(default_factory=lambda: _env("OPENROUTER_API_KEY"))
     ollama_base_url: str = field(

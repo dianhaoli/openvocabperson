@@ -9,6 +9,12 @@ import { PersonThumb } from '../common/PersonThumb';
 import { Button } from '../ui/Button';
 import { EmptyState, ErrorState, Loading } from '../ui/Misc';
 
+const REVIEW_TOAST: Record<ReviewAction, (e: Entity) => string> = {
+  accept: (e) => `Linked to ${personName(e.person)}`,
+  new: (e) => `Created ${personName(e.person)}`,
+  reject: () => 'Sighting left unlinked',
+};
+
 function ReviewItem({ entity, onResolved }: { entity: Entity; onResolved: (id: string) => void }) {
   const actions = useActions();
   const [busy, setBusy] = useState<ReviewAction | null>(null);
@@ -19,6 +25,7 @@ function ReviewItem({ entity, onResolved }: { entity: Entity; onResolved: (id: s
     try {
       const updated = await api.reviewEntity(entity.id, action);
       actions.upsertEntity(updated);
+      actions.toast(REVIEW_TOAST[action](updated), 'success');
       onResolved(entity.id);
     } catch (err) {
       actions.toastError(err, 'Review failed');
@@ -31,7 +38,7 @@ function ReviewItem({ entity, onResolved }: { entity: Entity; onResolved: (id: s
     <div className="rounded-xl border border-border bg-bg-card p-2.5 flex flex-col gap-2">
       <div className="flex items-center gap-2">
         <button type="button" onClick={() => actions.openMedia(entity.media_id, entity.id)} title="Open in workspace" className="shrink-0">
-          <Img src={entity.crop_url} alt="sighting" className="w-[84px] h-[84px] rounded-lg object-cover border border-border hover:border-accent" />
+          <Img src={entity.crop_url} alt="sighting" className="w-[84px] h-[84px] rounded-lg object-cover object-top border border-border hover:border-accent" />
         </button>
         <div className="flex flex-col items-center text-text-muted text-[10px] shrink-0 w-12">
           <span className="text-lg">⇄</span>
@@ -39,7 +46,7 @@ function ReviewItem({ entity, onResolved }: { entity: Entity; onResolved: (id: s
         </div>
         {suggested ? (
           <button type="button" onClick={() => actions.openPerson(suggested.id)} className="flex flex-col items-center gap-1 min-w-0" title="Open person">
-            <PersonThumb personId={suggested.id} className="w-[84px] h-[84px] rounded-lg object-cover border border-border hover:border-accent" />
+            <PersonThumb personId={suggested.id} className="w-[84px] h-[84px] rounded-lg object-cover object-top border border-border hover:border-accent" />
             <span className="text-[10.5px] truncate max-w-[90px]">{personName(suggested)}</span>
           </button>
         ) : (

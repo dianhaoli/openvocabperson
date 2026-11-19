@@ -45,7 +45,7 @@ def encode_image(img: Image.Image, max_side: int = 1024, quality: int = 85) -> s
     w, h = img.size
     scale = min(1.0, max_side / max(w, h))
     if scale < 1.0:
-        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BILINEAR)
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.BILINEAR)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode("ascii")
@@ -66,8 +66,9 @@ def extract_json(text: str) -> Any:
         return json.loads(text)
     except Exception:
         pass
-    # first balanced object/array
-    for open_c, close_c in (("{", "}"), ("[", "]")):
+    # first balanced object/array, trying whichever bracket appears first
+    pairs = sorted((("{", "}"), ("[", "]")), key=lambda p: (text.find(p[0]) < 0, text.find(p[0])))
+    for open_c, close_c in pairs:
         start = text.find(open_c)
         while start != -1:
             depth = 0
@@ -213,7 +214,7 @@ class _HttpModel(ChatModel):
                 return r.json()
             body = r.text[:800]
             if r.status_code == 400 and attempt <= 4:
-                dropped = self._drop_unsupported(payload, body)
+                dropped = self._drop_unsupported(payload, r.text)
                 if dropped:
                     log.info("%s: retrying without unsupported param %r", self.spec, dropped)
                     continue
@@ -226,16 +227,47 @@ class _HttpModel(ChatModel):
 
     @staticmethod
     def _drop_unsupported(payload: dict, body: str) -> Optional[str]:
+        """Remove (or rename) the request parameter a 400 response complains about.
+
+        Prefers the structured ``error.param`` (OpenAI style); otherwise picks the optional
+        parameter mentioned first in the error message. Returns the parameter changed, if any.
+        """
         low = body.lower()
-        if "unsupported" not in low and "not supported" not in low and "unrecognized" not in low and "unknown" not in low and "extra inputs" not in low:
+        if not any(marker in low for marker in _UNSUPPORTED_MARKERS):
             return None
-        for key in ("reasoning_effort", "temperature", "response_format", "max_completion_tokens", "max_tokens", "parallel_tool_calls"):
-            if key in payload and key in body:
-                payload.pop(key)
-                if key == "max_completion_tokens" and "max_tokens" not in payload:
-                    payload["max_tokens"] = 1024
-                return key
+        mentioned = {key: low.find(alias) for key, aliases in _OPTIONAL_PARAMS.items() for alias in aliases if key in payload and alias in low}
+        param = _error_param(body)
+        key = param if param in payload and param in _OPTIONAL_PARAMS else min(mentioned, key=mentioned.__getitem__, default=None)
+        if key is None:
+            return None
+        value = payload.pop(key)
+        renamed = _TOKEN_PARAM_RENAMES.get(key)
+        if renamed and renamed not in payload:
+            payload[renamed] = value
+        return key
+
+
+_UNSUPPORTED_MARKERS = ("unsupported", "not supported", "does not support", "unrecognized", "unknown", "extra inputs", "not permitted", "deprecated", "not allowed")
+# optional request parameters that may be dropped on a 400, with the spellings error messages use for them
+_OPTIONAL_PARAMS: dict[str, tuple[str, ...]] = {
+    "reasoning_effort": ("reasoning_effort",),
+    "temperature": ("temperature",),
+    "response_format": ("response_format",),
+    "max_completion_tokens": ("max_completion_tokens",),
+    "max_tokens": ("max_tokens",),
+    "parallel_tool_calls": ("parallel_tool_calls",),
+    "output_config": ("output_config", "effort"),
+}
+# token-limit parameters are renamed rather than dropped (older servers / reasoning models)
+_TOKEN_PARAM_RENAMES = {"max_completion_tokens": "max_tokens", "max_tokens": "max_completion_tokens"}
+
+
+def _error_param(body: str) -> Optional[str]:
+    try:
+        err = json.loads(body).get("error")
+    except (ValueError, AttributeError):
         return None
+    return err.get("param") if isinstance(err, dict) else None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -251,8 +283,13 @@ class OpenAICompatModel(_HttpModel):
 
     @property
     def _is_reasoning(self) -> bool:
+        """Models that spend hidden reasoning tokens from the completion budget."""
         m = self.model.lower()
-        return self.provider == "openai" and (m.startswith("o1") or m.startswith("o3") or m.startswith("o4") or m.startswith("gpt-5") or m.startswith("gpt-6"))
+        if self.provider == "openai":
+            return m.startswith(("o1", "o3", "o4", "gpt-5", "gpt-6"))
+        if self.provider == "gemini":
+            return m.startswith(("gemini-2.5", "gemini-3"))
+        return False
 
     def _convert(self, messages: list[dict]) -> list[dict]:
         out: list[dict] = []
@@ -290,13 +327,11 @@ class OpenAICompatModel(_HttpModel):
 
     async def chat(self, messages, tools=None, *, max_tokens=1024, json_mode=False, temperature=0.0) -> ChatResponse:
         payload: dict[str, Any] = {"model": self.model, "messages": self._convert(messages)}
-        if self.provider == "openai":
-            payload["max_completion_tokens"] = max_tokens * (4 if self._is_reasoning else 1)
-        else:
-            payload["max_tokens"] = max_tokens
+        budget = max_tokens * REASONING_BUDGET_FACTOR if self._is_reasoning else max_tokens
+        payload["max_completion_tokens" if self.provider == "openai" else "max_tokens"] = budget
         if self._is_reasoning:
             payload["reasoning_effort"] = "low"
-        else:
+        if not (self._is_reasoning and self.provider == "openai"):  # OpenAI reasoning models reject temperature
             payload["temperature"] = temperature
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
@@ -308,12 +343,20 @@ class OpenAICompatModel(_HttpModel):
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        data = await self._post(f"{self.base_url}/chat/completions", payload, headers)
+        url = f"{self.base_url}/chat/completions"
+        data = await self._post(url, payload, headers)
+        if self._is_reasoning and _reasoning_exhausted(data):
+            # hidden reasoning used the whole budget before any answer: retry once with more room
+            token_key = "max_completion_tokens" if "max_completion_tokens" in payload else "max_tokens"
+            payload[token_key] = payload.get(token_key, budget) * 2
+            log.info("%s: reasoning exhausted the token budget; retrying with %s=%s", self.spec, token_key, payload[token_key])
+            data = await self._post(url, payload, headers)
         try:
-            msg = data["choices"][0]["message"]
-        except (KeyError, IndexError) as e:
+            choice = data["choices"][0]
+            msg = choice["message"]
+        except (KeyError, IndexError, TypeError) as e:
             raise ProviderError(f"{self.spec}: malformed response {str(data)[:300]}") from e
-        calls = []
+        calls: list[ToolCall] = []
         for tc in msg.get("tool_calls") or []:
             fn = tc.get("function", {})
             try:
@@ -322,6 +365,18 @@ class OpenAICompatModel(_HttpModel):
                 args = {"_raw": fn.get("arguments")}
             calls.append(ToolCall(id=tc.get("id") or f"call_{len(calls)}", name=fn.get("name", ""), arguments=args))
         return ChatResponse(text=(msg.get("content") or "").strip(), tool_calls=calls, raw=data)
+
+
+REASONING_BUDGET_FACTOR = 4  # completion budget multiplier for models that think before answering
+
+
+def _reasoning_exhausted(data: dict) -> bool:
+    try:
+        choice = data["choices"][0]
+    except (KeyError, IndexError, TypeError):
+        return False
+    msg = choice.get("message") or {}
+    return choice.get("finish_reason") == "length" and not (msg.get("content") or "").strip() and not msg.get("tool_calls")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -370,14 +425,26 @@ class AnthropicModel(_HttpModel):
         system, msgs = self._convert(messages)
         if json_mode:
             system = (system + "\n\nRespond with a single valid JSON value and nothing else.").strip()
-        payload: dict[str, Any] = {"model": self.model, "max_tokens": max_tokens, "messages": msgs, "temperature": temperature}
+        # Current Claude models think by default (adaptive thinking): keep the effort low for these short
+        # vision/JSON calls, leave room for thinking in max_tokens, and omit sampling parameters, which
+        # they reject when set to a non-default value.
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max_tokens * REASONING_BUDGET_FACTOR,
+            "messages": msgs,
+            "output_config": {"effort": "low"},
+        }
         if system:
             payload["system"] = system
         if tools:
             payload["tools"] = [{"name": t.name, "description": t.description, "input_schema": t.parameters} for t in tools]
         headers = {"x-api-key": self.api_key or "", "anthropic-version": "2023-06-01", "content-type": "application/json"}
         data = await self._post(f"{self.base_url}/v1/messages", payload, headers)
-        texts, calls = [], []
+        if data.get("stop_reason") == "refusal":
+            details = data.get("stop_details") or {}
+            raise ProviderError(f"{self.spec}: request refused ({details.get('category') or 'unspecified'})")
+        texts: list[str] = []
+        calls: list[ToolCall] = []
         for block in data.get("content", []):
             if block.get("type") == "text":
                 texts.append(block.get("text", ""))
@@ -440,7 +507,7 @@ def create_chat_model(spec: str, s: Settings) -> ChatModel:
     if provider == "openai":
         return OpenAICompatModel("openai", model or s.openai_vlm_model, s.openai_base_url, s.openai_api_key, t, c)
     if provider == "gemini":
-        return OpenAICompatModel("gemini", model or s.gemini_model, "https://generativelanguage.googleapis.com/v1beta/openai", s.gemini_api_key, t, c)
+        return OpenAICompatModel("gemini", model or s.gemini_model, s.gemini_base_url, s.gemini_api_key, t, c)
     if provider == "openrouter":
         return OpenAICompatModel("openrouter", model, "https://openrouter.ai/api/v1", s.openrouter_api_key, t, c)
     if provider == "ollama":
@@ -450,8 +517,7 @@ def create_chat_model(spec: str, s: Settings) -> ChatModel:
             raise ProviderError("OVP_COMPAT_BASE_URL is not set")
         return OpenAICompatModel("compat", model, s.compat_base_url, s.compat_api_key, t, c)
     if provider == "anthropic":
-        m = AnthropicModel(model or s.anthropic_vlm_model, "https://api.anthropic.com", s.anthropic_api_key, t, c)
-        return m
+        return AnthropicModel(model or s.anthropic_vlm_model, s.anthropic_base_url, s.anthropic_api_key, t, c)
     if provider in LOCAL_PROVIDERS:
         from .vlm_local import LocalVLM
 

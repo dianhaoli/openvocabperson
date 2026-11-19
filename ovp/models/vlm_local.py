@@ -23,21 +23,29 @@ from .llm import ChatModel, ChatResponse, ProviderError
 log = logging.getLogger("ovp.vlm_local")
 
 MAX_PIXELS = 512 * 28 * 28  # caps visual tokens per image (Qwen convention)
+MIN_PIXELS = 56 * 56
 
 
 def batch_by_area(items: list[tuple[int, int]], max_batch: int, max_area: int) -> list[list[int]]:
     """First-fit-decreasing packing of (index, area) so one huge crop can't stall a batch."""
-    order = sorted(items, key=lambda x: x[1], reverse=True)
-    batches: list[tuple[list[int], int]] = []
-    for idx, area in order:
-        for b in batches:
-            if len(b[0]) < max_batch and b[1] + area <= max_area:
-                b[0].append(idx)
-                batches[batches.index(b)] = (b[0], b[1] + area)
+    batches: list[tuple[list[int], list[int]]] = []  # (indices, [total area])
+    for idx, area in sorted(items, key=lambda x: x[1], reverse=True):
+        for members, total in batches:
+            if len(members) < max_batch and total[0] + area <= max_area:
+                members.append(idx)
+                total[0] += area
                 break
         else:
-            batches.append(([idx], area))
-    return [b[0] for b in batches]
+            batches.append(([idx], [area]))
+    return [members for members, _ in batches]
+
+
+def _dtype_kwarg() -> str:
+    """transformers >= 4.56 takes ``dtype``; older releases only know ``torch_dtype``."""
+    import transformers
+    from packaging.version import Version
+
+    return "dtype" if Version(transformers.__version__) >= Version("4.56") else "torch_dtype"
 
 
 class LocalVLM(ChatModel):
@@ -48,8 +56,8 @@ class LocalVLM(ChatModel):
     def __init__(self, model: str, settings: Settings):
         super().__init__(model, concurrency=1)
         self.settings = settings
-        self._model = None
-        self._processor = None
+        self._model: Any = None
+        self._processor: Any = None
         self._lock = threading.Lock()
 
     # loading happens on the device thread
@@ -63,10 +71,11 @@ class LocalVLM(ChatModel):
             try:
                 from transformers import AutoModelForImageTextToText as AutoVLM
             except ImportError:  # older transformers
-                from transformers import AutoModelForVision2Seq as AutoVLM
+                from transformers import AutoModelForVision2Seq as AutoVLM  # type: ignore[attr-defined,no-redef]
 
             device = get_runtime().device
-            kwargs: dict[str, Any] = {"torch_dtype": torch.float16 if device != "cpu" else torch.float32}
+            dtype = torch.float16 if device != "cpu" else torch.float32
+            kwargs: dict[str, Any] = {}
             if device.startswith("cuda"):
                 kwargs["device_map"] = "auto"
                 try:
@@ -85,22 +94,42 @@ class LocalVLM(ChatModel):
                         else BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16, bnb_4bit_quant_type="nf4")
                     )
                 if torch.cuda.is_bf16_supported():
-                    kwargs["torch_dtype"] = torch.bfloat16
+                    dtype = torch.bfloat16
+            kwargs[_dtype_kwarg()] = dtype
             log.info("loading local VLM %s on %s", self.model, device)
-            model = AutoVLM.from_pretrained(self.model, **kwargs)
+            model: Any = AutoVLM.from_pretrained(self.model, **kwargs)
             if not device.startswith("cuda"):
                 model = model.to(device)
             model.eval()
-            processor = AutoProcessor.from_pretrained(self.model, max_pixels=MAX_PIXELS)
+            # Qwen-VL processors resize to a pixel budget; cap it so a large crop can't explode the token count
+            proc_kwargs: dict[str, Any] = {"size": {"shortest_edge": MIN_PIXELS, "longest_edge": MAX_PIXELS}} if model.config.model_type.startswith("qwen") else {}
+            processor = AutoProcessor.from_pretrained(self.model, **proc_kwargs)
             tok = getattr(processor, "tokenizer", None)
             if tok is not None:
-                tok.padding_side = "left"
-                if tok.pad_token_id is None:
-                    tok.pad_token_id = tok.eos_token_id
+                tok.padding_side = "left"  # decoder-only batched generation needs left padding
+                if tok.pad_token is None:
+                    tok.pad_token = tok.eos_token
             self._model, self._processor = model, processor
 
     async def warmup(self) -> None:
         await get_runtime().run_model(self._load)
+
+    async def grounding_frame(self, image: Image.Image) -> Optional[tuple[int, int]]:
+        """(width, height) of the image as the model sees it, for models that answer boxes in absolute
+        pixels of their resized input (Qwen2-VL / Qwen2.5-VL); None for models using relative coordinates."""
+        return await get_runtime().run_model(self._grounding_frame_sync, image.size)
+
+    def _grounding_frame_sync(self, size: tuple[int, int]) -> Optional[tuple[int, int]]:
+        self._load()
+        if self._model.config.model_type not in ("qwen2_vl", "qwen2_5_vl"):
+            return None
+        from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+
+        ip = self._processor.image_processor
+        height, width = smart_resize(
+            size[1], size[0], factor=ip.patch_size * ip.merge_size, min_pixels=ip.size["shortest_edge"], max_pixels=ip.size["longest_edge"]
+        )
+        return width, height
 
     @staticmethod
     def _hf_messages(messages: list[dict]) -> tuple[list[dict], list[Image.Image]]:
@@ -133,7 +162,7 @@ class LocalVLM(ChatModel):
             texts.append(proc.apply_chat_template(hf, tokenize=False, add_generation_prompt=True))
             images.extend(imgs)
         inputs = proc(text=texts, images=images or None, padding=True, return_tensors="pt")
-        inputs = inputs.to(model.device)
+        inputs = inputs.to(model.device, dtype=model.dtype)  # casts only floating tensors (pixel values)
         tok = getattr(proc, "tokenizer", proc)
         with torch.inference_mode():
             out = model.generate(

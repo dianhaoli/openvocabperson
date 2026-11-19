@@ -31,8 +31,10 @@ function attrValue(v: unknown): string {
 
 function EntityDetails({ entityId, cached }: { entityId: string; cached: Entity | undefined }) {
   const actions = useActions();
-  const q = useApi<EntityDetail>(`entity:${entityId}`, (s) => api.entity(entityId, s));
-  const detail = q.data;
+  const { personsVersion } = useAppState();
+  // Refetch when identities change elsewhere (rename, merge, watchlist); keep showing the previous data meanwhile.
+  const q = useApi<EntityDetail>(`entity:${entityId}:${personsVersion}`, (s) => api.entity(entityId, s));
+  const detail = q.data ?? q.stale;
   const entity: Entity | undefined = detail ?? cached;
   const [pickerOpen, setPickerOpen] = useState(false);
   const [assigning, setAssigning] = useState(false);

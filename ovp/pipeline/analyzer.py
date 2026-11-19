@@ -16,11 +16,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import queue
 import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Iterator, Optional, Sequence, Union
 
 import numpy as np
 from PIL import Image
@@ -169,6 +170,10 @@ def expand_box(box: tuple, w: int, h: int, ratio: float) -> tuple[int, int, int,
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+REID_CROPS_PER_TRACK = 8
+MAX_TRAJECTORY_POINTS = 240
+
+
 @dataclass
 class _Track:
     tid: int
@@ -179,7 +184,7 @@ class _Track:
     best_box: Optional[tuple] = None
     best_frame: int = 0
     best_polys: Any = None
-    reid: list[tuple[float, Image.Image]] = field(default_factory=list)
+    reid: list[tuple[float, Image.Image]] = field(default_factory=list)  # (quality, tight crop), best first
 
     @property
     def label(self) -> str:
@@ -193,11 +198,209 @@ class _Track:
     def t_end(self) -> float:
         return self.hits[-1][0]
 
+    def add(self, idx: int, t: float, frame: np.ndarray, d: Detection, ratio: float) -> None:
+        """Record one tracked detection; keeps the best crop and a few good Re-ID crops."""
+        self.labels[d.label] = self.labels.get(d.label, 0) + 1
+        self.hits.append((round(t, 3), tuple(round(v, 1) for v in d.box), d.score, idx))
+        q = d.score * math.sqrt(max(d.area, 1.0))
+        if q > self.best_q:
+            self.best_q, self.best_box, self.best_frame, self.best_polys = q, d.box, idx, d.polygons
+            self.best_crop = _crop_bgr(frame, d.box, ratio)
+        # every 3rd hit (consecutive frames look alike), keeping the highest-quality crops
+        if d.label == "person" and len(self.hits) % 3 == 1 and (len(self.reid) < REID_CROPS_PER_TRACK or q > self.reid[-1][0]):
+            self.reid.append((q, _crop_bgr(frame, d.box, 0.0)))
+            self.reid.sort(key=lambda x: -x[0])
+            del self.reid[REID_CROPS_PER_TRACK:]
+
 
 def _crop_bgr(frame: np.ndarray, box: tuple, ratio: float) -> Image.Image:
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = expand_box(box, w, h, ratio)
     return Image.fromarray(np.ascontiguousarray(frame[y1:y2, x1:x2, ::-1]))
+
+
+def _presence(c: Candidate) -> list[tuple[float, float]]:
+    """Time segments in which a track is actually visible (a stitched track has gaps)."""
+    times = [p[0] for p in (c.trajectory or [])]
+    if len(times) < 2:
+        start = c.t_start or 0.0
+        return [(start, c.t_end if c.t_end is not None else start)]
+    max_gap = 2.5 * float(np.median(np.diff(times)))  # tolerate a missed detection or two
+    segments = [[times[0], times[0]]]
+    for t in times[1:]:
+        if t - segments[-1][1] > max_gap:
+            segments.append([t, t])
+        else:
+            segments[-1][1] = t
+    return [(s, e) for s, e in segments]
+
+
+def _segments_overlap(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> bool:
+    return any(s1 <= e2 and s2 <= e1 for s1, e1 in a for s2, e2 in b)
+
+
+def _same_track(c: Candidate, e: Any) -> bool:
+    """Whether a new track duplicates a stored video entity (same label, overlapping in time and space)."""
+    if e["label"] != c.det.label or e["t_start"] is None or c.t_start is None:
+        return False
+    if c.t_end < e["t_start"] or e["t_end"] < c.t_start:  # type: ignore[operator]
+        return False
+    return box_iou(c.det.box, (e["x1"], e["y1"], e["x2"], e["y2"])) > 0.5
+
+
+@dataclass
+class _VideoInfo:
+    fps: float
+    frame_count: int  # 0 when the container does not say
+    width: int
+    height: int
+    poster: Image.Image
+
+    @property
+    def duration(self) -> Optional[float]:
+        return self.frame_count / self.fps if self.frame_count else None
+
+
+def _probe_video(path: Path) -> Optional[_VideoInfo]:
+    import cv2
+
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            return None
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not (0 < fps <= 240):  # missing or bogus (VFR webm can report 1000)
+            fps = 25.0
+        n = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+        ok, first = cap.read()
+        if not ok:
+            return None
+        h, w = first.shape[:2]
+        return _VideoInfo(fps=fps, frame_count=n, width=w, height=h, poster=_bgr_to_image(first))
+    finally:
+        cap.release()
+
+
+_END = object()
+
+
+class _FrameReader:
+    """Decodes every ``step``-th frame on a background thread so decoding overlaps inference.
+
+    Iterates ``(frame_index, seconds, bgr)``; timestamps come from the container (correct for
+    variable frame rate). Skipped frames are only ``grab``-bed, never converted. After the
+    iteration, ``reached_end`` / ``frame_count`` / ``duration`` describe the whole file (useful when
+    the container does not state its length, e.g. browser-recorded WebM).
+    """
+
+    def __init__(self, path: Path, fps: float, step: int, max_frames: int, depth: int = 4):
+        self.reached_end = False
+        self.frame_count = 0
+        self.duration = 0.0
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=depth)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(path, fps, step, max_frames), name="ovp-video-decode", daemon=True)
+        self._thread.start()
+
+    def _put(self, item: Any) -> bool:
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _run(self, path: Path, fps: float, step: int, max_frames: int) -> None:
+        import cv2
+
+        cap = cv2.VideoCapture(str(path))
+        try:
+            idx = sampled = 0
+            while sampled < max_frames:
+                if idx % step:
+                    ok = cap.grab()
+                else:
+                    ok, frame = cap.read()
+                if not ok:
+                    self.reached_end = True
+                    break
+                t = _frame_time(cap, idx, fps)
+                self.frame_count, self.duration = idx + 1, t + 1.0 / fps
+                if idx % step == 0:
+                    if not self._put((idx, t, frame)):
+                        return
+                    sampled += 1
+                idx += 1
+        except Exception as e:  # surfaced to the consumer
+            self._put(e)
+        finally:
+            cap.release()
+            self._put(_END)
+
+    def __iter__(self) -> Iterator[tuple[int, float, np.ndarray]]:
+        while True:
+            try:
+                item = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                if self._stop.is_set():  # closed early (e.g. the awaiting task was cancelled): never block the device thread
+                    return
+                continue
+            if item is _END:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+
+def _frame_time(cap: Any, idx: int, fps: float) -> float:
+    """Seconds of the frame just read: container timestamp (VFR-safe), else index / fps."""
+    import cv2
+
+    pos = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+    return pos if (pos > 0 or idx == 0) else idx / fps
+
+
+def _bgr_to_image(frame: np.ndarray) -> Image.Image:
+    return Image.fromarray(np.ascontiguousarray(frame[:, :, ::-1]))
+
+
+def _read_frames(path: Path, indices: list[int]) -> list[tuple[int, float, np.ndarray]]:
+    """Read specific frames as ``(index, seconds, bgr)``. Seeks when the container is indexed;
+    otherwise (e.g. browser-recorded WebM without cues) decodes forward, which is always exact."""
+    import cv2
+
+    cap = cv2.VideoCapture(str(path))
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = fps if 0 < fps <= 240 else 25.0
+        wanted = sorted(set(indices))
+        out: list[tuple[int, float, np.ndarray]] = []
+        if cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0:
+            for idx in wanted:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ok, frame = cap.read()
+                if ok:
+                    out.append((idx, _frame_time(cap, idx, fps), frame))
+            return out
+        idx = 0
+        for target in wanted:
+            while idx < target and cap.grab():
+                idx += 1
+            if idx < target:
+                break
+            ok, frame = cap.read()
+            if not ok:
+                break
+            out.append((idx, _frame_time(cap, idx, fps), frame))
+            idx += 1
+        return out
+    finally:
+        cap.release()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -228,14 +431,15 @@ class Analyzer:
         det = await self.reg.ensure("detector", det_spec)
         if det is None:
             raise RuntimeError("no detector available – install ultralytics (and CLIP for open-vocabulary) or configure a VLM detector")
-        if plan.source != "default" and not det.open_vocab and not det_spec:
-            # the query needs open-vocabulary; prefer YOLOE if the default is closed-set
-            for alt in ("yoloe:yoloe-11m-seg.pt", "yolo-world:yolov8l-worldv2.pt"):
-                if any(p not in COCO_CLASSES for p in plan.prompts):
-                    cand = await self.reg.ensure("detector", alt)
-                    if cand is not None:
-                        det = cand
-                        break
+        needs_open_vocab = plan.source != "default" and any(p not in COCO_CLASSES for p in plan.prompts)
+        if needs_open_vocab and not det.open_vocab and not det_spec:
+            # the default detector is closed-set (COCO) but the query is not: switch to an open-vocab one
+            for alt in self.reg.open_vocab_fallbacks():
+                cand = await self.reg.ensure("detector", alt)
+                if cand is not None:
+                    log.info("query needs open-vocabulary detection: using %s instead of %s", cand.spec, det.spec)
+                    det = cand
+                    break
         need_vlm = opts.describe != "none" or any(c.verify for c in plan.concepts) or opts.verify is True
         vlm = await self.reg.ensure("vlm", opts.vlm) if need_vlm else None
         seg = None
@@ -308,7 +512,7 @@ class Analyzer:
         return len(cands)
 
     # ── shared crop processing ────────────────────────────────────────────────
-    async def _process(self, media_id: str, cands: list[Candidate], opts: AnalyzeOptions, plan: QueryPlan, models: dict[str, Any], emit: Emit, cancel: Optional[threading.Event], extra: list = ()) -> None:
+    async def _process(self, media_id: str, cands: list[Candidate], opts: AnalyzeOptions, plan: QueryPlan, models: dict[str, Any], emit: Emit, cancel: Optional[threading.Event], extra: Sequence[asyncio.Task] = ()) -> None:
         def check_cancel() -> None:
             if cancel is not None and cancel.is_set():
                 raise Cancelled()
@@ -473,11 +677,10 @@ class Analyzer:
             emit("stage", media_id=media_id, stage="identity", message=f"Linking {len(people)} person sighting(s)")
             conflicts = None
             if any(c.t_start is not None for c in cands):
-                spans = {c.entity_id: (c.t_start or 0.0, c.t_end or 0.0) for c in cands}
+                presence = {c.entity_id: _presence(c) for c in cands}
 
-                def conflicts(a: str, b: str) -> bool:
-                    (s1, e1), (s2, e2) = spans[a], spans[b]
-                    return not (e1 < s2 or e2 < s1)
+                def conflicts(a: str, b: str) -> bool:  # two tracks visible at the same time are two people
+                    return _segments_overlap(presence[a], presence[b])
 
             await self.identity.assign_media(people, models["reid"].space, conflicts=conflicts)  # type: ignore[arg-type]
 
@@ -485,131 +688,103 @@ class Analyzer:
             emit("entity", entity=serialize.entity(row))
 
     # ── video ─────────────────────────────────────────────────────────────────
-    async def analyze_video(self, path: Path, name: str, opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event] = None, media_id: Optional[str] = None) -> str:
-        import cv2
+    async def analyze_video(self, path: Path, name: str, opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event] = None) -> str:
+        from ..runtime import get_runtime
 
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            raise RuntimeError(f"cannot open video {name}")
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        ok, first = cap.read()
-        cap.release()
-        if not ok:
+        info = await get_runtime().run_cpu(_probe_video, path)
+        if info is None:
             raise RuntimeError(f"cannot decode video {name}")
-        duration = n / fps if n else None
-        if media_id is None:
-            media_id = new_id("m")
-            stored = await self.store.import_file(media_id, path, path.suffix or ".mp4")
-            poster = Image.fromarray(first[:, :, ::-1])
-            await self.store.save_thumb(media_id, poster)
-            await self.db.insert_media(
-                id=media_id, kind="video", name=name, path=str(stored), thumb_path=str(self.store.thumb_path(media_id)), width=w, height=h,
-                duration=duration, fps=fps, frame_count=n, query=opts.query, plan=plan.to_dict(), options=opts.to_dict(), status="processing",
-            )
-            emit("media_created", media=serialize.media(await self.db.get_media(media_id)))
-            path = stored
+        media_id = new_id("m")
+        stored = await self.store.import_file(media_id, path, path.suffix or ".mp4")
+        await self.store.save_thumb(media_id, info.poster)
+        await self.db.insert_media(
+            id=media_id, kind="video", name=name, path=str(stored), thumb_path=str(self.store.thumb_path(media_id)), width=info.width, height=info.height,
+            duration=info.duration, fps=info.fps, frame_count=info.frame_count, query=opts.query, plan=plan.to_dict(), options=opts.to_dict(), status="processing",
+        )
+        emit("media_created", media=serialize.media(await self.db.get_media(media_id)))
         try:
-            await self._video_entities(media_id, path, fps, n, opts, plan, emit, cancel, existing=None)
+            await self._video_entities(media_id, stored, info.fps, info.frame_count, opts, plan, emit, cancel, existing=None)
             await self.db.update_media(media_id, status="done")
+        except Cancelled:
+            await self.db.update_media(media_id, status="cancelled")  # the stored video can still be scanned later
+            raise
         except BaseException:
             await self.db.update_media(media_id, status="error")
             raise
         return media_id
 
     async def _video_entities(self, media_id: str, path: Path, fps: float, n: int, opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event], existing: Optional[list[Any]]) -> int:
-        import cv2
+        from ..runtime import get_runtime
 
         models = await self._models(opts, plan)
         det = models["detector"]
         if not getattr(det, "supports_tracking", False):
             raise RuntimeError(f"detector {det.spec} cannot track video; use a YOLO/YOLOE/YOLO-World detector")
-        target_fps = opts.video_fps or self.s.video_fps
-        max_frames = opts.max_frames or self.s.max_frames
-        step = max(1, int(round(fps / max(0.1, target_fps))))
-        if n and n / step > max_frames:
-            step = int(math.ceil(n / max_frames))
-        total = (n // step) if n else None
         prompts = self._detector_supports(det, plan)
+        if not prompts:
+            emit("detections", media_id=media_id, count=0, labels={}, frames=0)
+            return 0
+        sample_fps = min(fps, opts.video_fps or self.s.video_fps)
+        max_frames = max(1, opts.max_frames or self.s.max_frames)
+        step = max(1, round(fps / max(0.1, sample_fps)))
+        if n and math.ceil(n / step) > max_frames:
+            step = math.ceil(n / max_frames)
+        total = min(math.ceil(n / step), max_frames) if n else None
         conf = opts.conf if opts.conf is not None else self.s.detection_conf
+        if plan.source == "default":
+            conf = min(conf, 0.2)  # same recall as images for the default "everything" vocabulary
         ratio = self.s.expand_ratio
         tracks: dict[int, _Track] = {}
-        counter = {"frames": 0}
+        sampled = 0
         loop = asyncio.get_running_loop()
-        last_emit = [0.0]
+        last_emit = 0.0
 
-        def frames():
-            cap = cv2.VideoCapture(str(path))
-            idx = 0
-            try:
-                while True:
-                    if idx % step == 0:
-                        ok, frame = cap.read()
-                        if not ok:
-                            break
-                        yield idx, idx / fps, frame
-                    else:
-                        if not cap.grab():
-                            break
-                    idx += 1
-                    if n == 0 and idx / step > max_frames:
-                        break
-            finally:
-                cap.release()
-
-        def on_frame(idx: int, t: float, frame: np.ndarray, dets: list[Detection]) -> None:
-            counter["frames"] += 1
+        def on_frame(idx: int, t: float, frame: np.ndarray, dets: list[Detection]) -> None:  # runs on the device thread
+            nonlocal sampled, last_emit
+            sampled += 1
             for d in dets:
-                if d.track_id is None:
-                    continue
-                tr = tracks.setdefault(d.track_id, _Track(d.track_id))
-                tr.labels[d.label] = tr.labels.get(d.label, 0) + 1
-                tr.hits.append((round(t, 3), tuple(round(v, 1) for v in d.box), d.score, idx))
-                q = d.score * math.sqrt(max(d.area, 1.0))
-                if q > tr.best_q:
-                    tr.best_q, tr.best_box, tr.best_frame, tr.best_polys = q, d.box, idx, d.polygons
-                    tr.best_crop = _crop_bgr(frame, d.box, ratio)
-                if d.label == "person" and len(tr.hits) % 3 == 1 and (len(tr.reid) < 8 or q > tr.reid[-1][0]):
-                    tr.reid.append((q, _crop_bgr(frame, d.box, 0.0)))
-                    tr.reid.sort(key=lambda x: -x[0])
-                    del tr.reid[8:]
+                if d.track_id is not None:
+                    tracks.setdefault(d.track_id, _Track(d.track_id)).add(idx, t, frame, d, ratio)
             now = time.monotonic()
-            if now - last_emit[0] > 0.5:
-                last_emit[0] = now
-                msg = f"Tracking frame {counter['frames']}" + (f"/{total}" if total else "") + f" · {len(tracks)} track(s)"
-                loop.call_soon_threadsafe(lambda: emit("stage", media_id=media_id, stage="track", message=msg, frames=counter["frames"], total=total))
+            if now - last_emit > 0.5:
+                last_emit = now
+                msg = f"Tracking frame {sampled}" + (f"/{total}" if total else "") + f" · {len(tracks)} track(s)"
+                loop.call_soon_threadsafe(lambda: emit("stage", media_id=media_id, stage="track", message=msg, frames=sampled, total=total))
 
         emit("stage", media_id=media_id, stage="track", message=f"Tracking {len(prompts)} prompt(s) at ~{fps / step:.1f} fps with {det.spec}")
-        await self.reg.ensure("detector", det.spec)
-        from ..runtime import get_runtime
-
-        await get_runtime().run_model(
-            det.track_frames_sync, frames(), prompts if (det.open_vocab or plan.source != "default") else None, conf, on_frame,
-            (lambda: cancel.is_set()) if cancel is not None else (lambda: False),
-        )
+        t0 = time.perf_counter()
+        reader = _FrameReader(path, fps, step, max_frames)
+        try:
+            await get_runtime().run_model(
+                det.track_frames_sync, reader, prompts if (det.open_vocab or plan.source != "default") else None, conf, on_frame,
+                (lambda: cancel.is_set()) if cancel is not None else (lambda: False), fps / step,
+            )
+        finally:
+            reader.close()
         if cancel is not None and cancel.is_set():
             raise Cancelled()
-        min_hits = self.s.min_track_hits if counter["frames"] >= 6 else 1
+        if not n and reader.reached_end:  # the container did not state its length; now we know it
+            await self.db.update_media(media_id, frame_count=reader.frame_count, duration=round(reader.duration, 3))
+        min_hits = self.s.min_track_hits if sampled >= 6 else 1
         good = [t for t in tracks.values() if len(t.hits) >= min_hits and t.best_crop is not None]
-        emit("detections", media_id=media_id, count=len(good), labels=_count(t.label for t in good), frames=counter["frames"])
+        emit("detections", media_id=media_id, count=len(good), labels=_count(t.label for t in good), frames=sampled, elapsed=round(time.perf_counter() - t0, 2))
 
         cands: list[Candidate] = []
         for tr in good:
             d = Detection(box=tr.best_box, score=float(np.mean([hh[2] for hh in tr.hits])), label=tr.label, polygons=tr.best_polys if opts.segment else None, track_id=tr.tid)  # type: ignore[arg-type]
             c = Candidate(det=d, crop=tr.best_crop)  # type: ignore[arg-type]
             c.t_start, c.t_end, c.frame_index = tr.t_start, tr.t_end, tr.best_frame
-            c.trajectory = _thin_traj([[hh[0], *hh[1]] for hh in tr.hits], 240)
+            c.trajectory = _thin_traj([[hh[0], *hh[1]] for hh in tr.hits], MAX_TRAJECTORY_POINTS)
             c.reid_crops = [im for _, im in tr.reid]
             cands.append(c)
-        if existing:
-            cands = [c for c in cands if not any(e["label"] == c.det.label and e["t_start"] is not None and not (c.t_end < e["t_start"] or e["t_end"] < c.t_start) and box_iou(c.det.box, (e["x1"], e["y1"], e["x2"], e["y2"])) > 0.5 for e in existing)]
+        if existing:  # library scan: skip tracks already stored (same label, overlapping in time and space)
+            cands = [c for c in cands if not any(_same_track(c, e) for e in existing)]
         cands = await self._stitch(cands, models)
         await self._process(media_id, cands, opts, plan, models, emit, cancel)
         return len(cands)
 
     async def _stitch(self, cands: list[Candidate], models: dict[str, Any]) -> list[Candidate]:
-        """Merge person tracks that are the same person re-entering (no temporal overlap)."""
+        """Merge person tracks that are the same person re-entering (never visible at the same time)."""
         reid = models["reid"]
         people = [c for c in cands if c.is_person and c.reid_crops]
         if reid is None or len(people) < 2:
@@ -619,25 +794,25 @@ class Analyzer:
         for c in people:
             c.reid_embedding = l2n(vecs[k : k + len(c.reid_crops)].mean(0))
             k += len(c.reid_crops)
-        th = self.identity.thresholds(reid.space).match
-        people.sort(key=lambda c: c.t_start or 0)
+        th = self.identity.thresholds(reid.space).match + 0.03  # stricter than cross-media linking: merging is not reviewable
+        people.sort(key=lambda c: c.t_start or 0.0)
         merged: set[int] = set()
         for i, a in enumerate(people):
             if id(a) in merged:
                 continue
             for b in people[i + 1 :]:
-                if id(b) in merged or b.t_start is None or a.t_end is None or b.t_start <= a.t_end:
+                if id(b) in merged or _segments_overlap(_presence(a), _presence(b)):
                     continue
-                if float(a.reid_embedding @ b.reid_embedding) >= th + 0.03:  # type: ignore[operator]
-                    a.trajectory = (a.trajectory or []) + (b.trajectory or [])
-                    a.t_end = b.t_end
+                if float(a.reid_embedding @ b.reid_embedding) >= th:  # type: ignore[operator]
+                    a.trajectory = _thin_traj(sorted((a.trajectory or []) + (b.trajectory or [])), MAX_TRAJECTORY_POINTS)
+                    a.t_start, a.t_end = min(a.t_start, b.t_start), max(a.t_end, b.t_end)  # type: ignore[type-var]
                     if b.det.score * math.sqrt(b.det.area) > a.det.score * math.sqrt(a.det.area):
-                        a.det, a.crop, a.frame_index = Detection(b.det.box, b.det.score, b.det.label, b.det.polygons, None, a.det.track_id), b.crop, b.frame_index
+                        a.det, a.crop, a.frame_index = Detection(box=b.det.box, score=b.det.score, label=b.det.label, polygons=b.det.polygons, track_id=a.det.track_id), b.crop, b.frame_index
                     a.reid_crops = (a.reid_crops + b.reid_crops)[:12]
                     a.reid_embedding = l2n(a.reid_embedding + b.reid_embedding)  # type: ignore[operator]
                     merged.add(id(b))
         out = [c for c in cands if id(c) not in merged]
-        for c in out:  # recompute Re-ID in the main stage from merged crops
+        for c in out:  # the main stage computes Re-ID from the (merged) crops
             c.reid_embedding = None
         return out
 
@@ -706,44 +881,26 @@ class Analyzer:
 
     async def _scene_image(self, m: Any, frame_index: Optional[int]) -> Image.Image:
         if m["kind"] == "video":
-            import cv2
-
-            def grab() -> Image.Image:
-                cap = cv2.VideoCapture(m["path"])
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index or 0))
-                ok, frame = cap.read()
-                cap.release()
-                if not ok:
-                    raise RuntimeError("cannot read frame")
-                return Image.fromarray(frame[:, :, ::-1])
-
             from ..runtime import get_runtime
 
-            return await get_runtime().run_cpu(grab)
+            frames = await get_runtime().run_cpu(_read_frames, Path(m["path"]), [int(frame_index or 0)])
+            if not frames:
+                raise RuntimeError("cannot read frame")
+            return _bgr_to_image(frames[0][2])
         return await self.store.open_image(m["path"])
 
     async def _video_frames(self, m: Any, k: int) -> list[tuple[float, Image.Image]]:
-        import cv2
-
-        def grab() -> list[tuple[float, Image.Image]]:
-            cap = cv2.VideoCapture(m["path"])
-            n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-            out = []
-            for i in range(k):
-                idx = int((i + 0.5) * n / k) if n else i * int(fps)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                ok, frame = cap.read()
-                if ok:
-                    im = Image.fromarray(frame[:, :, ::-1])
-                    im.thumbnail((768, 768))
-                    out.append((idx / fps, im))
-            cap.release()
-            return out
-
+        """``k`` frames spread evenly over the video (the first ``k`` seconds if its length is unknown)."""
         from ..runtime import get_runtime
 
-        return await get_runtime().run_cpu(grab)
+        n, fps = m["frame_count"] or 0, m["fps"] or 25.0
+        indices = [int((i + 0.5) * n / k) for i in range(k)] if n else [int(i * fps) for i in range(k)]
+        out = []
+        for _, t, frame in await get_runtime().run_cpu(_read_frames, Path(m["path"]), indices):
+            im = _bgr_to_image(frame)
+            im.thumbnail((768, 768))
+            out.append((t, im))
+        return out
 
 
 def _count(labels: Any) -> dict[str, int]:

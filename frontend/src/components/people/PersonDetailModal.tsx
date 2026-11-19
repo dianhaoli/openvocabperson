@@ -85,7 +85,7 @@ function PersonEditor({ person, onChanged }: { person: PersonDetail; onChanged: 
   return (
     <div className="flex flex-col gap-4">
       <div className="flex gap-4">
-        <Img src={person.thumb_url ?? undefined} alt="" className="w-28 h-28 rounded-xl object-cover border border-border shrink-0" />
+        <Img src={person.thumb_url ?? undefined} alt="" className="w-28 h-28 rounded-xl object-cover object-top border border-border shrink-0" />
         <div className="flex-1 min-w-0 flex flex-col gap-2">
           <input className={inputClass} value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Name (e.g. Alice)" />
           <textarea className={`${inputClass} resize-y min-h-[60px]`} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Notes…" rows={2} />
@@ -123,6 +123,7 @@ function PersonEditor({ person, onChanged }: { person: PersonDetail; onChanged: 
               <EntityTile
                 key={s.id}
                 entity={s}
+                showPerson={false}
                 onClick={() => {
                   actions.openMedia(s.media_id, s.id);
                   actions.openPerson(null);

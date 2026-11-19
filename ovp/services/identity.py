@@ -19,7 +19,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
-from ..config import get_settings
+from ..config import Thresholds, get_settings
 from ..models.embedders import l2n
 from ..storage.db import Database
 
@@ -32,27 +32,39 @@ def reid_kind_of(space: str) -> str:
     return parts[1] if len(parts) > 1 else parts[0]
 
 
+LEADER_CLUSTERING_ABOVE = 4000  # sightings; beyond this the O(n²) similarity matrix gets too large
+
+
+def leader_clusters(vecs: np.ndarray, groups: list[str], threshold: float) -> list[list[int]]:
+    """Single-pass leader clustering with cannot-link on equal ``groups`` (for very large sets)."""
+    clusters: list[list[int]] = []
+    cents: list[np.ndarray] = []
+    medias: list[set[str]] = []
+    X = l2n(vecs.astype(np.float32))
+    for i in range(len(X)):
+        best, best_sim = -1, threshold
+        for k, c in enumerate(cents):
+            s = float(X[i] @ c)
+            if s >= best_sim and groups[i] not in medias[k]:
+                best, best_sim = k, s
+        if best < 0:
+            clusters.append([i])
+            cents.append(X[i].copy())
+            medias.append({groups[i]})
+        else:
+            clusters[best].append(i)
+            medias[best].add(groups[i])
+            cents[best] = l2n(X[clusters[best]].sum(0))
+    return clusters
+
+
 def agglomerate(vecs: np.ndarray, groups: list[str], threshold: float) -> list[list[int]]:
     """Centroid-linkage agglomerative clustering with cannot-link on equal ``groups`` (media ids)."""
     n = len(vecs)
     if n == 0:
         return []
-    if n > 4000:  # leader clustering for very large sets
-        clusters: list[list[int]] = []
-        cents: list[np.ndarray] = []
-        medias: list[set[str]] = []
-        for i in range(n):
-            best, bs = -1, threshold
-            for k, c in enumerate(cents):
-                s = float(vecs[i] @ c)
-                if s >= bs and groups[i] not in medias[k]:
-                    best, bs = k, s
-            if best < 0:
-                clusters.append([i]); cents.append(vecs[i].copy()); medias.append({groups[i]})
-            else:
-                clusters[best].append(i); medias[best].add(groups[i])
-                cents[best] = l2n(vecs[clusters[best]].sum(0))
-        return clusters
+    if n > LEADER_CLUSTERING_ABOVE:
+        return leader_clusters(vecs, groups, threshold)
     X = l2n(vecs.astype(np.float32))
     sums = X.copy()
     cents = X.copy()
@@ -95,7 +107,7 @@ class IdentityService:
         self.db = db
         self.lock = asyncio.Lock()
 
-    def thresholds(self, space: str):
+    def thresholds(self, space: str) -> Thresholds:
         return get_settings().thresholds_for(reid_kind_of(space))
 
     async def assign_media(
@@ -116,11 +128,8 @@ class IdentityService:
         results: dict[str, dict[str, Any]] = {}
         async with self.lock:
             cands: list[tuple[float, str, str]] = []
-            best: dict[str, tuple[Optional[str], float]] = {}
             for eid, vec in items:
-                matches = await self.db.match_persons(space, vec, k=8)
-                best[eid] = matches[0] if matches else (None, -1.0)
-                cands += [(s, eid, pid) for pid, s in matches]
+                cands += [(s, eid, pid) for pid, s in await self.db.match_persons(space, vec, k=8)]
             cands.sort(reverse=True)
             owners: dict[str, list[str]] = {}  # person → sightings of this media linked to it
             done: set[str] = set()
@@ -196,6 +205,9 @@ class IdentityService:
             rows = await self.db.get_embeddings(space, only_persons=True)
             if not rows:
                 return {"persons": 0, "changed": 0, "sightings": 0}
+            # a space can hold vectors of an older model size; only the dominant size is comparable
+            dim = Counter(len(r[1]) for r in rows).most_common(1)[0][0]
+            rows = [r for r in rows if len(r[1]) == dim]
             persons = {r["id"]: r for r in (await self.db.list_persons(limit=100000))[0]}
             named = {pid for pid, p in persons.items() if p["label"] or p["is_watchlist"] or p["notes"]}
             fixed = [(eid, v, m, pid) for eid, v, m, pid, st in rows if pid in named or st == "manual"]
@@ -231,6 +243,8 @@ class IdentityService:
                     new_clusters.append(ids)
                     continue
                 claimed.add(target)
+                if target in anchors:  # later clusters from the same media cannot join this anchor
+                    anchor_media.setdefault(target, set()).update(cmedia)
                 for e in ids:
                     assignments[e] = target
             changed = await self.db.apply_clustering(assignments, new_clusters, space)

@@ -29,6 +29,8 @@ log = logging.getLogger("ovp.search")
 
 RRF_K = 60
 WEIGHTS = {"fts": 1.0, "label": 1.2, "semantic": 1.0, "clip": 0.8, "image": 1.0, "reid": 1.2}
+# Nearest neighbours below these cosine similarities are unrelated and only add noise to the fusion.
+MIN_SIM = {"semantic": 0.2, "clip": 0.18, "image": 0.5, "reid": 0.3}
 
 
 class SearchService:
@@ -63,7 +65,8 @@ class SearchService:
         if text and text.strip():
             text = text.strip()
             tasks["fts"] = self.db.fts(text, pool, filters)
-            terms = self.planner.offline_plan(text).prompts + [c.name for c in self.planner.offline_plan(text).concepts]
+            plan = self.planner.offline_plan(text)
+            terms = plan.prompts + [c.name for c in plan.concepts]
             tasks["label"] = self.db.label_match(list(dict.fromkeys(terms)), pool, filters)
             temb = await self.reg.ensure("text_embedder")
             if temb is not None:
@@ -88,8 +91,6 @@ class SearchService:
             if isinstance(res, Exception):
                 log.warning("search signal %s failed: %s", name, res)
                 continue
-            if name == "clip":  # CLIP text-image sims are compressed; drop the bottom tail
-                res = [(i, s) for i, s in res if s >= 0.18]
             for rank, (eid, s) in enumerate(res):
                 fused[eid] = fused.get(eid, 0.0) + WEIGHTS[name] / (RRF_K + rank + 1)
                 raw.setdefault(eid, {})[name] = round(float(s), 4)
@@ -100,19 +101,18 @@ class SearchService:
         v = await self._embed_query(model, kind, text)
         if v is None:
             return []
-        space = model.space
-        return await self.db.knn(space, v, k, filters)
+        return await self.db.knn(model.space, v, k, filters, min_sim=MIN_SIM[kind])
 
     async def _knn_image(self, clip: Any, image: Image.Image, k: int, filters: dict) -> list[tuple[str, float]]:
         v = (await clip.embed_images([image]))[0]
-        return await self.db.knn(clip.space, v, k, filters, min_sim=0.5)
+        return await self.db.knn(clip.space, v, k, filters, min_sim=MIN_SIM["image"])
 
     async def _knn_reid(self, reid: Any, image: Image.Image, k: int, filters: dict) -> list[tuple[str, float]]:
         crop = await self.person_crop(image)
         if crop is None:
             return []
         v = (await reid.embed([crop]))[0]
-        return await self.db.knn(reid.space, v, k, {**filters, "labels": ["person"]}, min_sim=0.3)
+        return await self.db.knn(reid.space, v, k, {**filters, "labels": ["person"]}, min_sim=MIN_SIM["reid"])
 
     async def person_crop(self, image: Image.Image) -> Optional[Image.Image]:
         """Largest detected person, or the image itself if no detector / no person."""

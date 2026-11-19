@@ -1,0 +1,17 @@
+# NVIDIA GPU override (requires the NVIDIA Container Toolkit):
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+# Builds the CUDA torch wheels plus the local-model extras (Qwen2.5-VL, OWLv2, sentence-transformers).
+services:
+  backend:
+    build:
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu124}
+        REQUIREMENTS: ${REQUIREMENTS:-requirements-local.txt}
+    image: openvocab-vision:${OVP_IMAGE_TAG:-gpu}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

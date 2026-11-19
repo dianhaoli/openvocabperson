@@ -14,11 +14,11 @@ export function Filmstrip() {
   };
   return (
     <div className="flex items-center gap-2 px-4 py-2 border-b border-border bg-bg-secondary/60">
-      <div className="flex flex-col shrink-0 w-[92px]">
-        <span className="text-[10px] uppercase tracking-wider text-text-muted truncate" title={collection.title}>
+      <div className="flex flex-col shrink-0 w-[110px]">
+        <span className="text-[11px] font-medium text-text-secondary truncate" title={collection.title}>
           {collection.title}
         </span>
-        <span className="text-[11px] text-text-secondary">
+        <span className="text-[10.5px] text-text-muted">
           {idx === -1 ? '–' : idx + 1} / {collection.media.length}
         </span>
       </div>

@@ -11,11 +11,14 @@ export function EntityTile({
   onClick,
   footer,
   className,
+  showPerson = true,
 }: {
   entity: Entity;
   onClick?: () => void;
   footer?: ReactNode;
   className?: string;
+  /** Title the tile with the linked person's name instead of the detector label. */
+  showPerson?: boolean;
 }) {
   return (
     <button
@@ -27,8 +30,8 @@ export function EntityTile({
         className,
       )}
     >
-      <div className="relative aspect-square w-full">
-        <Img src={entity.crop_url} alt={entity.label} className="absolute inset-0 w-full h-full object-cover" />
+      <div className="relative aspect-square w-full bg-black/60">
+        <Img src={entity.crop_url} alt={entity.label} className="absolute inset-0 w-full h-full object-contain" />
         {entity.person?.is_watchlist && (
           <span className="absolute top-1 right-1 text-[10px] bg-error text-white rounded px-1">★</span>
         )}
@@ -36,7 +39,7 @@ export function EntityTile({
       <div className="px-1.5 py-1 flex flex-col min-w-0">
         <div className="flex items-center gap-1 text-[11px] min-w-0">
           <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: labelColor(entity.label) }} />
-          <span className="truncate">{entity.person ? personName(entity.person) : entity.label}</span>
+          <span className="truncate">{showPerson && entity.person ? personName(entity.person) : entity.label}</span>
           <span className="ml-auto text-text-muted font-mono text-[10px]">{pct(entity.score)}</span>
         </div>
         {footer}

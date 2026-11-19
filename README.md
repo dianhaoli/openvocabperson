@@ -1,99 +1,181 @@
-# Open-Vocabulary Person Analysis
+# OpenVocab Vision
 
-Upload an image, detect people with YOLO, describe each one with a vision-language model, recognize the same person across uploads, and search everything by text or by example image.
+Find anything in your photos and videos by describing it. Type a query such as "dangerous things", "people holding phones" or "dogs, bicycles". An LLM turns it into detector prompts. An open-vocabulary detector (YOLOE by default) finds and segments the matches, and a vision-language model checks each candidate and describes it. Every person sighting is linked to an identity cluster across uploads. You can then search the library by text or by photo, or ask an analyst agent about it.
+
+It runs on a laptop CPU, an Apple Silicon Mac or a CUDA GPU, with local models, cloud APIs (OpenAI, Anthropic, Gemini, OpenRouter, Ollama, any OpenAI-compatible server) or a mix of the two.
 
 ![Demo](https://github.com/user-attachments/assets/81d30065-eaf9-461d-bddb-ee7183e1b14b)
 
 **[Demo video](https://www.youtube.com/watch?v=MsrKKbLeFY0)**
 
-## What it does
+## Quickstart
 
-- **Detect, then describe.** YOLO11-L finds objects; only confident `person` detections are routed to Qwen2.5-VL-3B, which describes actions, clothing, held objects and visibility. Everything else stays YOLO-only, so the VLM runs only where it is needed.
-- **Re-identify across uploads.** Each person crop gets a 512-d OSNet Re-ID embedding, matched by cosine similarity against running-mean cluster centroids stored in pgvector. Results are `matched` (>= 0.75), `new` (< 0.60) or `pending` review in between. Clusters can be named, put on a watchlist, merged or reassigned.
-- **Hybrid search.** Full-text search over VLM descriptions (Postgres `tsvector`) combined with image-embedding similarity (pgvector HNSW), using adjustable text/vector weights. You can also look up a person by photo via Re-ID.
-- **Grounded follow-up Q&A.** Ask questions about a detected person. By default the VLM sees only the person crop, with a prompt that tells it to answer only from visible evidence and to say when it is unsure. A full-scene option answers from the whole image when the question needs context.
+### Docker (one container for the API and UI, plus PostgreSQL)
+
+```bash
+git clone https://github.com/dianhaoli/openvocabperson.git && cd openvocabperson
+cp .env.example .env          # optional: add OPENAI_API_KEY (or another provider)
+docker compose up -d --build  # → http://localhost:8000
+```
+
+- NVIDIA GPU (CUDA torch and local Qwen2.5-VL): `docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build`
+- Model weights download on first use into the `weights` and `model-cache` volumes. Media and crops go to `storage`.
+- Optional nginx front end on :3000: `docker compose --profile nginx up -d`.
+
+### Local
+
+You need Python 3.10+, PostgreSQL with [pgvector](https://github.com/pgvector/pgvector), and Node 18+ (only to build the UI).
+
+```bash
+pip install -r requirements.txt          # + requirements-local.txt for local Qwen-VL / HF detectors
+createdb vision_analysis && psql vision_analysis -c "CREATE EXTENSION vector"
+cp .env.example .env                     # set DATABASE_URL and a provider key
+(cd frontend && npm ci && npm run build) # the backend serves frontend/dist at /
+python -m ovp serve --port 8000          # same as: uvicorn app:app
+```
+
+Open http://localhost:8000. API docs are at `/docs`. For UI development, run `cd frontend && npm run dev` (port 5173, proxies `/api` to :8000).
+
+### Command line
+
+The CLI uses the same database, storage and models as the server, in process and without HTTP:
+
+```bash
+python -m ovp analyze photos/ clip.mp4 --query "people with bags" --segment --describe all
+python -m ovp analyze bus.jpg --json > result.json   # same JSON shapes as the HTTP API
+python -m ovp search "man in a red jacket" --limit 10
+python -m ovp search --image suspect.jpg             # CLIP image similarity + person Re-ID
+python -m ovp models                                 # providers, availability, defaults (--check loads them)
+python -m ovp serve --port 8000 --reload
+```
+
+Results go to stdout. Progress and logs go to stderr, so `--json` output can be piped. Run `python -m ovp <command> --help` for every flag. Analyzed media show up in the UI library.
 
 ![UI](https://github.com/user-attachments/assets/f7a1219f-46c3-4930-b70b-e4ac124cf136)
+
+## What it does
+
+- **Open-vocabulary analysis.** Queries can be literal ("person, dog"), abstract ("dangerous things", "all living things") or attribute-based ("menacing people"). The planner expands abstract concepts into prompts with the LLM, or with a built-in lexicon when no LLM is configured. It also attaches VLM yes/no verification questions to concepts that a detector cannot decide alone. With no query, the detector uses the 80 COCO classes.
+- **Detect, segment, verify, describe.** You get boxes and masks (YOLOE-seg masks, or SAM 2.1 / MobileSAM / FastSAM). The VLM sends one JSON reply per crop that both verifies concepts and describes the subject (actions, clothing, held objects for people; colour and details for objects).
+- **Images and videos.** Video frames are sampled (2 fps by default) and tracked with ByteTrack. Each track becomes one entity with a trajectory, a best crop and several Re-ID crops. Track fragments of the same person are stitched back together.
+- **Identity across uploads.** Each person sighting gets a Re-ID embedding (OSNet, or CLIP or a colour histogram as fallback) and is matched against cluster centroids in pgvector. The result is `matched`, `new` or `pending` review. You can name clusters, put them on a watchlist, merge them, reassign sightings or re-cluster everything.
+- **Hybrid search.** Several signals are fused with reciprocal-rank fusion: Postgres full-text over labels and descriptions, label/lexicon match, text-embedding similarity of descriptions, CLIP text-to-image and image-to-image, and person Re-ID for photo queries.
+- **Grounded Q&A.** You can ask about one detection (crop or full scene) or a whole image or video. Answers are stored with the entity.
+- **Analyst agent.** A tool-calling LLM can search the library, run open-vocabulary scans over stored media, analyze server-side folders, and manage people. Answers stream over SSE with tool cards.
+- **Jobs.** All analysis runs as background jobs with live SSE progress. Closing the browser tab does not stop a job, and jobs can be cancelled.
 
 ## Architecture
 
 ```
-image ──> YOLO11-L ──> routing ─┬─ non-person / low-conf ──> stored as YOLO-only
-                                └─ person (conf >= 0.3) ──┬─> Qwen2.5-VL ──> description + 1536-d embedding
-                                                          └─> OSNet ──> 512-d Re-ID ──> cosine vs centroids
-                                                                                        (matched / new / pending)
-                                        │
-                                        v
-             PostgreSQL + pgvector: sessions, entities, person clusters
-             (GIN full-text index, HNSW vector indexes)
-                                        │
-                                        v
-             FastAPI (REST + SSE streaming)  <──>  React + TypeScript UI
+                 query ──► planner (LLM or lexicon) ──► detector prompts + verification questions
+                                       │
+image ─────────────────────────────────┤
+video ─► frame sampler ─► detector + ByteTrack ─► tracks ─► stitching
+                                       ▼
+                    open-vocab detection (+ masks) ─► cross-prompt NMS ─► routing
+                                       │
+          ┌──────────────────┬─────────┴────────┬──────────────────┐   (run concurrently)
+          ▼                  ▼                  ▼                  ▼
+   VLM verify+describe   segmentation      CLIP crop          person Re-ID
+   (JSON per crop,       (SAM box prompts  embeddings         embeddings
+    batched/concurrent)   or detector masks)
+          └──────────────────┴─────────┬────────┴──────────────────┘
+                                       ▼
+              text embeddings of descriptions ─► one DB transaction ─► identity linking
+                                       ▼
+   PostgreSQL + pgvector: media · entities (tsvector) · embeddings (one HNSW index per space)
+                          persons (centroids) · Q&A
+                                       ▼
+   FastAPI ─ jobs (SSE progress) ─ search (RRF) ─ persons/review ─ agent (tool calling, SSE)
+      ▲                                                                   │
+      └──── React UI (Analyze · Library · Search · People · Agent) ───────┘   + python -m ovp CLI
 ```
 
-| File | Role |
-|------|------|
-| `pipeline.py` | YOLO detection, routing, batched VLM inference, Re-ID |
-| `app.py` | FastAPI server: analyze, stream, Q&A, search, person clusters |
-| `database.py` | Postgres/pgvector schema and hybrid search |
-| `embeddings.py`, `reid.py`, `person_matcher.py` | VLM embeddings, OSNet extractor, match thresholds |
-| `frontend/` | React 19 + Vite + Tailwind UI |
+Local model inference runs on one dedicated worker thread per device, so the event loop never blocks and GPU work is serialized. Cloud calls run concurrently with semaphores. Default models load in the background at startup, so the library and search are usable immediately.
 
-## Quickstart
+| Module | Role |
+|---|---|
+| `ovp/api/app.py` | FastAPI routes ([contract](docs/API.md)) and serving of the built UI |
+| `ovp/cli.py` | `python -m ovp serve \| analyze \| search \| models` |
+| `ovp/context.py` | Wires storage, models and services (one per process) |
+| `ovp/config.py` | Settings from environment variables / `.env` |
+| `ovp/runtime.py` | Device selection, device thread, CPU pool |
+| `ovp/jobs.py` | Background jobs, event replay, cancellation |
+| `ovp/pipeline/planner.py`, `analyzer.py` | Query planning; image and video pipeline; Q&A |
+| `ovp/models/` | Detectors, segmenters, chat models (VLM/LLM), local Qwen-VL, embedders and Re-ID, and the registry that resolves `provider:model` specs |
+| `ovp/services/identity.py`, `search.py` | Identity clustering and review; hybrid search |
+| `ovp/storage/db.py`, `files.py` | PostgreSQL schema and queries; originals, thumbnails, crops |
+| `ovp/agent/agent.py` | Analyst agent and its tools |
+| `frontend/` | React 19, TypeScript, Vite, Tailwind v4 |
 
-### Docker Compose
+More detail is in [docs/DETAILS.md](docs/DETAILS.md): the pipeline, identity, search, the agent, the schema, operations and troubleshooting.
 
-```bash
-git clone https://github.com/dianhaoli/openvocabperson.git
-cd openvocabperson
-docker compose up -d        # postgres (pgvector), backend, frontend
-```
+## Models
 
-- Frontend: http://localhost:3000
-- API: http://localhost:8000 (`GET /health`)
+Every role takes a spec of the form `provider:model`. Set it in `.env` (`OVP_DETECTOR=...`), change it at runtime in the UI's Models dialog (`PATCH /api/config`), or override it per request (`detector`, `segmenter`, `vlm`, `llm` in the analyze options). `auto` picks the best option for the hardware and keys it finds, and `none` disables a role.
 
-Models download on first start. For NVIDIA GPUs, uncomment the `deploy` block in `docker-compose.yml` (requires the NVIDIA Container Toolkit).
+| Role | Local | Cloud / server | `auto` picks |
+|---|---|---|---|
+| Detector | `yoloe:yoloe-11{s,m,l}-seg.pt` (open-vocab and masks), `yolo-world:yolov8l-worldv2.pt`, `yolo:yolo11l.pt` / `yolo:yolo11l-seg.pt` (COCO only), `owlv2:google/owlv2-base-patch16-ensemble`, `grounding-dino:IDEA-Research/grounding-dino-tiny` | `vlm:<vlm spec>` (boxes from a VLM, e.g. `vlm:gemini:gemini-2.5-flash`) | YOLOE-11L on CUDA, otherwise YOLOE-11M. YOLO11-L without the CLIP package. A VLM without ultralytics |
+| Segmenter | `sam:sam2.1_{t,b,l}.pt`, `sam:mobile_sam.pt`, `sam:sam_b.pt`, `fastsam:FastSAM-s.pt`, `detector` (YOLOE-seg masks, free) | – | Detector masks when available, then `sam:sam2.1_b.pt` on CUDA, otherwise `sam:mobile_sam.pt` |
+| VLM | `qwen:Qwen/Qwen2.5-VL-3B-Instruct` (or `-7B`; `hf:` works too), `ollama:qwen2.5vl:7b` | `openai:gpt-4.1-mini`, `anthropic:claude-haiku-5-5`, `gemini:gemini-2.5-flash`, `openrouter:<model>`, `compat:<model>` | Local Qwen on a GPU, otherwise the first key found: OpenAI, Anthropic, Gemini, then compat |
+| LLM (planner, agent) | `ollama:qwen3:8b` | `openai:gpt-4.1-mini`, `anthropic:claude-sonnet-5-5`, `gemini:gemini-2.5-flash`, `openrouter:<model>`, `compat:<model>` | First key found: OpenAI, Anthropic, Gemini, then compat. The agent needs tool calling |
+| Image embedder | `clip:ViT-B-32`, `clip:ViT-B-16`, `clip:ViT-L-14` (open_clip, falling back to the OpenAI CLIP package) | – | `clip:ViT-B-32` |
+| Text embedder | `st:all-MiniLM-L6-v2`, `ollama:nomic-embed-text`, `clip` (CLIP text tower) | `openai:text-embedding-3-small`, `gemini:gemini-embedding-001`, `compat:<model>` | OpenAI, then Gemini, then sentence-transformers |
+| Re-ID | `osnet:osnet_x1_0` (torchreid), `clip`, `color` (histogram fallback) | – | OSNet. If its weights cannot load: CLIP, then colour |
 
-### Local
+Run `python -m ovp models` (or `GET /api/models`) to see what is available on your machine and why the rest is not. On CPU, use `OVP_DETECTOR=yoloe:yoloe-11s-seg.pt` and a cloud VLM. SAM 2.1-B and local Qwen-VL are slow there.
 
-Requires Python 3.10+, Node 18+, PostgreSQL with the pgvector extension, and a CUDA GPU or Apple Silicon (CPU works but is slow).
+## Configuration
 
-```bash
-# Backend
-pip install -r requirements.txt
-createdb vision_analysis
-psql vision_analysis -c "CREATE EXTENSION vector;"
-export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/vision_analysis"  # this is the default
-uvicorn app:app --host 0.0.0.0 --port 8000
+All settings are environment variables. A `.env` file in the working directory is read automatically; see [.env.example](.env.example).
 
-# Frontend (http://localhost:5173, proxies API calls to :8000)
-cd frontend
-npm install
-npm run dev
-```
-
-Try it from the command line:
-
-```bash
-curl -X POST -F "file=@image.jpg" http://localhost:8000/analyze
-python demo.py path/to/image.jpg   # runs the pipeline without the server
-```
-
-## Tech stack
-
-- **Models:** Ultralytics YOLO11-L, Qwen2.5-VL-3B-Instruct (Transformers, optional INT8/INT4 via bitsandbytes), OSNet x1.0 (torchreid)
-- **Backend:** Python, PyTorch, FastAPI, uvicorn, asyncpg
-- **Storage/search:** PostgreSQL 15 + pgvector (HNSW), Postgres full-text search (GIN)
-- **Frontend:** React 19, TypeScript, Vite, Tailwind CSS v4
-- **Deployment:** Docker Compose (Postgres, backend, nginx-served frontend)
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/vision_analysis` | PostgreSQL with pgvector. The schema is created and migrated on start |
+| `OVP_STORAGE_DIR` | `storage` | Originals, thumbnails, crops, upload spool |
+| `OVP_WEIGHTS_DIR` | `.` | Where local weight files are looked up (ultralytics downloads into the working directory) |
+| `OVP_DEVICE` | `auto` | `auto` (CUDA, then MPS, then CPU), `cpu`, `cuda`, `cuda:1`, `mps` |
+| `OVP_DETECTOR` / `OVP_SEGMENTER` / `OVP_VLM` / `OVP_LLM` | `auto` | Model specs (see [Models](#models)) |
+| `OVP_EMBEDDER` / `OVP_TEXT_EMBEDDER` / `OVP_REID` | `auto` | CLIP image embedder, text embedder for descriptions, Re-ID model |
+| `OPENAI_API_KEY`, `OPENAI_BASE_URL` | –, `https://api.openai.com/v1` | OpenAI (or any proxy that speaks its API) |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` | –, `https://api.anthropic.com` | Anthropic |
+| `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), `GEMINI_BASE_URL` | –, `https://generativelanguage.googleapis.com/v1beta/openai` | Google Gemini (OpenAI-compatible endpoint) |
+| `OPENROUTER_API_KEY` | – | OpenRouter (`openrouter:<model>`) |
+| `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Ollama (`ollama:<model>`) |
+| `OVP_COMPAT_BASE_URL`, `OVP_COMPAT_API_KEY` | – | Any OpenAI-compatible server: vLLM, LM Studio, TGI, llama.cpp (`compat:<model>`) |
+| `OVP_OPENAI_VLM_MODEL` / `OVP_OPENAI_LLM_MODEL` | `gpt-4.1-mini` | Model used by `auto` and by `openai:` without a model |
+| `OVP_ANTHROPIC_VLM_MODEL` / `OVP_ANTHROPIC_LLM_MODEL` | `claude-haiku-5-5` / `claude-sonnet-5-5` | Same for Anthropic |
+| `OVP_GEMINI_MODEL` | `gemini-2.5-flash` | Same for Gemini |
+| `OVP_LOCAL_VLM_MODEL` | `Qwen/Qwen2.5-VL-3B-Instruct` | Local VLM for `qwen:` / `hf:` |
+| `OVP_CONF` | `0.25` | Detector confidence threshold. Default-vocabulary runs use at most 0.2 |
+| `OVP_LOW_CONF` | `0.3` | Persons below this score are kept as `low_confidence`, with no description and no Re-ID |
+| `OVP_NMS_IOU` | `0.7` | IoU for cross-prompt NMS |
+| `OVP_EXPAND_RATIO` | `0.1` | Crop padding around boxes |
+| `OVP_MAX_DETECTIONS` | `100` | Detections per image |
+| `OVP_VLM_CONCURRENCY` | `8` | Parallel requests per cloud model |
+| `OVP_VLM_BATCH` | `4` | Batch size for the local VLM |
+| `OVP_VLM_MAX_TOKENS` | `260` | Max tokens per crop reply |
+| `OVP_MAX_VLM_CROPS` | `40` | Max crops per media item sent to the VLM (largest and most confident first) |
+| `OVP_VLM_QUANT` | `none` | `8bit` / `4bit` for the local VLM (bitsandbytes, CUDA) |
+| `OVP_REQUEST_TIMEOUT` | `90` | Seconds per cloud request |
+| `OVP_VIDEO_FPS` | `2.0` | Frames per second sampled from videos |
+| `OVP_MAX_FRAMES` | `600` | Max sampled frames per video |
+| `OVP_MIN_TRACK_HITS` | `2` | Tracks seen in fewer sampled frames are dropped |
+| `OVP_JOB_CONCURRENCY` | `2` | Jobs running at once |
+| `OVP_MEDIA_CONCURRENCY` | `3` | Media items processed at once within a job |
+| `OVP_REID_MATCH` / `OVP_REID_REVIEW` | per backend | Identity thresholds. Defaults: OSNet 0.75/0.60, CLIP 0.88/0.80, colour 0.93/0.86 |
+| `OVP_PRELOAD` | `true` | Load default models in the background at startup |
+| `OVP_FRONTEND_DIST` | `frontend/dist` | Built UI served at `/` |
 
 ## Limitations
 
-Identity matching is cross-image body Re-ID only. There is no video tracking, face recognition or multi-camera calibration, and clothing changes reduce match reliability.
-
-## More
-
-API reference, configuration options, database schema and troubleshooting are in [docs/DETAILS.md](docs/DETAILS.md).
+- **Identity is appearance-based body Re-ID.** There is no face recognition. A change of clothes, heavy occlusion or very small people reduce match quality, and the colour-histogram fallback is weak. Uncertain matches go to the review queue instead of being merged automatically.
+- **Verification and descriptions are only as good as the VLM.** Small or blurry crops and abstract concepts ("menacing") can be wrong. Each answer comes with the stored reason, so you can audit it.
+- **CPU works, but slowly.** On CPU, use YOLOE-11S, MobileSAM and a cloud VLM. Local Qwen-VL and SAM 2.1-L need a GPU. Long videos are capped by `OVP_MAX_FRAMES`.
+- **Jobs and agent conversations live in memory.** They are lost on restart. Analysis results themselves are stored in PostgreSQL.
+- **There is no authentication.** CORS is open, and `/api/analyze/paths` (also used by the agent) reads any path the server process can access. Run the server only on a trusted network or behind an authenticating proxy.
+- **Weights download on first use.** That includes ultralytics assets from GitHub, OSNet from Google Drive, and CLIP / Qwen / OWLv2 from Hugging Face. Offline machines need the weights placed in `OVP_WEIGHTS_DIR` or the caches in advance. When a download fails, the model is reported as unavailable instead of crashing the server.
 
 ## License
 

@@ -21,7 +21,7 @@ function PersonCard({ p, extra, onClick }: { p: Person; extra?: string; onClick:
       className="flex flex-col rounded-xl overflow-hidden border border-border bg-bg-card hover:border-accent transition-colors text-left min-w-0"
     >
       <div className="relative aspect-square">
-        <Img src={p.thumb_url ?? undefined} alt="" className="absolute inset-0 w-full h-full object-cover" />
+        <Img src={p.thumb_url ?? undefined} alt="" className="absolute inset-0 w-full h-full object-cover object-top" />
         {p.is_watchlist && <span className="absolute top-1 right-1 text-[9.5px] bg-error text-white rounded px-1">★ watch</span>}
         {extra && <span className="absolute bottom-1 right-1 text-[10px] font-mono bg-black/75 rounded px-1">{extra}</span>}
       </div>

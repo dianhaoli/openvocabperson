@@ -6,7 +6,7 @@ import { TERMINAL_STATUSES } from '../../hooks/useJobTracker';
 import { useWorkspaceJob } from '../../hooks/useWorkspaceJob';
 import type { Job, Media, MediaKind } from '../../types';
 import { cn } from '../../utils/cn';
-import { relativeTime } from '../../utils/format';
+import { relativeTime, shortId } from '../../utils/format';
 import { Img } from '../common/Img';
 import { JobPanel, StatusBadge } from '../jobs/JobPanel';
 import { Button } from '../ui/Button';
@@ -75,6 +75,8 @@ export function LibraryTab() {
   const jobs = (jobsQ.data ?? jobsQ.stale)?.jobs ?? [];
   const anyRunning = jobs.some((j) => !TERMINAL_STATUSES.includes(j.status));
   const { reload: reloadJobs } = jobsQ;
+  const total = page?.total ?? 0;
+  const items = page?.media ?? [];
 
   useEffect(() => {
     if (!anyRunning) return;
@@ -102,6 +104,8 @@ export function LibraryTab() {
     setDeleting(true);
     try {
       await api.deleteMedia(toDelete.id);
+      // Deleting the last item of a page moves back to the previous page instead of showing an empty one.
+      if (items.length === 1 && offset > 0) setOffset(Math.max(0, offset - PAGE));
       actions.removeMedia(toDelete.id);
       actions.bumpPersons();
       actions.toast(`Deleted ${toDelete.name}`, 'success');
@@ -123,7 +127,7 @@ export function LibraryTab() {
       const res = await api.job(job.id);
       const media = res.media ?? [];
       media.forEach((m) => actions.cacheMedia(m));
-      actions.setCollection({ title: `${job.kind} · ${job.id}`, media });
+      actions.setCollection({ title: `${job.kind === 'scan' ? 'Scan' : 'Analysis'} ${shortId(job.id)}`, media });
       if (media[0]) actions.openMedia(media[0].id);
       else actions.toast('This job produced no media', 'info');
     } catch (err) {
@@ -133,8 +137,6 @@ export function LibraryTab() {
     }
   };
 
-  const total = page?.total ?? 0;
-  const items = page?.media ?? [];
 
   return (
     <div className="flex flex-col gap-4 p-4">

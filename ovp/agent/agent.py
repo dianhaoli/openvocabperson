@@ -4,11 +4,16 @@ The agent can search, run new open-vocabulary scans over stored photos/videos, i
 question images with the VLM, cluster / name / merge people, and ingest folders. Tool results
 carry full entity/media/person objects for the UI (rendered as galleries) and a compact JSON
 summary for the model.
+
+Conversations live in memory. A turn runs as its own task so it finishes (and the transcript
+stays valid) even when the client disconnects mid-stream; turns of one conversation are
+serialized by a lock, different conversations run concurrently.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -17,27 +22,49 @@ from typing import Any, Awaitable, Callable, Optional
 
 from .. import serialize
 from ..models.llm import ChatModel, ToolCall, ToolSpec
-from ..storage.db import new_id, rows_by_id
+from ..storage.db import new_id
 
 log = logging.getLogger("ovp.agent")
 
-SYSTEM_PROMPT = """You are OpenVocab Analyst, an assistant that investigates a private library of photos and videos.
-Every photo/video has been processed: objects were detected (open-vocabulary), people were described by a vision-language model and grouped into identity clusters ("persons") via Re-ID.
+Emit = Callable[..., Awaitable[None]]
+ToolFn = Callable[..., Awaitable["ToolOutput"]]
 
-How to work:
-- Use tools; never invent entities, people, counts or file names. Prefer `search` first for anything already detected/described.
-- If the user asks for something that may not have been detected yet (e.g. "dangerous things", "all living things", a specific object), run `find_in_library`, which re-scans stored media with an open-vocabulary detector (and an LLM-expanded vocabulary + VLM verification for abstract requests).
-- For questions about what is happening in a specific image or about a specific detection, use `ask_image`.
-- For people: `list_persons` (order by sightings to find who appears most), `get_person`, `name_person`, `set_watchlist`, `merge_persons` (only when the user asks or the evidence is strong — say why), `recluster_persons`.
-- Refer to items by their ids (e.g. e_1a2b3c4d5e, m_..., p_...) so the UI can link them. Keep answers concise, use short bullet lists, and state uncertainty honestly (Re-ID matches are probabilistic)."""
+MAX_CONVERSATIONS = 200
+MAX_TOOL_RESULT_CHARS = 14_000
+HISTORY_BUDGET_CHARS = 120_000
+
+SYSTEM_PROMPT = """You are OpenVocab Analyst, an assistant that investigates a private library of photos and videos.
+Every photo/video has been processed: objects were detected (open-vocabulary), people were described by a vision-language model (VLM) and grouped into identity clusters ("persons") via Re-ID.
+
+Ground rules:
+- Answer only from tool results; never invent entities, people, counts, ids or file names.
+- Whenever the user mentions an id (m_..., e_..., p_..., j_...), call a tool with it — even if it looks malformed. Never say an id does not exist, or that the library lacks something, without a tool result showing it.
+- Resolve references like "that person" / "him" / "those" from the conversation (the item most recently discussed). Ask which one only if it is genuinely ambiguous — e.g. several people tie, or a name matches several persons — especially before renaming, watchlisting or merging.
+
+Choosing tools:
+- Things already detected or described (objects, people's clothing/actions/appearance): `search` first.
+- Counting objects across the library: `stats` (label counts); `search` results are capped and are not a count.
+- Something that may not have been detected yet (e.g. "dangerous things", "all living things", a specific object): `find_in_library`, which re-scans stored media with an open-vocabulary detector (LLM-expanded vocabulary + VLM verification for abstract requests). It is slower; tell the user what was checked.
+- "What is happening in m_..." or any question about the content of one photo/video or detection: `ask_image`.
+- People: `list_persons` (order "sightings" for who appears most), `get_person`, `find_person_sightings`, `name_person`, `set_watchlist`, `merge_persons` (only when the user asks or the evidence is strong — say why), `recluster_persons`.
+
+Answers: refer to items by id (e_..., m_..., p_...) so the UI can link them; the UI already shows galleries of the returned items, so do not repeat every field. Keep answers concise with short bullet lists, and state uncertainty honestly (Re-ID matches and VLM judgements are probabilistic)."""
+
+SUMMARIZE_PROMPT = "Tool budget exhausted. Without calling more tools, summarize for the user what you found so far."
 
 
 @dataclass
 class Conversation:
     id: str
-    messages: list[dict] = field(default_factory=list)
+    messages: list[dict[str, Any]] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    @property
+    def title(self) -> str:
+        first = next((m["content"] for m in self.messages if m["role"] == "user"), "")
+        return first[:80]
 
 
 @dataclass
@@ -50,6 +77,10 @@ class ToolOutput:
     job_id: Optional[str] = None
 
 
+def _fail(message: str) -> ToolOutput:
+    return ToolOutput(message, {"error": message})
+
+
 def _obj(props: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
     return {"type": "object", "properties": props, "required": required or [], "additionalProperties": False}
 
@@ -59,12 +90,13 @@ class Agent:
         """``ctx`` is the app context (db, analyzer, search, identity, jobs, registry, store)."""
         self.ctx = ctx
         self.conversations: dict[str, Conversation] = {}
-        self.tools: dict[str, tuple[ToolSpec, Callable[..., Awaitable[ToolOutput]]]] = {}
+        self.tools: dict[str, tuple[ToolSpec, ToolFn]] = {}
+        self._turns: set[asyncio.Task] = set()  # strong refs: turns outlive their HTTP request
         self._register()
 
     # ── tool registry ─────────────────────────────────────────────────────────
-    def _tool(self, name: str, description: str, params: dict[str, Any], required: list[str] | None = None):
-        def deco(fn: Callable[..., Awaitable[ToolOutput]]):
+    def _tool(self, name: str, description: str, params: dict[str, Any], required: list[str] | None = None) -> Callable[[ToolFn], ToolFn]:
+        def deco(fn: ToolFn) -> ToolFn:
             self.tools[name] = (ToolSpec(name, description, _obj(params, required)), fn)
             return fn
 
@@ -74,44 +106,68 @@ class Agent:
         t = self._tool
         S = {"type": "string"}
         I = {"type": "integer"}
+        db = self.ctx.db
 
-        @t("search", "Hybrid search over detected entities (labels, VLM descriptions, CLIP). Returns matching detections with their media.",
+        async def person_out(person_id: str, summary: str) -> ToolOutput:
+            p = await db.get_person(person_id)
+            if p is None:
+                return _fail(f"person {person_id} not found")
+            pd = serialize.person(p)
+            return ToolOutput(summary, {"person": _compact_person(pd)}, persons=[pd])
+
+        @t("search", "Hybrid search over already-detected entities (labels, VLM descriptions of people's clothing/actions/appearance, CLIP). Returns the best matching detections with their media; results are capped, so do not use them as a count.",
            {"query": {**S, "description": "what to look for, e.g. 'man in red jacket', 'knife', 'people on bikes'"},
             "labels": {"type": "array", "items": S, "description": "optional exact detector labels to restrict to, e.g. ['person']"},
-            "media_id": S, "person_id": S, "limit": I}, ["query"])
+            "media_id": {**S, "description": "restrict to one photo/video"}, "person_id": {**S, "description": "restrict to one person"},
+            "limit": {**I, "description": "max results (default 12, max 40)"}}, ["query"])
         async def search(query: str, labels: Optional[list[str]] = None, media_id: Optional[str] = None, person_id: Optional[str] = None, limit: int = 12) -> ToolOutput:
             hits = await self.ctx.search.search(query, None, {"labels": labels, "media_id": media_id, "person_id": person_id}, min(max(limit, 1), 40))
             res = await self.ctx.search.hydrate(hits)
             ents = [r["entity"] for r in res]
             media = _uniq([r["media"] for r in res if r["media"]])
-            return ToolOutput(f"{len(ents)} result(s)", {"results": [{**serialize.compact_entity(r["entity"]), "media_name": (r["media"] or {}).get("name"), "score": r["score"]} for r in res]}, ents, media)
+            found = [{**serialize.compact_entity(r["entity"]), "media_name": (r["media"] or {}).get("name"), "score": round(r["score"], 3)} for r in res]
+            return ToolOutput(f"{len(ents)} result(s)", {"results": found}, ents, media)
 
-        @t("find_in_library", "Run a NEW open-vocabulary detection scan over stored photos/videos for anything (concrete objects or abstract categories like 'dangerous things', 'all living things', 'menacing people'). Slower than search; results are saved and become searchable.",
-           {"query": S, "media_ids": {"type": "array", "items": S, "description": "restrict to these media (default: whole library)"},
-            "limit_media": {**I, "description": "max number of most recent media to scan (default 50)"},
+        @t("find_in_library", "Run a NEW open-vocabulary detection scan over stored photos/videos for anything (concrete objects or abstract categories like 'dangerous things', 'all living things', 'menacing people'). Returns every matching detection in the scanned media (new and previously found). Slower than search; results are saved and become searchable.",
+           {"query": S, "media_ids": {"type": "array", "items": S, "description": "restrict to these media (default: the most recent media)"},
+            "limit_media": {**I, "description": "max number of most recent media to scan when media_ids is not given (default 50, max 500)"},
             "verify": {"type": "boolean", "description": "VLM-verify every candidate (default: automatic)"}}, ["query"])
         async def find_in_library(query: str, media_ids: Optional[list[str]] = None, limit_media: int = 50, verify: Optional[bool] = None) -> ToolOutput:
             from ..pipeline.analyzer import AnalyzeOptions
 
+            if media_ids:
+                known = {m["id"] for m in await db.get_media_many(media_ids)}
+                unknown = [i for i in media_ids if i not in known]
+                if unknown:
+                    return _fail(f"unknown media id(s): {', '.join(unknown)}")
+                ids = list(dict.fromkeys(media_ids))
+            else:
+                ids = await db.all_media_ids(limit=max(1, min(limit_media, 500)))
+            if not ids:
+                return _fail("the library is empty")
             opts = AnalyzeOptions(query=query, verify=verify if verify is not None else "auto", describe="none")
-            job = self.ctx.jobs.submit_scan(media_ids, opts, limit=None if media_ids else max(1, min(limit_media, 500)))
+            job = self.ctx.jobs.submit_scan(ids, opts)
             try:
                 await self.ctx.jobs.wait(job, timeout=900)
             except asyncio.TimeoutError:
                 return ToolOutput(f"scan still running (job {job.id})", {"job_id": job.id, "status": job.status, "progress": job.progress}, job_id=job.id)
-            concepts = {c["name"] for c in (job.plan or {}).get("concepts", [])}
-            ents: list[dict] = []
-            if job.media_ids:
-                rows = await self.ctx.db.media_entities_many(job.media_ids)
-                ents = [serialize.entity(r) for r in rows if r["concept"] in concepts and r["stage"] != "rejected"]
-            media = [serialize.media(m) for m in await self.ctx.db.get_media_many(job.media_ids)] if job.media_ids else []
-            data = {
-                "plan": [{"concept": c["name"], "prompts": c["prompts"][:12], "verified_by_vlm": c["verify"]} for c in (job.plan or {}).get("concepts", [])],
-                "scanned": job.summary.get("scanned"),
-                "found": [{**serialize.compact_entity(e)} for e in ents[:60]],
-                "status": job.status,
+            if job.status != "done":
+                return ToolOutput(f"scan {job.status}", {"job_id": job.id, "status": job.status, "error": job.error}, job_id=job.id)
+            concepts = (job.plan or {}).get("concepts", [])
+            ents = await self._concept_hits(ids, concepts)
+            hit_media = {e["media_id"] for e in ents}
+            media = [serialize.media(m) for m in await db.get_media_many(list(hit_media))]
+            data: dict[str, Any] = {
+                "plan": [{"concept": c["name"], "prompts": c["prompts"][:12], "verified_by_vlm": c["verify"]} for c in concepts],
+                "scanned_media": len(ids),
+                "new_candidates": job.summary.get("entities", 0),
+                "hits": len(ents),
+                "media_with_hits": len(hit_media),
+                "found": [serialize.compact_entity(e) for e in ents[:60]],
             }
-            return ToolOutput(f"scanned {job.summary.get('scanned', 0)} media, {len(ents)} hit(s)", data, ents, media, job_id=job.id)
+            if not ents and any(c.get("kind") == "person_attribute" for c in concepts):
+                data["note"] = "people detected before this scan are not re-verified by it; check them with `search` (VLM descriptions) or `ask_image`"
+            return ToolOutput(f"scanned {len(ids)} media, {len(ents)} hit(s)", data, ents, media, job_id=job.id)
 
         @t("plan_query", "Preview how a query would be expanded into detector prompts and VLM checks (no detection).", {"query": S}, ["query"])
         async def plan_query(query: str) -> ToolOutput:
@@ -122,170 +178,237 @@ class Agent:
 
         @t("list_media", "List photos/videos in the library, newest first.", {"limit": I, "offset": I, "kind": {"type": "string", "enum": ["image", "video"]}})
         async def list_media(limit: int = 20, offset: int = 0, kind: Optional[str] = None) -> ToolOutput:
-            rows = await self.ctx.db.list_media(min(limit, 100), offset, kind)
-            total = await self.ctx.db.count_media(kind)
+            rows = await db.list_media(min(max(limit, 1), 100), max(offset, 0), kind)
+            total = await db.count_media(kind)
             media = [serialize.media(r) for r in rows]
-            return ToolOutput(f"{len(media)} of {total} media", {"total": total, "media": [{k: m[k] for k in ("id", "kind", "name", "entity_count", "person_count", "query", "duration")} for m in media]}, media=media)
+            keys = ("id", "kind", "name", "entity_count", "person_count", "query", "duration")
+            return ToolOutput(f"{len(media)} of {total} media", {"total": total, "media": [{k: m[k] for k in keys if m.get(k) is not None} for m in media]}, media=media)
 
-        @t("get_media", "Get one photo/video with all its detections.", {"media_id": S}, ["media_id"])
+        @t("get_media", "Get one photo/video with all its detections (labels, VLM descriptions, linked persons).", {"media_id": S}, ["media_id"])
         async def get_media(media_id: str) -> ToolOutput:
-            m = await self.ctx.db.get_media(media_id)
+            m = await db.get_media(media_id)
             if m is None:
-                return ToolOutput("not found", {"error": "media not found"})
-            ents = [serialize.entity(e) for e in await self.ctx.db.media_entities(media_id)]
+                return _fail(f"media {media_id} not found")
+            ents = [serialize.entity(e) for e in await db.media_entities(media_id)]
             md = serialize.media(m)
-            return ToolOutput(f"{md['name']}: {len(ents)} entities", {"media": {k: md[k] for k in ("id", "kind", "name", "width", "height", "duration")}, "entities": [serialize.compact_entity(e) for e in ents if e["stage"] != "rejected"]}, ents, [md])
+            kept = [serialize.compact_entity(e) for e in ents if e["stage"] != "rejected"]
+            return ToolOutput(f"{md['name']}: {len(kept)} entities", {"media": {k: md[k] for k in ("id", "kind", "name", "width", "height", "duration")}, "entities": kept}, ents, [md])
 
-        @t("ask_image", "Ask the vision-language model a question about a photo/video (media_id) or about one detection (entity_id).",
-           {"question": S, "media_id": S, "entity_id": S, "scope": {"type": "string", "enum": ["crop", "scene"], "description": "for entity questions: crop only, or the whole scene"}}, ["question"])
+        @t("ask_image", "Ask the vision-language model a question about a photo/video (media_id) or about one detection (entity_id), e.g. 'what is happening here?'. Give exactly one of media_id or entity_id.",
+           {"question": S, "media_id": S, "entity_id": S, "scope": {"type": "string", "enum": ["crop", "scene"], "description": "for entity questions: the crop only (default), or the whole scene"}}, ["question"])
         async def ask_image(question: str, media_id: Optional[str] = None, entity_id: Optional[str] = None, scope: str = "crop") -> ToolOutput:
             if entity_id:
+                rows = await db.get_entities([entity_id])
+                if not rows:
+                    return _fail(f"entity {entity_id} not found")
                 ans = await self.ctx.analyzer.ask_entity(entity_id, question, scope)
-                rows = await self.ctx.db.get_entities([entity_id])
                 return ToolOutput(ans[:120], {"answer": ans}, [serialize.entity(r) for r in rows])
             if media_id:
+                m = await db.get_media(media_id)
+                if m is None:
+                    return _fail(f"media {media_id} not found")
                 ans = await self.ctx.analyzer.ask_media(media_id, question)
-                m = await self.ctx.db.get_media(media_id)
-                return ToolOutput(ans[:120], {"answer": ans}, media=[serialize.media(m)] if m else [])
-            return ToolOutput("need media_id or entity_id", {"error": "provide media_id or entity_id"})
+                return ToolOutput(ans[:120], {"answer": ans}, media=[serialize.media(m)])
+            return _fail("provide media_id or entity_id")
 
         @t("list_persons", "List identity clusters (people seen across media).",
-           {"query": {**S, "description": "filter by name/notes"}, "watchlist": {"type": "boolean"}, "order": {"type": "string", "enum": ["recent", "sightings"]}, "limit": I})
+           {"query": {**S, "description": "filter by name/notes"}, "watchlist": {"type": "boolean", "description": "only watchlisted persons"},
+            "order": {"type": "string", "enum": ["recent", "sightings"], "description": "default: sightings (most seen first)"}, "limit": I})
         async def list_persons(query: Optional[str] = None, watchlist: bool = False, order: str = "sightings", limit: int = 20) -> ToolOutput:
-            rows, total = await self.ctx.db.list_persons(watchlist, query, min(limit, 100), 0, order)
+            rows, total = await db.list_persons(watchlist, query or None, min(max(limit, 1), 100), 0, order)
             ps = [serialize.person(r) for r in rows]
             return ToolOutput(f"{len(ps)} of {total} person(s)", {"total": total, "persons": [_compact_person(p) for p in ps]}, persons=ps)
 
-        @t("get_person", "Get a person cluster with all sightings.", {"person_id": S}, ["person_id"])
+        @t("get_person", "Get a person cluster with its sightings (VLM descriptions per sighting).", {"person_id": S}, ["person_id"])
         async def get_person(person_id: str) -> ToolOutput:
-            p = await self.ctx.db.get_person(person_id)
+            p = await db.get_person(person_id)
             if p is None:
-                return ToolOutput("not found", {"error": "person not found"})
-            sights = [serialize.entity(r) for r in await self.ctx.db.person_sightings(person_id, 100)]
+                return _fail(f"person {person_id} not found")
+            sights = [serialize.entity(r) for r in await db.person_sightings(person_id, 100)]
             pd = serialize.person(p)
             return ToolOutput(f"{pd['label'] or person_id}: {len(sights)} sighting(s)", {"person": _compact_person(pd), "sightings": [serialize.compact_entity(e) for e in sights[:40]]}, sights, persons=[pd])
 
         @t("name_person", "Give a person cluster a name/label (and optional notes).", {"person_id": S, "name": S, "notes": S}, ["person_id", "name"])
         async def name_person(person_id: str, name: str, notes: Optional[str] = None) -> ToolOutput:
-            ok = await self.ctx.db.update_person(person_id, label=name, notes=notes)
-            p = await self.ctx.db.get_person(person_id)
-            return ToolOutput("named" if ok else "not found", {"ok": ok}, persons=[serialize.person(p)] if p else [])
+            if not await db.update_person(person_id, label=name, notes=notes):
+                return _fail(f"person {person_id} not found")
+            return await person_out(person_id, f"named {name}")
 
-        @t("set_watchlist", "Add or remove a person from the watchlist.", {"person_id": S, "on": {"type": "boolean"}}, ["person_id", "on"])
+        @t("set_watchlist", "Add (on=true) or remove (on=false) a person from the watchlist.", {"person_id": S, "on": {"type": "boolean"}}, ["person_id", "on"])
         async def set_watchlist(person_id: str, on: bool) -> ToolOutput:
-            ok = await self.ctx.db.update_person(person_id, is_watchlist=on)
-            p = await self.ctx.db.get_person(person_id)
-            return ToolOutput("updated" if ok else "not found", {"ok": ok}, persons=[serialize.person(p)] if p else [])
+            if not await db.update_person(person_id, is_watchlist=on):
+                return _fail(f"person {person_id} not found")
+            return await person_out(person_id, "added to watchlist" if on else "removed from watchlist")
 
-        @t("merge_persons", "Merge person `other_id` into `keep_id` (same individual).", {"keep_id": S, "other_id": S}, ["keep_id", "other_id"])
+        @t("merge_persons", "Merge person `other_id` into `keep_id` (they are the same individual). Irreversible.", {"keep_id": S, "other_id": S}, ["keep_id", "other_id"])
         async def merge_persons(keep_id: str, other_id: str) -> ToolOutput:
-            ok = await self.ctx.db.merge_persons(keep_id, other_id)
-            p = await self.ctx.db.get_person(keep_id)
-            return ToolOutput("merged" if ok else "merge failed", {"ok": ok}, persons=[serialize.person(p)] if p else [])
+            if keep_id == other_id:
+                return _fail("keep_id and other_id are the same person")
+            missing = [i for i in (keep_id, other_id) if await db.get_person(i) is None]
+            if missing:
+                return _fail(f"person(s) not found: {', '.join(missing)}")
+            if not await db.merge_persons(keep_id, other_id):
+                return _fail("merge failed")
+            return await person_out(keep_id, f"merged {other_id} into {keep_id}")
 
         @t("recluster_persons", "Re-run identity clustering over all person sightings (named people are kept as anchors).", {"threshold": {"type": "number", "description": "cosine threshold; lower merges more"}})
         async def recluster_persons(threshold: Optional[float] = None) -> ToolOutput:
             space = self.ctx.reid_space()
             if not space:
-                return ToolOutput("Re-ID unavailable", {"error": "no Re-ID model"})
+                return _fail("Re-ID is unavailable (no Re-ID model)")
             res = await self.ctx.identity.recluster(space, threshold)
-            rows, _ = await self.ctx.db.list_persons(False, None, 30, 0, "sightings")
+            rows, _ = await db.list_persons(False, None, 30, 0, "sightings")
             ps = [serialize.person(r) for r in rows]
             return ToolOutput(f"{res['persons']} person(s), {res['changed']} change(s)", {**res, "top_persons": [_compact_person(p) for p in ps]}, persons=ps)
 
-        @t("find_person_sightings", "Find where a person appears, by person id or by name.", {"person_id": S, "name": S})
+        @t("find_person_sightings", "Find where a person appears (photos/videos and sightings), by person id or by name.", {"person_id": S, "name": S})
         async def find_person_sightings(person_id: Optional[str] = None, name: Optional[str] = None) -> ToolOutput:
             if not person_id and name:
-                rows, _ = await self.ctx.db.list_persons(False, name, 5, 0)
-                if not rows:
-                    return ToolOutput("no such person", {"error": f"no person named {name!r}"})
-                person_id = rows[0]["id"]
+                rows, _ = await db.list_persons(False, name, 10, 0)
+                exact = [r for r in rows if (r["label"] or "").casefold() == name.casefold()]
+                matches = exact or rows
+                if not matches:
+                    return _fail(f"no person named {name!r}")
+                if len(matches) > 1:
+                    ps = [serialize.person(r) for r in matches]
+                    return ToolOutput(f"{len(ps)} persons match {name!r}", {"error": "ambiguous name, ask the user which one", "candidates": [_compact_person(p) for p in ps]}, persons=ps)
+                person_id = matches[0]["id"]
             if not person_id:
-                return ToolOutput("need person_id or name", {"error": "provide person_id or name"})
-            sights = [serialize.entity(r) for r in await self.ctx.db.person_sightings(person_id, 200)]
-            media = [serialize.media(m) for m in await self.ctx.db.get_media_many(list({e["media_id"] for e in sights}))]
-            return ToolOutput(f"{len(sights)} sighting(s) in {len(media)} media", {"person_id": person_id, "media": [{"id": m["id"], "name": m["name"], "kind": m["kind"]} for m in media], "sightings": [serialize.compact_entity(e) for e in sights[:50]]}, sights, media)
+                return _fail("provide person_id or name")
+            p = await db.get_person(person_id)
+            if p is None:
+                return _fail(f"person {person_id} not found")
+            pd = serialize.person(p)
+            sights = [serialize.entity(r) for r in await db.person_sightings(person_id, 200)]
+            media = [serialize.media(m) for m in await db.get_media_many(list({e["media_id"] for e in sights}))]
+            data = {"person": _compact_person(pd), "media": [{"id": m["id"], "name": m["name"], "kind": m["kind"]} for m in media], "sightings": [serialize.compact_entity(e) for e in sights[:50]]}
+            return ToolOutput(f"{len(sights)} sighting(s) in {len(media)} media", data, sights, media, [pd])
 
-        @t("stats", "Library statistics: counts and most common labels.", {})
+        @t("stats", "Library statistics: media/entity/person counts and the count of every detected label.", {})
         async def stats() -> ToolOutput:
-            st = await self.ctx.db.stats()
+            st = await db.stats()
             return ToolOutput(f"{st['media']} media, {st['entities']} entities, {st['persons']} persons", st)
 
         @t("analyze_paths", "Ingest photos/videos from server-side files or folders (runs the full pipeline).",
-           {"paths": {"type": "array", "items": S}, "query": {**S, "description": "optional open-vocabulary query"}, "wait": {"type": "boolean"}}, ["paths"])
+           {"paths": {"type": "array", "items": S}, "query": {**S, "description": "optional open-vocabulary query"}, "wait": {"type": "boolean", "description": "wait for completion (default true)"}}, ["paths"])
         async def analyze_paths(paths: list[str], query: Optional[str] = None, wait: bool = True) -> ToolOutput:
             from ..pipeline.analyzer import AnalyzeOptions
 
             items = self.ctx.jobs.collect_paths(paths)
             if not items:
-                return ToolOutput("no media found", {"error": "no images/videos at those paths"})
+                return _fail("no images/videos at those paths")
             job = self.ctx.jobs.submit_analyze(items, AnalyzeOptions(query=query))
             if wait:
                 try:
                     await self.ctx.jobs.wait(job, timeout=1800)
                 except asyncio.TimeoutError:
                     pass
-            media = [serialize.media(m) for m in await self.ctx.db.get_media_many(job.media_ids)] if job.media_ids else []
-            return ToolOutput(f"job {job.id}: {job.status}, {len(job.media_ids)}/{len(items)} done", {"job": {k: v for k, v in job.to_dict().items() if k in ("id", "status", "progress", "summary", "error")}}, media=media, job_id=job.id)
+            media = [serialize.media(m) for m in await db.get_media_many(job.media_ids)] if job.media_ids else []
+            info = {k: v for k, v in job.to_dict().items() if k in ("id", "status", "progress", "summary", "error")}
+            return ToolOutput(f"job {job.id}: {job.status}, {len(job.media_ids)}/{len(items)} done", {"job": info}, media=media, job_id=job.id)
 
         @t("job_status", "Status of a background job.", {"job_id": S}, ["job_id"])
         async def job_status(job_id: str) -> ToolOutput:
             job = self.ctx.jobs.get(job_id)
             if job is None:
-                return ToolOutput("not found", {"error": "job not found"})
+                return _fail(f"job {job_id} not found")
             return ToolOutput(job.status, {k: v for k, v in job.to_dict().items() if k in ("id", "status", "progress", "summary", "error", "media_ids")}, job_id=job_id)
 
-    # ── conversation loop ─────────────────────────────────────────────────────
+    async def _concept_hits(self, media_ids: list[str], concepts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Accepted detections of a plan's concepts in ``media_ids``, including earlier ones:
+        entities tagged with a concept name, or (for unverified concepts) carrying one of its prompts as label."""
+        names = {c["name"] for c in concepts}
+        labels = {p.casefold() for c in concepts if not c["verify"] for p in c["prompts"]}
+        rows = await self.ctx.db.media_entities_many(media_ids)
+        return [serialize.entity(r) for r in rows if r["stage"] != "rejected" and (r["concept"] in names or r["label"].casefold() in labels)]
+
+    # ── conversations ─────────────────────────────────────────────────────────
     def get_conversation(self, cid: Optional[str]) -> Conversation:
+        """Return conversation ``cid``, or start one (under ``cid`` when given, e.g. after a restart)."""
         if cid and cid in self.conversations:
             return self.conversations[cid]
         conv = Conversation(id=cid or new_id("c"))
         conv.messages.append({"role": "system", "content": SYSTEM_PROMPT})
         self.conversations[conv.id] = conv
-        if len(self.conversations) > 200:
-            oldest = min(self.conversations.values(), key=lambda c: c.created_at)
+        idle = [c for c in self.conversations.values() if not c.lock.locked() and c is not conv]
+        while len(self.conversations) > MAX_CONVERSATIONS and idle:
+            oldest = min(idle, key=lambda c: c.updated_at)
+            idle.remove(oldest)
             self.conversations.pop(oldest.id, None)
         return conv
 
-    async def run(self, conv: Conversation, text: str, llm: ChatModel, emit: Callable[..., Awaitable[None]], max_steps: int = 12) -> None:
-        async with conv.lock:
-            conv.messages.append({"role": "user", "content": text})
-            specs = [spec for spec, _ in self.tools.values()]
-            for step in range(max_steps):
-                resp = await llm.chat(_trim(conv.messages), specs, max_tokens=1500)
-                conv.messages.append({"role": "assistant", "content": resp.text, "tool_calls": resp.tool_calls})
-                if resp.text:
-                    await emit("message", text=resp.text)
-                if not resp.tool_calls:
-                    return
-                outs = await asyncio.gather(*(self._call(tc, emit) for tc in resp.tool_calls))
-                for tc, out in zip(resp.tool_calls, outs):
-                    conv.messages.append({"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": out})
-            final = await llm.chat(_trim(conv.messages) + [{"role": "user", "content": "Summarize what you found so far for the user."}], None, max_tokens=800)
-            conv.messages.append({"role": "assistant", "content": final.text})
-            await emit("message", text=final.text)
+    def list_conversations(self) -> list[dict[str, Any]]:
+        convs = sorted(self.conversations.values(), key=lambda c: c.updated_at, reverse=True)
+        return [
+            {"id": c.id, "title": c.title, "created_at": c.created_at, "updated_at": c.updated_at, "message_count": sum(m["role"] in ("user", "assistant") for m in c.messages)}
+            for c in convs
+        ]
 
-    async def _call(self, tc: ToolCall, emit: Callable[..., Awaitable[None]]) -> str:
-        await emit("tool_call", id=tc.id, name=tc.name, arguments=tc.arguments)
-        entry = self.tools.get(tc.name)
-        t0 = time.perf_counter()
-        if entry is None:
-            out = ToolOutput("unknown tool", {"error": f"unknown tool {tc.name}"})
-        else:
+    def start_turn(self, conv: Conversation, text: str, llm: ChatModel, emit: Emit) -> asyncio.Task:
+        """Run one turn as an independent task (it survives client disconnects)."""
+        task = asyncio.create_task(self.run(conv, text, llm, emit))
+        self._turns.add(task)
+        task.add_done_callback(self._turns.discard)
+        return task
+
+    async def run(self, conv: Conversation, text: str, llm: ChatModel, emit: Emit, max_steps: int = 12) -> None:
+        async with conv.lock:
+            _close_dangling_tool_calls(conv.messages)
+            conv.messages.append({"role": "user", "content": text})
+            conv.updated_at = time.time()
+            specs = [spec for spec, _ in self.tools.values()]
             try:
-                args = {k: v for k, v in (tc.arguments or {}).items() if v is not None and not k.startswith("_")}
-                out = await entry[1](**args)
-            except TypeError as e:
-                out = ToolOutput("bad arguments", {"error": f"bad arguments: {e}"})
-            except Exception as e:
-                log.exception("tool %s failed", tc.name)
-                out = ToolOutput(f"error: {e}", {"error": str(e)})
+                for _ in range(max_steps):
+                    resp = await llm.chat(_trim(conv.messages), specs, max_tokens=1500)
+                    conv.messages.append({"role": "assistant", "content": resp.text, "tool_calls": resp.tool_calls})
+                    if resp.text:
+                        await emit("message", text=resp.text)
+                    if not resp.tool_calls:
+                        if not resp.text:
+                            await emit("error", message=f"{llm.spec} returned an empty reply")
+                        return
+                    outs = await asyncio.gather(*(self._call(tc, emit) for tc in resp.tool_calls))
+                    for tc, out in zip(resp.tool_calls, outs):
+                        conv.messages.append({"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": out})
+                # Tools stay declared (providers such as Anthropic reject tool blocks without them);
+                # any further tool calls are ignored.
+                final = await llm.chat(_trim(conv.messages) + [{"role": "user", "content": SUMMARIZE_PROMPT}], specs, max_tokens=800)
+                summary = final.text or "I ran out of tool steps before reaching an answer."
+                conv.messages.append({"role": "assistant", "content": summary})
+                await emit("message", text=summary)
+            finally:
+                conv.updated_at = time.time()
+
+    async def _call(self, tc: ToolCall, emit: Emit) -> str:
+        await emit("tool_call", id=tc.id, name=tc.name, arguments=tc.arguments)
+        t0 = time.perf_counter()
+        out = await self._invoke(tc)
         await emit(
             "tool_result", id=tc.id, name=tc.name, summary=out.summary, elapsed=round(time.perf_counter() - t0, 2),
             entities=out.entities[:60], media=out.media[:40], persons=out.persons[:40], job_id=out.job_id,
         )
         payload = json.dumps(out.data, default=str)
-        return payload[:14000] + ("…(truncated)" if len(payload) > 14000 else "")
+        return payload if len(payload) <= MAX_TOOL_RESULT_CHARS else payload[:MAX_TOOL_RESULT_CHARS] + "…(truncated)"
+
+    async def _invoke(self, tc: ToolCall) -> ToolOutput:
+        entry = self.tools.get(tc.name)
+        if entry is None:
+            return _fail(f"unknown tool {tc.name!r}")
+        fn = entry[1]
+        if "_raw" in (tc.arguments or {}):
+            return _fail("arguments were not valid JSON")
+        args = {k: v for k, v in (tc.arguments or {}).items() if v is not None}
+        try:
+            inspect.signature(fn).bind(**args)
+        except TypeError as e:
+            return _fail(f"bad arguments: {e}")
+        try:
+            return await fn(**args)
+        except KeyError as e:
+            return _fail(f"not found: {e.args[0] if e.args else e}")
+        except Exception as e:
+            log.exception("tool %s failed", tc.name)
+            return _fail(f"{type(e).__name__}: {e}")
 
     def transcript(self, conv: Conversation) -> list[dict[str, Any]]:
         out = []
@@ -302,21 +425,53 @@ class Agent:
         return out
 
 
-def _trim(messages: list[dict], max_chars: int = 120_000) -> list[dict]:
-    """Keep the system prompt and the most recent messages within a character budget,
-    never starting the window on a tool result (it must follow its assistant tool call)."""
-    total = 0
-    keep: list[dict] = []
-    for m in reversed(messages[1:]):
-        size = len(m["content"]) if isinstance(m.get("content"), str) else 500
-        if total + size > max_chars and keep:
+def _close_dangling_tool_calls(messages: list[dict[str, Any]]) -> None:
+    """Give every assistant tool call a tool result (a turn may have been interrupted between
+    the two); providers reject transcripts with unanswered tool calls."""
+    out: list[dict[str, Any]] = []
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        out.append(m)
+        i += 1
+        calls: list[ToolCall] = m.get("tool_calls") or []
+        if not calls:
+            continue
+        answered: set[str] = set()
+        while i < len(messages) and messages[i]["role"] == "tool":
+            answered.add(messages[i]["tool_call_id"])
+            out.append(messages[i])
+            i += 1
+        for tc in calls:
+            if tc.id not in answered:
+                out.append({"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": json.dumps({"error": "interrupted before the tool finished"})})
+    messages[:] = out
+
+
+def _trim(messages: list[dict[str, Any]], max_chars: int = HISTORY_BUDGET_CHARS) -> list[dict[str, Any]]:
+    """The system prompt plus the longest run of whole recent turns within a character budget.
+
+    The window always starts at a user message (so tool results stay with their assistant tool
+    call, and providers that require a leading user turn are satisfied) and always includes the
+    current turn, even when that alone exceeds the budget."""
+    system, rest = messages[0], messages[1:]
+    turn_starts = [i for i, m in enumerate(rest) if m["role"] == "user"]
+    if not turn_starts:
+        return messages
+    start = turn_starts[-1]
+    size = sum(_size(m) for m in rest[start:])
+    for prev in reversed(turn_starts[:-1]):
+        size += sum(_size(m) for m in rest[prev:start])
+        if size > max_chars:
             break
-        keep.append(m)
-        total += size
-    keep.reverse()
-    while keep and keep[0]["role"] == "tool":
-        keep.pop(0)
-    return [messages[0]] + keep
+        start = prev
+    return [system] + rest[start:]
+
+
+def _size(m: dict[str, Any]) -> int:
+    content = m.get("content")
+    n = len(content) if isinstance(content, str) else 500
+    return n + sum(len(json.dumps(tc.arguments, default=str)) for tc in m.get("tool_calls") or [])
 
 
 def _uniq(items: list[dict]) -> list[dict]:

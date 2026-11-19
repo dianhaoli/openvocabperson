@@ -4,7 +4,7 @@ data/
 *.db-journal
 
 # Storage (images)
-storage/
+/storage/
 
 # Environment variables
 .env
@@ -44,4 +44,3 @@ frontend/dist/
 # model weights / caches
 mobileclip*.ts
 *.engine
-storage/

@@ -37,6 +37,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setHealth: (health, error) => dispatch({ type: 'setHealth', health, error }),
       bumpPersons: () => dispatch({ type: 'bumpPersons' }),
       bumpLibrary: () => dispatch({ type: 'bumpLibrary' }),
+      setProcessing: (mediaIds, processing) => dispatch({ type: 'setProcessing', mediaIds, processing }),
     };
   }, []);
 

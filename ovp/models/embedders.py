@@ -297,7 +297,7 @@ class ColorReID(ReIDModel):
     def describe(cls, img: Image.Image) -> np.ndarray:
         import cv2
 
-        arr = np.asarray(img.convert("RGB").resize((64, 128), Image.BILINEAR))
+        arr = np.asarray(img.convert("RGB").resize((64, 128), Image.Resampling.BILINEAR))
         hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
         feats = []
         h = hsv.shape[0]

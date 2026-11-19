@@ -47,7 +47,7 @@ export function PersonPicker({ open, title, excludeId, allowNew, busy, onPick, o
               onClick={() => onPick(p.id)}
               className="flex flex-col items-center gap-1 p-2 rounded-xl border border-border bg-bg-card hover:border-accent transition-colors disabled:opacity-50"
             >
-              <Img src={p.thumb_url ?? undefined} alt="" className="w-16 h-16 rounded-lg object-cover" />
+              <Img src={p.thumb_url ?? undefined} alt="" className="w-16 h-16 rounded-lg object-cover object-top" />
               <span className="text-[11px] truncate max-w-full">{personName(p)}</span>
               <span className="text-[10px] text-text-muted">
                 {p.sighting_count} sightings{p.is_watchlist ? ' · ★' : ''}

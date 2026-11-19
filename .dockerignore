@@ -1,39 +1,30 @@
-# Python
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.Python
-*.egg-info
-.eggs
-*.egg
-.venv
-venv
-env
-
-# IDE
-.idea
-.vscode
-*.swp
-*.swo
-
-# Git
+# Only app.py, ovp/, requirements*.txt and frontend/ (sources) are needed in the build context.
 .git
-.gitignore
-
-# Frontend (built separately)
-frontend
-
-# Storage (mounted as volume)
-storage
-
-# Models (downloaded at runtime or mounted)
-*.pt
-*.pth
-
-# Misc
-*.md
+.github
 .env
 .env.*
+**/__pycache__
+**/*.pyc
+.venv
+venv
+.pytest_cache
+.ipynb_checkpoints
+*.ipynb
 *.log
 
+# frontend: dependencies and build output are produced inside the image
+frontend/node_modules
+frontend/dist
+
+# runtime data and model weights (mounted as volumes)
+storage
+weights
+*.pt
+*.pth
+*.onnx
+*.engine
+mobileclip*.ts
+
+tests
+docs
+*.md

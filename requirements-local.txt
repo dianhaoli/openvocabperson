@@ -1,0 +1,10 @@
+# Optional: fully local models (no cloud keys needed).
+#   qwen:Qwen/Qwen2.5-VL-3B-Instruct    local VLM (descriptions, verification, Q&A) - use a GPU
+#   owlv2:... / grounding-dino:...      Hugging Face open-vocabulary detectors
+#   st:all-MiniLM-L6-v2                 local text embeddings for semantic search
+-r requirements.txt
+transformers>=4.49
+accelerate>=0.33
+sentence-transformers>=3.0
+# OVP_VLM_QUANT=8bit|4bit (CUDA only)
+bitsandbytes>=0.43; sys_platform == "linux"

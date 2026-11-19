@@ -14,6 +14,8 @@ All local inference runs on the device thread (see ``runtime.py``).
 from __future__ import annotations
 
 import logging
+import math
+import tempfile
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -49,8 +51,12 @@ COCO_SYNONYMS = {
 }
 
 
+MIN_PART_FRACTION = 0.03  # mask fragments smaller than this share of the largest part are speckle
+MIN_PART_PIXELS = 16.0
+
+
 def simplify_polygons(polys: Iterable[np.ndarray], max_polys: int = 4, min_points: int = 3) -> list[Polygon]:
-    """Douglas-Peucker simplify, keep the largest few contours, round to 1 decimal."""
+    """Douglas-Peucker simplify, keep the largest few contours (dropping speckle), round to 1 decimal."""
     import cv2
 
     out: list[tuple[float, Polygon]] = []
@@ -64,8 +70,11 @@ def simplify_polygons(polys: Iterable[np.ndarray], max_polys: int = 4, min_point
             continue
         area = float(cv2.contourArea(approx))
         out.append((area, [[round(float(x), 1), round(float(y), 1)] for x, y in approx]))
+    if not out:
+        return []
     out.sort(key=lambda x: x[0], reverse=True)
-    return [p for _, p in out[:max_polys]]
+    min_area = max(MIN_PART_PIXELS, out[0][0] * MIN_PART_FRACTION)
+    return [p for i, (area, p) in enumerate(out[:max_polys]) if i == 0 or area >= min_area]
 
 
 def mask_to_polygons(mask: np.ndarray, scale_x: float = 1.0, scale_y: float = 1.0) -> tuple[list[Polygon], int]:
@@ -103,6 +112,33 @@ def _ul_device() -> str:
     return "0" if d == "cuda" else d
 
 
+TRACK_LOST_SECONDS = 2.0  # how long ByteTrack keeps a lost track alive; longer gaps are re-joined by Re-ID stitching
+
+
+def _bytetrack_config(sample_fps: float, conf: float) -> tuple[str, float]:
+    """A ByteTrack config for the *sampled* frame rate and detection threshold.
+
+    Ultralytics' defaults assume every frame of a ~30 fps video (track_buffer=30 frames ≈ 1 s) and a
+    fixed 0.25 track threshold. At 2 fps sampling the default would keep lost tracks for 15 s and
+    hand a vanished person's ID to whoever appears near the predicted box. Returns the YAML path and
+    the (lower) detector confidence that feeds ByteTrack's second, low-score association stage.
+    """
+    buffer = max(2, math.ceil(TRACK_LOST_SECONDS * sample_fps))
+    low = round(max(0.05, conf * 0.4), 3)
+    conf = round(conf, 3)
+    path = Path(tempfile.gettempdir()) / "ovp-trackers" / f"bytetrack-b{buffer}-c{conf}.yaml"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{threading.get_ident()}.tmp")
+        tmp.write_text(
+            "tracker_type: bytetrack\n"
+            f"track_high_thresh: {conf}\ntrack_low_thresh: {low}\nnew_track_thresh: {conf}\n"
+            f"track_buffer: {buffer}\nmatch_thresh: 0.8\nfuse_score: True\n"
+        )
+        tmp.replace(path)
+    return str(path), low
+
+
 class Detector:
     kind = "base"
     open_vocab = False
@@ -129,6 +165,9 @@ class Detector:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+PE_CACHE_SIZE = 2048  # YOLOE prompt embeddings kept in memory (a few KB each)
+
+
 class UltralyticsDetector(Detector):
     supports_tracking = True
 
@@ -136,12 +175,12 @@ class UltralyticsDetector(Detector):
         super().__init__(weights)
         self.kind = kind
         self.open_vocab = kind in ("yoloe", "yolo-world")
-        self.supports_masks = kind == "yoloe" and "-seg" in weights or (kind == "yolo" and "-seg" in weights)
+        self.supports_masks = kind in ("yoloe", "yolo") and "-seg" in weights
         self.weights_dir = weights_dir
         self.max_det = max_det
-        self._model = None
+        self._model: Any = None
         self._classes: Optional[tuple[str, ...]] = None
-        self._pe_cache: "OrderedDict[tuple[str, ...], Any]" = OrderedDict()
+        self._pe_cache: "OrderedDict[str, Any]" = OrderedDict()  # YOLOE text embedding per prompt
         self._lock = threading.RLock()
 
     def _path(self) -> str:
@@ -154,16 +193,11 @@ class UltralyticsDetector(Detector):
     def _load(self) -> Any:
         with self._lock:
             if self._model is None:
-                from ultralytics import YOLO
+                from ultralytics import YOLO, YOLOE, YOLOWorld
 
-                if self.kind == "yoloe":
-                    from ultralytics import YOLOE as Cls
-                elif self.kind == "yolo-world":
-                    from ultralytics import YOLOWorld as Cls
-                else:
-                    Cls = YOLO
+                model_cls: type[Any] = {"yoloe": YOLOE, "yolo-world": YOLOWorld}.get(self.kind, YOLO)
                 log.info("loading detector %s", self.spec)
-                self._model = Cls(self._path())
+                self._model = model_cls(self._path())
             return self._model
 
     def _set_vocab(self, prompts: Optional[list[str]]) -> Optional[set[str]]:
@@ -179,21 +213,36 @@ class UltralyticsDetector(Detector):
                 if key in COCO_CLASSES:
                     allowed.add(key)
             return allowed
-        names = tuple(prompts or COCO_CLASSES)
+        names = tuple(dict.fromkeys(p.strip() for p in prompts or () if p.strip())) or tuple(COCO_CLASSES)
         if names == self._classes:
             return None
         if self.kind == "yoloe":
-            pe = self._pe_cache.get(names)
-            if pe is None:
-                pe = model.get_text_pe(list(names))
-                self._pe_cache[names] = pe
-                while len(self._pe_cache) > 32:
-                    self._pe_cache.popitem(last=False)
-            model.set_classes(list(names), pe)
+            model.set_classes(list(names), self._text_embeddings(model, names))
         else:
             model.set_classes(list(names))
         self._classes = names
         return None
+
+    def _class_ids(self, allowed: Optional[set[str]]) -> Optional[list[int]]:
+        """Class indices for a closed-set label whitelist (None = all classes)."""
+        if allowed is None:
+            return None
+        return sorted(i for i, name in self._model.names.items() if name in allowed)
+
+    def _text_embeddings(self, model: Any, names: tuple[str, ...]) -> Any:
+        """YOLOE prompt embeddings, cached per prompt so overlapping vocabularies only embed new words."""
+        import torch
+
+        missing = [n for n in names if n not in self._pe_cache]
+        if missing:
+            fresh = model.get_text_pe(missing)  # (1, len(missing), dim)
+            for i, name in enumerate(missing):
+                self._pe_cache[name] = fresh[0, i]
+        for name in names:
+            self._pe_cache.move_to_end(name)
+        while len(self._pe_cache) > PE_CACHE_SIZE:
+            self._pe_cache.popitem(last=False)
+        return torch.stack([self._pe_cache[n] for n in names])[None]
 
     def _parse(self, r: Any, allowed: Optional[set[str]], track: bool = False) -> list[Detection]:
         dets: list[Detection] = []
@@ -228,7 +277,9 @@ class UltralyticsDetector(Detector):
             if allowed is not None and not allowed:
                 return []
             bgr = np.ascontiguousarray(np.asarray(image.convert("RGB"))[:, :, ::-1])
-            r = self._model.predict(bgr, conf=conf, iou=0.5, max_det=self.max_det, device=_ul_device(), verbose=False)[0]
+            r = self._model.predict(
+                bgr, conf=conf, iou=0.5, max_det=self.max_det, classes=self._class_ids(allowed), device=_ul_device(), verbose=False
+            )[0]
             return self._parse(r, allowed)
 
     async def detect(self, image: Image.Image, prompts: Optional[list[str]], conf: float) -> list[Detection]:
@@ -241,26 +292,33 @@ class UltralyticsDetector(Detector):
         conf: float,
         on_frame: Callable[[int, float, np.ndarray, list[Detection]], None],
         should_stop: Callable[[], bool] = lambda: False,
+        sample_fps: float = 30.0,
     ) -> None:
-        """Run ByteTrack over BGR frames. ``on_frame`` gets every frame's tracked detections."""
+        """Run ByteTrack over sampled BGR frames. ``on_frame`` gets every frame's tracked detections.
+
+        The tracker is re-created on the first frame of every call (``persist=False``), so no
+        state leaks between videos, and the shared predictor stays usable for plain ``predict``.
+        """
         with self._lock:
             allowed = self._set_vocab(prompts)
-            model = self._model
-            first = True
-            for idx, t, frame in frames:
-                if should_stop():
-                    break
-                r = model.track(frame, persist=not first, conf=conf, iou=0.5, max_det=self.max_det, tracker="bytetrack.yaml", device=_ul_device(), verbose=False)[0]
-                first = False
-                on_frame(idx, t, frame, self._parse(r, allowed, track=True))
-            # reset tracker state for the next video
+            if allowed is not None and not allowed:
+                return
+            model = self._load()
+            classes = self._class_ids(allowed)
+            tracker, low_conf = _bytetrack_config(sample_fps, conf)
             try:
-                if getattr(model, "predictor", None) is not None:
-                    model.predictor.trackers = None  # type: ignore[attr-defined]
-                    model.predictor = None
-                    self._classes = None if self.open_vocab else self._classes
-            except Exception:
-                pass
+                for i, (idx, t, frame) in enumerate(frames):
+                    if should_stop():
+                        break
+                    r = model.track(
+                        frame, persist=i > 0, conf=low_conf, iou=0.5, max_det=self.max_det, classes=classes,
+                        tracker=tracker, device=_ul_device(), verbose=False,
+                    )[0]
+                    on_frame(idx, t, frame, self._parse(r, allowed, track=True))
+            finally:
+                predictor = getattr(model, "predictor", None)
+                if predictor is not None:
+                    predictor.trackers = []  # drop the finished video's track state (frames, Kalman filters)
 
     async def warmup(self) -> None:
         await get_runtime().run_model(self._detect_sync, Image.new("RGB", (64, 64)), None, 0.5)
@@ -277,8 +335,8 @@ class HFZeroShotDetector(Detector):
     def __init__(self, kind: str, weights: str):
         super().__init__(weights)
         self.kind = kind
-        self._model = None
-        self._processor = None
+        self._model: Any = None
+        self._processor: Any = None
 
     def _load(self) -> None:
         if self._model is not None:
@@ -344,10 +402,17 @@ class VLMGroundingDetector(Detector):
         labels = list(prompts or ["person"])
         w, h = image.size
         gemini = self.vlm.provider == "gemini"
+        # Coordinate convention per model family: Gemini answers [ymin, xmin, ymax, xmax] on a 0-1000 grid;
+        # Qwen2/2.5-VL were trained on absolute pixels of their resized input; everything else gets 0-1000.
+        pixel_frame = await self.vlm.grounding_frame(image) if hasattr(self.vlm, "grounding_frame") else None
         if gemini:
             fmt = 'Return a JSON list like [{"label": "...", "box_2d": [ymin, xmin, ymax, xmax], "confidence": 0.0-1.0}] with coordinates normalized to 0-1000.'
+        elif pixel_frame:
+            fmt = (f'Return JSON {{"objects": [{{"label": "...", "bbox_2d": [x1, y1, x2, y2], "confidence": 0.0-1.0}}]}} '
+                   f"with absolute pixel coordinates in the {pixel_frame[0]}x{pixel_frame[1]} image.")
         else:
             fmt = 'Return JSON {"objects": [{"label": "...", "box": [x1, y1, x2, y2], "confidence": 0.0-1.0}]} with coordinates normalized to 0-1000 (0,0 = top-left).'
+        sx, sy = (w / pixel_frame[0], h / pixel_frame[1]) if pixel_frame else (w / 1000, h / 1000)
         prompt = (
             "Detect every instance of the following in the image: "
             + ", ".join(labels)
@@ -364,8 +429,8 @@ class VLMGroundingDetector(Detector):
                 if "box_2d" in it:
                     y1, x1, y2, x2 = [float(v) for v in it["box_2d"]]
                 else:
-                    x1, y1, x2, y2 = [float(v) for v in it["box"]]
-                box = (x1 / 1000 * w, y1 / 1000 * h, x2 / 1000 * w, y2 / 1000 * h)
+                    x1, y1, x2, y2 = [float(v) for v in it.get("bbox_2d") or it["box"]]
+                box = (x1 * sx, y1 * sy, x2 * sx, y2 * sy)
                 box = (max(0, min(box[0], box[2])), max(0, min(box[1], box[3])), min(w, max(box[0], box[2])), min(h, max(box[1], box[3])))
                 if box[2] - box[0] < 2 or box[3] - box[1] < 2:
                     continue
@@ -375,7 +440,7 @@ class VLMGroundingDetector(Detector):
                 if label not in labels:
                     label = next((l for l in labels if l in label or label in l), label)
                 dets.append(Detection(box=box, score=score, label=label))
-            except Exception:
+            except (KeyError, TypeError, ValueError, AttributeError):
                 continue
         return dets
 

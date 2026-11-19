@@ -21,8 +21,8 @@ function ResultCard({ r, onOpen }: { r: SearchResult; onOpen: () => void }) {
       onClick={onOpen}
       className="flex flex-col text-left rounded-xl overflow-hidden border border-border bg-bg-card hover:border-accent transition-colors min-w-0"
     >
-      <div className="relative aspect-[4/3]">
-        <Img src={e.crop_url} alt={e.label} className="absolute inset-0 w-full h-full object-cover" />
+      <div className="relative aspect-[4/3] bg-black/60">
+        <Img src={e.crop_url} alt={e.label} className="absolute inset-0 w-full h-full object-contain" />
         <span className="absolute top-1 right-1 font-mono text-[10px] bg-black/75 rounded px-1">{r.score.toFixed(3)}</span>
         {r.media.kind === 'video' && <span className="absolute top-1 left-1 text-[9px] bg-black/70 rounded px-1">▶</span>}
       </div>

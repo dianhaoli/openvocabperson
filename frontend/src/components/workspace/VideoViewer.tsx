@@ -1,10 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
 import type { Entity, MediaDetail } from '../../types';
 import { labelColor } from '../../utils/colors';
 import { cn } from '../../utils/cn';
 import { drawTag, entityCaption } from '../../utils/draw';
 import { formatTime, personName } from '../../utils/format';
-import { boxAtTime, containFit } from '../../utils/geometry';
+import { boxAtTime, containFit, pickSmallest } from '../../utils/geometry';
+
+/** Height of the native video controls bar, left free so the controls stay usable. */
+const CONTROLS_HEIGHT = 56;
 
 interface Props {
   media: MediaDetail;
@@ -125,12 +128,32 @@ export function VideoViewer({ media, entities, selectedId, onSelect }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
 
+  const dur = duration || media.duration || Math.max(1, ...entities.map((e) => e.t_end ?? 0));
+
   const seek = (t: number) => {
     const video = videoRef.current;
     if (video) video.currentTime = Math.max(0, t);
   };
 
-  const dur = duration || media.duration || Math.max(1, ...entities.map((e) => e.t_end ?? 0));
+  /** Click on the frame: select the smallest track box under the cursor, otherwise toggle playback. */
+  const onFrameClick = (ev: MouseEvent<HTMLDivElement>) => {
+    const video = videoRef.current;
+    if (!video) return;
+    const rect = video.getBoundingClientRect();
+    const fit = containFit(video.videoWidth || media.width, video.videoHeight || media.height, rect.width, rect.height);
+    const x = ((ev.clientX - rect.left - fit.offsetX) / fit.width) * (media.width || video.videoWidth);
+    const y = ((ev.clientY - rect.top - fit.offsetY) / fit.height) * (media.height || video.videoHeight);
+    const hit = pickSmallest(entities, (e) => boxAtTime(e, video.currentTime), x, y);
+    if (hit) onSelect(hit.id);
+    else if (video.paused) void video.play();
+    else video.pause();
+  };
+
+  const seekFromLane = (ev: MouseEvent<HTMLDivElement>) => {
+    const rect = ev.currentTarget.getBoundingClientRect();
+    seek(((ev.clientX - rect.left) / rect.width) * dur);
+  };
+
   const tracks = [...entities].sort((a, b) => (a.t_start ?? 0) - (b.t_start ?? 0));
 
   return (
@@ -163,6 +186,12 @@ export function VideoViewer({ media, entities, selectedId, onSelect }: Props) {
               onError={() => setError(true)}
             />
             <canvas ref={canvasRef} className="absolute top-0 left-0 pointer-events-none" />
+            <div
+              className="absolute inset-x-0 top-0 cursor-crosshair"
+              style={{ bottom: CONTROLS_HEIGHT }}
+              onClick={onFrameClick}
+              title="Click a box to select its track · click elsewhere to play/pause"
+            />
           </>
         )}
       </div>
@@ -196,14 +225,11 @@ export function VideoViewer({ media, entities, selectedId, onSelect }: Props) {
                     {e.track_id != null && <span className="text-text-muted font-mono">#{e.track_id} </span>}
                     {e.person ? personName(e.person) : e.label}
                   </button>
-                  <div className="relative flex-1 h-3 rounded bg-bg-primary">
+                  <div className="relative flex-1 h-3 rounded bg-bg-primary cursor-pointer" onClick={seekFromLane} title="Click to seek · click a bar to select its track">
                     <button
                       type="button"
                       title={`${e.label}: ${formatTime(start)} – ${formatTime(end)}`}
-                      onClick={() => {
-                        seek(start);
-                        onSelect(e.id);
-                      }}
+                      onClick={() => onSelect(e.id)}
                       className={cn('absolute top-0 h-3 rounded transition-opacity', isSel ? 'ring-2 ring-white/80' : 'opacity-75 hover:opacity-100')}
                       style={{ left: `${left}%`, width: `${width}%`, background: color }}
                     />

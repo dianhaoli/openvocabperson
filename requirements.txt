@@ -1,43 +1,33 @@
-# Core Deep Learning Framework
-torch>=2.1.0
-torchvision>=0.16.0
-torchaudio>=2.1.0
+# Core runtime: API server, open-vocabulary detection/segmentation, Re-ID, CLIP search.
+# Works on CPU, CUDA and Apple Silicon. VLM/LLM features need a cloud key (see .env.example)
+# or the local extras in requirements-local.txt.
+#
+# GPU: install the CUDA build of torch first, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
-# Transformers & Vision Models
-transformers>=4.36.0
-qwen-vl-utils>=0.0.14
+# compute
+torch>=2.2
+torchvision>=0.17
+numpy>=1.26
+pillow>=10.2
+opencv-python-headless>=4.9
 
-# Object Detection
-ultralytics>=8.1.0
+# detection / segmentation / tracking (YOLOE, YOLO-World, YOLO11, SAM 2.1, MobileSAM, FastSAM, ByteTrack)
+ultralytics>=8.3.150
+lap>=0.5.12
+# text encoder for YOLOE / YOLO-World prompts; also a CLIP fallback for embeddings
+clip @ git+https://github.com/ultralytics/CLIP.git
 
-# Person Re-ID (OSNet)
+# embeddings: CLIP crops (text->image and image->image search), OSNet person Re-ID
+open_clip_torch>=2.24
 torchreid>=0.2.5
-gdown>=4.7.0
+gdown>=5.1
 
-# Image Processing
-opencv-python>=4.8.0
-pillow>=10.1.0
-numpy>=1.24.0
-
-# Visualization
-matplotlib>=3.8.0
-
-# Utilities
-requests>=2.31.0
-
-# Model Optimization
-accelerate>=0.25.0
-bitsandbytes>=0.41.0  # INT8/INT4 quantization
-
-# Web API
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-python-multipart>=0.0.6  # For file uploads
-# Database 
-asyncpg>=0.29.0  # PostgreSQL async driver
-python-dotenv>=1.0.0  # For .env file support
-
-# Note: pgvector extension is installed in PostgreSQL, not Python
-# Install in PostgreSQL: CREATE EXTENSION vector;
-# The vector similarity search will use pgvector if available,
-# otherwise falls back to JSON embedding storage with Python-based similarity
+# API / storage
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+pydantic>=2.6
+httpx>=0.27
+asyncpg>=0.29
+python-dotenv>=1.0

@@ -151,7 +151,7 @@ export function AgentTab() {
         </Button>
       </div>
 
-      <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-3 py-3 flex flex-col gap-2.5">
+      <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-3 py-3 flex flex-col gap-2.5 [&>*]:shrink-0">
         {items.length === 0 && (
           <EmptyState icon="✦" title="Ask the vision agent" hint="It can search your library, scan for concepts, manage people and answer questions about images.">
             {!agentAvailable && <div className="text-warning text-xs">The agent capability is unavailable on the backend (no LLM configured).</div>}

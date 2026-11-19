@@ -188,6 +188,9 @@ Rules:
 - At most 40 prompts in total. Output JSON only."""
 
 
+MAX_PLAN_PROMPTS = 40
+
+
 class QueryPlanner:
     def __init__(self, max_cache: int = 256):
         self._cache: "OrderedDict[tuple, QueryPlan]" = OrderedDict()
@@ -249,13 +252,13 @@ class QueryPlanner:
         concepts: list[Concept] = []
         total = 0
         for it in items or []:
-            if not isinstance(it, dict):
+            if not isinstance(it, dict) or total >= MAX_PLAN_PROMPTS:
                 continue
             kind = "person_attribute" if it.get("kind") == "person_attribute" else "object"
             prompts = [str(p).strip().lower() for p in (it.get("prompts") or []) if str(p).strip()]
             if kind == "person_attribute":
                 prompts = ["person"]
-            prompts = [COCO_SYNONYMS.get(p, p) for p in prompts][: max(1, 40 - total)]
+            prompts = list(dict.fromkeys(COCO_SYNONYMS.get(p, p) for p in prompts))[: MAX_PLAN_PROMPTS - total]
             if not prompts:
                 continue
             total += len(prompts)
@@ -264,7 +267,7 @@ class QueryPlanner:
             if kind == "person_attribute" and not question:
                 question = f"Does this person match the description '{it.get('name', query)}'?"
                 verify = True
-            concepts.append(Concept(name=str(it.get("name") or query), prompts=list(dict.fromkeys(prompts)), kind=kind, verify=verify or kind == "person_attribute", question=question))
+            concepts.append(Concept(name=str(it.get("name") or query), prompts=prompts, kind=kind, verify=verify or kind == "person_attribute", question=question))
         if not concepts:
             raise ValueError("planner returned no concepts")
         return QueryPlan(query=query, concepts=_dedupe(concepts), expanded=True, source="llm")

@@ -18,8 +18,8 @@ export function EntityCard({ entity, selected, onClick }: { entity: Entity; sele
         entity.stage === 'rejected' && 'opacity-60',
       )}
     >
-      <div className="relative aspect-[4/3]">
-        <Img src={entity.crop_url} alt={entity.label} className="absolute inset-0 w-full h-full object-cover" />
+      <div className="relative aspect-[4/3] bg-black/60">
+        <Img src={entity.crop_url} alt={entity.label} className="absolute inset-0 w-full h-full object-contain" />
         <span className="absolute top-0 left-0 h-full w-1" style={{ background: color }} />
         <span className="absolute top-1 right-1 font-mono text-[10px] bg-black/75 rounded px-1">{pct(entity.score)}</span>
         {entity.t_start != null && (

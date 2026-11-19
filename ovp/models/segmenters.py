@@ -21,7 +21,7 @@ from PIL import Image
 
 from ..runtime import get_runtime
 from ..types import Detection
-from .detectors import mask_to_polygons
+from .detectors import box_iou, mask_to_polygons
 
 log = logging.getLogger("ovp.segment")
 
@@ -78,25 +78,12 @@ class UltralyticsSegmenter(Segmenter):
         masks = r.masks.data.cpu().numpy()
         mh, mw = masks.shape[1:]
         h, w = bgr.shape[:2]
-        # SAM returns one mask per prompt in order; FastSAM may return a different count → match by IoU
-        if len(masks) == len(dets):
+        # SAM returns one mask per prompt, in prompt order. FastSAM segments everything and returns
+        # the selected masks in its own order (de-duplicated), so those are matched to boxes by IoU.
+        if self.kind == "sam" and len(masks) == len(dets):
             pairs = list(zip(dets, masks))
         else:
-            pairs = []
-            for d in dets:
-                best, best_iou = None, 0.0
-                for m in masks:
-                    ys, xs = np.nonzero(m > 0.5)
-                    if len(xs) == 0:
-                        continue
-                    mb = (xs.min() * w / mw, ys.min() * h / mh, xs.max() * w / mw, ys.max() * h / mh)
-                    from .detectors import box_iou
-
-                    iou = box_iou(d.box, mb)
-                    if iou > best_iou:
-                        best, best_iou = m, iou
-                if best is not None and best_iou > 0.3:
-                    pairs.append((d, best))
+            pairs = _match_masks_to_boxes(dets, masks, w / mw, h / mh)
         for d, m in pairs:
             polys, area = mask_to_polygons(m, w / mw, h / mh)
             if polys:
@@ -104,6 +91,37 @@ class UltralyticsSegmenter(Segmenter):
 
     async def segment(self, image: Image.Image, dets: list[Detection]) -> None:
         await get_runtime().run_model(self._segment_sync, image, dets)
+
+    async def warmup(self) -> None:
+        await get_runtime().run_model(self._load)
+
+
+MIN_MASK_BOX_IOU = 0.3
+
+
+def _match_masks_to_boxes(dets: list[Detection], masks: np.ndarray, sx: float, sy: float) -> list[tuple[Detection, np.ndarray]]:
+    """Greedy one-to-one assignment of masks to detections by box IoU (best pairs first)."""
+    mask_boxes: list[tuple[int, tuple[float, float, float, float]]] = []
+    for j, m in enumerate(masks):
+        ys, xs = np.nonzero(m > 0.5)
+        if len(xs):
+            mask_boxes.append((j, (xs.min() * sx, ys.min() * sy, (xs.max() + 1) * sx, (ys.max() + 1) * sy)))
+    scored = sorted(
+        ((box_iou(d.box, mb), i, j) for i, d in enumerate(dets) for j, mb in mask_boxes),
+        reverse=True,
+    )
+    used_dets: set[int] = set()
+    used_masks: set[int] = set()
+    pairs: list[tuple[Detection, np.ndarray]] = []
+    for iou, i, j in scored:
+        if iou < MIN_MASK_BOX_IOU:
+            break
+        if i in used_dets or j in used_masks:
+            continue
+        used_dets.add(i)
+        used_masks.add(j)
+        pairs.append((dets[i], masks[j]))
+    return pairs
 
 
 class DetectorMasks(Segmenter):

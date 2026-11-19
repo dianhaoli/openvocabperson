@@ -97,7 +97,7 @@ export function ToolCard({ name, args, result }: { name: string; args: unknown; 
                   className="flex flex-col rounded-lg overflow-hidden border border-border bg-bg-card hover:border-accent"
                 >
                   <div className="relative aspect-square">
-                    <Img src={p.thumb_url ?? undefined} alt="" className="absolute inset-0 w-full h-full object-cover" />
+                    <Img src={p.thumb_url ?? undefined} alt="" className="absolute inset-0 w-full h-full object-cover object-top" />
                     {p.is_watchlist && <span className="absolute top-1 right-1 text-[9px] bg-error text-white rounded px-1">★</span>}
                   </div>
                   <div className="px-1 py-0.5 text-[10.5px] truncate">{personName(p)}</div>

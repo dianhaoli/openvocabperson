@@ -44,7 +44,7 @@ export function EntityQA({ entityId, history, onAnswered }: Props) {
   return (
     <div className="flex flex-col gap-2">
       {history.length > 0 && (
-        <div ref={listRef} className="flex flex-col gap-2 max-h-[320px] overflow-y-auto pr-1">
+        <div ref={listRef} className="flex flex-col gap-2 max-h-[320px] overflow-y-auto pr-1 [&>*]:shrink-0">
           {history.map((h, i) => (
             <div key={`${h.created_at}-${i}`} className="flex flex-col gap-1">
               <div className="self-end max-w-[90%] rounded-xl rounded-br-sm bg-accent text-white text-xs px-2.5 py-1.5 whitespace-pre-wrap break-words">
