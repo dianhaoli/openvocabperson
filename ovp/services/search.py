@@ -8,7 +8,8 @@ Signals (each optional, all run concurrently):
 * ``image``    – CLIP image→image (query photo)
 * ``reid``     – person Re-ID similarity (query photo containing a person)
 
-Scores are fused with weighted RRF so signals with incomparable scales combine sensibly.
+Scores are fused with weighted RRF so signals with incomparable scales combine sensibly; tied
+raw scores share a rank.
 """
 
 from __future__ import annotations
@@ -31,6 +32,20 @@ RRF_K = 60
 WEIGHTS = {"fts": 1.0, "label": 1.2, "semantic": 1.0, "clip": 0.8, "image": 1.0, "reid": 1.2}
 # Nearest neighbours below these cosine similarities are unrelated and only add noise to the fusion.
 MIN_SIM = {"semantic": 0.2, "clip": 0.18, "image": 0.5, "reid": 0.3}
+
+
+def dense_ranks(scores: list[float]) -> list[int]:
+    """Ranks of descending ``scores`` where equal scores share a rank (1, 1, 0.5 → 0, 0, 1).
+
+    A signal that cannot tell entities apart (e.g. every "person" scores 1.0 on ``label``) then
+    adds the same amount to each of them instead of reordering them by arbitrary list position."""
+    ranks: list[int] = []
+    prev: Optional[float] = None
+    for s in scores:
+        s = round(float(s), 6)
+        ranks.append(0 if prev is None else ranks[-1] + (s != prev))
+        prev = s
+    return ranks
 
 
 class SearchService:
@@ -91,7 +106,7 @@ class SearchService:
             if isinstance(res, Exception):
                 log.warning("search signal %s failed: %s", name, res)
                 continue
-            for rank, (eid, s) in enumerate(res):
+            for rank, (eid, s) in zip(dense_ranks([s for _, s in res]), res):
                 fused[eid] = fused.get(eid, 0.0) + WEIGHTS[name] / (RRF_K + rank + 1)
                 raw.setdefault(eid, {})[name] = round(float(s), 4)
         ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)[:limit]

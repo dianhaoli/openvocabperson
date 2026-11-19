@@ -16,6 +16,15 @@ import { ConfirmModal } from '../ui/Modal';
 const PAGE = 24;
 type Tri = 'auto' | 'on' | 'off';
 
+/** Library status filter → `GET /api/media?status=`. Failed and cancelled media are hidden by default. */
+type StatusFilter = 'active' | 'error' | 'cancelled' | 'all';
+const STATUS_FILTER: Record<StatusFilter, { label: string; statuses: MediaStatus[]; empty: string }> = {
+  active: { label: 'Ready', statuses: ['done', 'processing'], empty: 'No media yet' },
+  error: { label: 'Failed', statuses: ['error'], empty: 'No failed media' },
+  cancelled: { label: 'Cancelled', statuses: ['cancelled'], empty: 'No cancelled media' },
+  all: { label: 'Any', statuses: ['done', 'processing', 'error', 'cancelled'], empty: 'No media yet' },
+};
+
 const MEDIA_STATUS: Record<Exclude<MediaStatus, 'done'>, { tone: 'accent' | 'error' | 'warning'; title: string }> = {
   processing: { tone: 'accent', title: 'Still being analyzed' },
   error: { tone: 'error', title: 'Analysis failed' },
@@ -77,6 +86,7 @@ export function LibraryTab() {
   const analysisJob = useWorkspaceJob('Analysis', { autoOpen: false });
 
   const [kind, setKind] = useState<'all' | MediaKind>('all');
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('active');
   const [offset, setOffset] = useState(0);
   const [scanQuery, setScanQuery] = useState('');
   const [scanVerify, setScanVerify] = useState<Tri>('auto');
@@ -89,8 +99,8 @@ export function LibraryTab() {
   const [importing, setImporting] = useState(false);
   const [pathsError, setPathsError] = useState<string | null>(null);
 
-  const mediaQ = useApi(`media:${kind}:${offset}:${libraryVersion}`, (s) =>
-    api.listMedia({ limit: PAGE, offset, kind: kind === 'all' ? null : kind }, s),
+  const mediaQ = useApi(`media:${kind}:${statusFilter}:${offset}:${libraryVersion}`, (s) =>
+    api.listMedia({ limit: PAGE, offset, kind: kind === 'all' ? null : kind, status: STATUS_FILTER[statusFilter].statuses }, s),
   );
   const jobsQ = useApi(`jobs:${libraryVersion}`, (s) => api.jobs(s));
   const page = mediaQ.data ?? mediaQ.stale;
@@ -265,9 +275,27 @@ export function LibraryTab() {
           />
         }
       >
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-text-secondary">Status</span>
+          <Segmented
+            value={statusFilter}
+            options={(Object.keys(STATUS_FILTER) as StatusFilter[]).map((k) => ({ value: k, label: STATUS_FILTER[k].label }))}
+            onChange={(v) => {
+              setStatusFilter(v);
+              setOffset(0);
+            }}
+            size="xs"
+          />
+        </div>
         {mediaQ.loading && !page && <Loading />}
         {!!mediaQ.error && <ErrorState error={mediaQ.error} onRetry={mediaQ.reload} />}
-        {page && items.length === 0 && <EmptyState icon="🗂" title="No media yet" hint="Analyze some images or videos to fill the library." />}
+        {page && items.length === 0 && (
+          <EmptyState
+            icon="🗂"
+            title={STATUS_FILTER[statusFilter].empty}
+            hint={statusFilter === 'active' || statusFilter === 'all' ? 'Analyze some images or videos to fill the library.' : undefined}
+          />
+        )}
         {items.length > 0 && (
           <div className={cn('grid grid-cols-3 gap-2', mediaQ.loading && 'opacity-60')}>
             {items.map((m) => (
@@ -324,7 +352,13 @@ export function LibraryTab() {
                 <StatusBadge status={j.status} />
                 <span className="text-text-secondary">{j.kind}</span>
                 <span className="truncate flex-1 text-text-muted">
-                  {[j.options?.query ? `“${j.options.query}”` : '', running ? '' : jobSummaryText(j)].filter(Boolean).join(' · ')}
+                  {[
+                    j.options?.query ? `“${j.options.query}”` : '',
+                    running ? '' : jobSummaryText(j),
+                    j.failed_media_ids.length ? `${j.failed_media_ids.length} left failed/cancelled` : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
                 </span>
                 {running && j.progress && j.progress.total > 0 && (
                   <span className="font-mono text-[10px] text-text-muted">

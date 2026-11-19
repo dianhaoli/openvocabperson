@@ -25,6 +25,16 @@ def media_kind(name: str, content_type: Optional[str] = None) -> Optional[str]:
     return None
 
 
+def safe_suffix(name: str, kind: str) -> str:
+    """The file suffix stored media and temporary uploads get: never the client's choice, so an
+    upload can not become e.g. a ``.pt`` file. Images are normalised to JPEG; videos keep a known
+    container suffix (decoders pick the demuxer by content) or get ``.mp4``."""
+    if kind == "image":
+        return ".jpg"
+    ext = Path(name or "").suffix.lower()
+    return ext if ext in VIDEO_EXT else ".mp4"
+
+
 class FileStore:
     def __init__(self, root: Optional[Path] = None):
         self.root = Path(root or get_settings().storage_dir)
@@ -79,8 +89,9 @@ class FileStore:
         # normalise to JPEG (EXIF orientation already applied) so boxes match what the browser shows
         return await get_runtime().run_cpu(self._save_jpeg, img, self.media_path(media_id, ".jpg"), 92)
 
-    async def import_file(self, media_id: str, src: Path, ext: str, move: bool = False) -> Path:
-        dst = self.media_path(media_id, ext)
+    async def import_file(self, media_id: str, src: Path, move: bool = False) -> Path:
+        """Copy (or move) a video into storage under a whitelisted suffix (see ``safe_suffix``)."""
+        dst = self.media_path(media_id, safe_suffix(src.name, "video"))
 
         def _copy() -> Path:
             if move:

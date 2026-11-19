@@ -9,6 +9,7 @@ import { Dropzone } from '../ui/Dropzone';
 import { Chip, Field, Section, Segmented, inputClass } from '../ui/Misc';
 import { JobPanel } from '../jobs/JobPanel';
 import { PlanView } from '../jobs/PlanView';
+import { cn } from '../../utils/cn';
 
 type Tri = 'auto' | 'on' | 'off';
 const TRI_OPTIONS: { value: Tri; label: string }[] = [
@@ -55,7 +56,8 @@ export function AnalyzeTab() {
   const [verify, setVerify] = useState<Tri>('auto');
   const [segment, setSegment] = useState(false);
   const [describe, setDescribe] = useState<DescribeMode>('persons');
-  const [conf, setConf] = useState(0.25);
+  // null = auto: the server picks a query-aware threshold (0.2 default vocabulary, 0.15 text queries)
+  const [conf, setConf] = useState<number | null>(null);
   const [videoFps, setVideoFps] = useState(2);
   const [plan, setPlan] = useState<{ query: string; plan: Plan } | null>(null);
   const [planning, setPlanning] = useState(false);
@@ -91,8 +93,8 @@ export function AnalyzeTab() {
       verify: triToValue(verify),
       segment,
       describe,
-      conf,
     };
+    if (conf != null) options.conf = conf;
     if (hasVideo) options.video_fps = videoFps;
     setSubmitting(true);
     try {
@@ -190,16 +192,24 @@ export function AnalyzeTab() {
               size="xs"
             />
           </Field>
-          <Field label={`Confidence ≥ ${conf.toFixed(2)}`}>
-            <input
-              type="range"
-              min={0.05}
-              max={0.9}
-              step={0.05}
-              value={conf}
-              onChange={(e) => setConf(Number(e.target.value))}
-              className="w-32 accent-[#6366f1]"
-            />
+          <Field label={`Confidence ≥ ${conf == null ? 'auto' : conf.toFixed(2)}`} hint={conf == null ? '0.2 default · 0.15 queries' : undefined}>
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                min={0.05}
+                max={0.9}
+                step={0.05}
+                value={conf ?? 0.15}
+                onChange={(e) => setConf(Number(e.target.value))}
+                aria-label="Detection confidence threshold"
+                className={cn('w-32 accent-[#6366f1]', conf == null && 'opacity-50')}
+              />
+              {conf != null && (
+                <button type="button" className="text-[11px] text-text-muted hover:text-text-primary" onClick={() => setConf(null)}>
+                  auto
+                </button>
+              )}
+            </div>
           </Field>
           {hasVideo && (
             <Field label={`Video sampling: ${videoFps} fps`}>

@@ -120,7 +120,8 @@ export interface AnalyzeOptions {
   detector?: string | null;
   segmenter?: string | null;
   vlm?: string | null;
-  conf?: number;
+  /** Omit for auto (0.2 default vocabulary, 0.15 text queries); a given value is used exactly. */
+  conf?: number | null;
   video_fps?: number;
   max_frames?: number;
   reid?: boolean;
@@ -132,6 +133,8 @@ export interface Job {
   status: JobStatus;
   progress: JobProgress | null;
   media_ids: string[];
+  /** Media rows a failed or cancelled item left behind ('error' / 'cancelled'); hidden from the default library listing. */
+  failed_media_ids: string[];
   error: string | null;
   created_at: number;
   finished_at: number | null;

@@ -46,6 +46,7 @@ python -m ovp analyze bus.jpg --json > result.json   # same JSON shapes as the H
 python -m ovp search "man in a red jacket" --limit 10
 python -m ovp search --image suspect.jpg             # CLIP image similarity + person Re-ID
 python -m ovp models                                 # providers, availability, defaults (--check loads them)
+python -m ovp reembed                                # move person sightings of older Re-ID spaces to the active model
 python -m ovp serve --port 8000 --reload
 ```
 
@@ -57,7 +58,7 @@ Results go to stdout. Progress and logs go to stderr, so `--json` output can be 
 
 - **Open-vocabulary analysis.** Queries can be literal ("person, dog"), abstract ("dangerous things", "all living things") or attribute-based ("menacing people"). The planner expands abstract concepts into prompts with the LLM, or with a built-in lexicon when no LLM is configured. It also attaches VLM yes/no verification questions to concepts that a detector cannot decide alone. With no query, the detector uses the 80 COCO classes.
 - **Detect, segment, verify, describe.** You get boxes and masks (YOLOE-seg masks, or SAM 2.1 / MobileSAM / FastSAM). The VLM sends one JSON reply per crop that both verifies concepts and describes the subject (actions, clothing, held objects for people; colour and details for objects).
-- **Images and videos.** Video frames are sampled (2 fps by default) and tracked with ByteTrack. Each track becomes one entity with a trajectory, a best crop and several Re-ID crops. Track fragments of the same person are stitched back together.
+- **Images and videos.** Video frames are sampled (2 fps by default) and tracked with ByteTrack, whatever the detector (YOLO, YOLOE, YOLO-World, OWLv2, Grounding DINO or VLM boxes). Each track becomes one entity with a trajectory, a best crop and several Re-ID crops. Track fragments of the same person are stitched back together.
 - **Identity across uploads.** Each person sighting gets a Re-ID embedding (OSNet, or CLIP or a colour histogram as fallback) and is matched against cluster centroids in pgvector. The result is `matched`, `new` or `pending` review. You can name clusters, put them on a watchlist, merge them, reassign sightings or re-cluster everything.
 - **Hybrid search.** Several signals are fused with reciprocal-rank fusion: Postgres full-text over labels and descriptions, label/lexicon match, text-embedding similarity of descriptions, CLIP text-to-image and image-to-image, and person Re-ID for photo queries.
 - **Grounded Q&A.** You can ask about one detection (crop or full scene) or a whole image or video. Answers are stored with the entity.
@@ -96,7 +97,7 @@ Local model inference runs on one dedicated worker thread per device, so the eve
 | Module | Role |
 |---|---|
 | `ovp/api/app.py` | FastAPI routes ([contract](docs/API.md)) and serving of the built UI |
-| `ovp/cli.py` | `python -m ovp serve \| analyze \| search \| models` |
+| `ovp/cli.py` | `python -m ovp serve \| analyze \| search \| reembed \| models` |
 | `ovp/context.py` | Wires storage, models and services (one per process) |
 | `ovp/config.py` | Settings from environment variables / `.env` |
 | `ovp/runtime.py` | Device selection, device thread, CPU pool |
@@ -124,6 +125,10 @@ Every role takes a spec of the form `provider:model`. Set it in `.env` (`OVP_DET
 | Text embedder | `st:all-MiniLM-L6-v2`, `ollama:nomic-embed-text`, `clip` (CLIP text tower) | `openai:text-embedding-3-small`, `gemini:gemini-embedding-001`, `compat:<model>` | OpenAI, then Gemini, then sentence-transformers |
 | Re-ID | `osnet:osnet_x1_0` (torchreid), `clip`, `color` (histogram fallback) | – | OSNet. If its weights cannot load: CLIP, then colour |
 
+**Per-request specs** are validated before anything is stored: an unknown provider, a malformed name or a disallowed weights path returns HTTP 400 (the analyze endpoints, `POST /api/scan`, the agent's `llm`). Local weights must lie in the working directory or `OVP_WEIGHTS_DIR`, never in `OVP_STORAGE_DIR` (uploaded media live there), and weight files need one of the suffixes `.pt`, `.pth`, `.ts`, `.onnx`, `.engine`, `.safetensors`, `.bin`; `..` is refused. Models loaded for a request stay cached next to the defaults, at most 4 of them, and the least recently used one is unloaded first.
+
+**Re-ID spaces.** Re-ID vectors are only compared within one embedding space: `reid:osnet:<model>`, `reid:clip:<model>` (for example `reid:clip:ViT-B-32`) or `reid:color:v2`. Switching the Re-ID model, or upgrading from a version that stored the older `reid:clip` / `reid:color` spaces, would leave the known people unmatched. The server therefore re-embeds such sightings from their stored crops in the background after the models are loaded, then moves the persons and recomputes their centroids in the active space. `python -m ovp reembed` does the same on demand. Old vectors are kept, so switching back needs no re-embedding.
+
 Run `python -m ovp models` (or `GET /api/models`) to see what is available on your machine and why the rest is not. On CPU, use `OVP_DETECTOR=yoloe:yoloe-11s-seg.pt` and a cloud VLM. SAM 2.1-B and local Qwen-VL are slow there.
 
 ## Configuration
@@ -134,7 +139,7 @@ All settings are environment variables. A `.env` file in the working directory i
 |---|---|---|
 | `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/vision_analysis` | PostgreSQL with pgvector. The schema is created and migrated on start |
 | `OVP_STORAGE_DIR` | `storage` | Originals, thumbnails, crops, upload spool |
-| `OVP_WEIGHTS_DIR` | `.` | Where local weight files are looked up (ultralytics downloads into the working directory) |
+| `OVP_WEIGHTS_DIR` | `.` | Where local weight files are looked up, besides the working directory (ultralytics downloads into the working directory). Per-request specs may only point into these two folders |
 | `OVP_DEVICE` | `auto` | `auto` (CUDA, then MPS, then CPU), `cpu`, `cuda`, `cuda:1`, `mps` |
 | `OVP_DETECTOR` / `OVP_SEGMENTER` / `OVP_VLM` / `OVP_LLM` | `auto` | Model specs (see [Models](#models)) |
 | `OVP_EMBEDDER` / `OVP_TEXT_EMBEDDER` / `OVP_REID` | `auto` | CLIP image embedder, text embedder for descriptions, Re-ID model |
@@ -148,7 +153,7 @@ All settings are environment variables. A `.env` file in the working directory i
 | `OVP_ANTHROPIC_VLM_MODEL` / `OVP_ANTHROPIC_LLM_MODEL` | `claude-haiku-5-5` / `claude-sonnet-5-5` | Same for Anthropic |
 | `OVP_GEMINI_MODEL` | `gemini-2.5-flash` | Same for Gemini |
 | `OVP_LOCAL_VLM_MODEL` | `Qwen/Qwen2.5-VL-3B-Instruct` | Local VLM for `qwen:` / `hf:` |
-| `OVP_CONF` | `0.25` | Detector confidence threshold. Default-vocabulary runs use at most 0.2 |
+| `OVP_CONF` | `0.25` | Upper bound of the automatic detector threshold: without `conf` in the options, default-vocabulary runs use min(`OVP_CONF`, 0.2) and text queries min(`OVP_CONF`, 0.15) (VLM verification filters the extra candidates). A `conf` given per request is used exactly |
 | `OVP_LOW_CONF` | `0.3` | Persons below this score are kept as `low_confidence`, with no description and no Re-ID |
 | `OVP_NMS_IOU` | `0.7` | IoU for cross-prompt NMS |
 | `OVP_EXPAND_RATIO` | `0.1` | Crop padding around boxes |
@@ -164,7 +169,7 @@ All settings are environment variables. A `.env` file in the working directory i
 | `OVP_MIN_TRACK_HITS` | `2` | Tracks seen in fewer sampled frames are dropped |
 | `OVP_JOB_CONCURRENCY` | `2` | Jobs running at once |
 | `OVP_MEDIA_CONCURRENCY` | `3` | Media items processed at once within a job |
-| `OVP_REID_MATCH` / `OVP_REID_REVIEW` | per backend | Identity thresholds. Defaults: OSNet 0.75/0.60, CLIP 0.88/0.80, colour 0.93/0.86 |
+| `OVP_REID_MATCH` / `OVP_REID_REVIEW` | per backend | Identity thresholds. Defaults: OSNet 0.75/0.60, CLIP 0.88/0.80, colour 0.87/0.78 |
 | `OVP_IMPORT_ROOTS` | – (disabled) | Comma-separated server folders that `POST /api/analyze/paths`, the UI's "Analyze server paths" and the agent may read. Unset → those return 403. The CLI is not restricted |
 | `OVP_CORS_ORIGINS` | `http://localhost:5173,http://localhost:3000` | Comma-separated browser origins allowed to call the API cross-origin; `*` allows any. The UI served by the API itself needs no entry |
 | `OVP_MAX_UPLOAD_MB` | `2048` | Max request body for uploads (all files of one request together) → 413 |

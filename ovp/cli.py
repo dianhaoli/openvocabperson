@@ -1,6 +1,6 @@
 """Command-line interface (``python -m ovp``).
 
-``serve`` runs the HTTP API + UI. ``analyze``, ``search`` and ``models`` use the same
+``serve`` runs the HTTP API + UI. ``analyze``, ``search``, ``reembed`` and ``models`` use the same
 application context as the server (database, file store, model registry, job manager) in
 process, without HTTP, so results land in the same library the UI shows.
 
@@ -193,7 +193,7 @@ async def run_analyze(args: argparse.Namespace, out: TextIO) -> int:
         return 2
     opts = analyze_options(args)
     async with app_context() as ctx:
-        items = ctx.jobs.collect_paths(args.paths)
+        items = await ctx.jobs.collect_paths(args.paths, restricted=False)  # local files: no import roots
         if not items:
             print("error: no images or videos found at the given paths", file=sys.stderr)
             return 2
@@ -254,6 +254,28 @@ async def run_search(args: argparse.Namespace, out: TextIO) -> int:
         signals = " ".join(f"{k}={v:.2f}" for k, v in r["scores"].items())
         out.write(f"{rank:>3}. {r['score']:.4f}  {m.get('name', '?')}  ({signals})\n")
         print_entity(out, e, indent="       ")
+    return 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# reembed
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+async def run_reembed(args: argparse.Namespace, out: TextIO) -> int:
+    """Re-embed person sightings stored under an older Re-ID space with the active model (the
+    server also does this in the background at start-up)."""
+    async with app_context() as ctx:
+        space = ctx.reid_space()
+        if space is None:
+            print("error: no Re-ID model available", file=sys.stderr)
+            return 2
+        res = await ctx.reembed_orphaned()
+    if args.json:
+        write_json(out, {"space": space, **res})
+    else:
+        counts = ", ".join(f"{k}={v}" for k, v in res.items()) or "nothing to do"
+        out.write(f"Re-ID space {space}: {counts}\n")
     return 0
 
 
@@ -349,6 +371,10 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--person", help="only sightings of this person id")
     output_flags(search)
     search.set_defaults(runner=run_search)
+
+    reembed = sub.add_parser("reembed", help="re-embed person sightings of older Re-ID spaces with the active Re-ID model")
+    output_flags(reembed)
+    reembed.set_defaults(runner=run_reembed)
 
     models = sub.add_parser("models", help="list model providers, availability and defaults")
     models.add_argument("--check", action="store_true", help="load every default model to verify it works (downloads weights)")

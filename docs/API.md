@@ -17,7 +17,8 @@ A single detection (image) or a single track (video).
   "id": "e_3f9a1c2b7d",
   "media_id": "m_81c2aa90f1",
   "label": "knife",                 // detector label (the prompt that matched)
-  "concept": "dangerous things",    // query concept that produced it (null for default vocab)
+  "concept": "dangerous things",    // query concept that produced it (null for default vocab); also set on
+                                    // rejected entities and on persons matched by a person-attribute concept
   "score": 0.83,                    // detector confidence
   "box": [12, 40, 220, 380],
   "polygon": [[[x, y], [x, y], ...]] , // segmentation polygons (null if not segmented)
@@ -59,8 +60,9 @@ A single detection (image) or a single track (video).
 ```
 `status`: `processing` while a job analyses it, `done` when finished, `error` when the analysis failed (or the
 server stopped mid-analysis: leftovers are marked `error` at startup), `cancelled` when its job was cancelled.
-`GET /api/media` lists `done` and `processing` media; `GET /api/stats` and library-wide scans count only `done`.
-`error` and `cancelled` media are hidden there but still reachable by id (and can be deleted).
+`GET /api/media` lists `done` and `processing` media by default; `?status=error,cancelled` (any comma list of
+the four statuses) lists the others, so failed media can be found and deleted. `total` counts the same set.
+`GET /api/stats` and library-wide scans count only `done`. Every media is reachable by id and can be deleted.
 `GET /api/media/{id}` returns `Media` plus `"entities": Entity[]` and `"plan": Plan | null`.
 
 ### Plan
@@ -91,7 +93,8 @@ restarts (their media and entities stay in the database), and only the newest 10
   "kind": "analyze",                // "analyze" | "scan"
   "status": "running",              // "queued" | "running" | "done" | "error" | "cancelled"
   "progress": {"done": 3, "total": 10, "stage": "describe", "message": "Describing 4 crops"},  // done counts finished media only (stays < total after a cancel)
-  "media_ids": ["m_..."],
+  "media_ids": ["m_..."],           // media analysed (analyze) or with accepted hits (scan)
+  "failed_media_ids": [],           // media rows a failed or cancelled item left ('error' / 'cancelled'), deletable by id
   "error": null,
   "created_at": 1731900000.0, "finished_at": null,
   "options": { /* AnalyzeOptions */ },
@@ -99,6 +102,8 @@ restarts (their media and entities stay in the database), and only the newest 10
   "summary": {"media": 1, "entities": 7, "failed": 0}  // {} until the job finishes; scan jobs: see below
 }
 ```
+`summary.entities` of an analyze job counts accepted entities only (rejected candidates are stored but not
+counted, as in `Media.entity_count`); `failed` counts items whose analysis raised an error.
 Summary of a finished `scan` job:
 ```jsonc
 {"scanned": 120,          // media items scanned
@@ -118,16 +123,24 @@ All fields optional.
   "verify": "auto",                 // true | false | "auto": VLM yes/no check on each candidate
   "segment": false,                 // run segmentation (SAM / detector masks)
   "describe": "persons",            // "persons" | "all" | "none": which detections get a VLM description
-  "detector": null,                 // model spec override, e.g. "yoloe:yoloe-11l-seg.pt"
+  "detector": null,                 // model spec override, e.g. "yoloe:yoloe-11l-seg.pt" (see "Model specs" below)
   "segmenter": null,                // e.g. "sam:sam2.1_b.pt"
   "vlm": null,                      // e.g. "openai:gpt-4.1-mini", "anthropic:claude-haiku-5-5", "qwen:Qwen/Qwen2.5-VL-3B-Instruct"
   "llm": null,                      // LLM used to expand the query (falls back to the VLM)
-  "conf": 0.25,                     // detector confidence threshold
+  "conf": null,                     // detector confidence threshold; null/omitted = auto: min(OVP_CONF, 0.2) for the
+                                    // default vocabulary, min(OVP_CONF, 0.15) for text queries. A given value is used exactly
   "video_fps": 2.0,                 // frames per second sampled from videos
   "max_frames": 600,
   "reid": true                      // link persons to identity clusters
 }
 ```
+
+Model specs (`detector`, `segmenter`, `vlm`, `llm`) are validated when the request arrives: an unknown provider,
+a malformed name or a disallowed weights path returns **400** before any media is stored. Local weights must lie in
+the working directory or `OVP_WEIGHTS_DIR` (never in `OVP_STORAGE_DIR`), weight files need a `.pt`, `.pth`, `.ts`,
+`.onnx`, `.engine`, `.safetensors` or `.bin` suffix, and `..` is refused. The configured defaults are always accepted.
+Up to 4 per-request models stay loaded besides the defaults; the least recently used one is unloaded first.
+Any detector can process videos (tracking is done by the analyzer, not by the detector).
 
 ## Endpoints
 
@@ -175,7 +188,8 @@ Job SSE events (`data: {...}\n\n`, each has `type`, `job_id`, `ts`):
 - `media_started` `{index, total, name, kind}`
 - `media_created` `{media}` (media row exists, file viewable)
 - `stage` `{media_id, stage, message}` stage in `detect|track|segment|verify|describe|embed|identity|save`
-- `detections` `{media_id, count, labels: {label: count}, elapsed}`
+- `detections` `{media_id, count, labels: {label: count}, elapsed}` (videos add `frames`). In a scan, `count` covers only
+  detections not already stored; stored entities detected again are re-checked and reported in the job summary
 - `entity` `{entity}` (emitted as each entity is finalized)
 - `media_done` `{media: MediaDetail}`
 - `progress` `{done, total}`
@@ -187,7 +201,7 @@ Job SSE events (`data: {...}\n\n`, each has `type`, `job_id`, `ts`):
 ### Media & entities
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/media?limit=50&offset=0&kind=image\|video` | `{media: Media[], total}`: `done` and `processing` media, newest first |
+| GET | `/api/media?limit=50&offset=0&kind=image\|video&status=done,processing` | `{media: Media[], total}`, newest first. `status` is a comma list of `done`, `processing`, `error`, `cancelled` (default `done,processing`; anything else → 400); `total` counts the same filter |
 | GET | `/api/media/{id}` | `MediaDetail` |
 | DELETE | `/api/media/{id}` | Deletes files, entities, and updates person clusters → `{success, media_id, persons_updated}` |
 | GET, HEAD | `/api/media/{id}/file` | Original image / video (Range supported) |
@@ -198,7 +212,7 @@ Job SSE events (`data: {...}\n\n`, each has `type`, `job_id`, `ts`):
 | DELETE | `/api/entities/{id}` | |
 | GET, HEAD | `/api/entities/{id}/crop` | JPEG crop |
 | POST | `/api/entities/{id}/ask` | `{question, scope: "crop"\|"scene", vlm?}` (legacy `use_full_scene: true` = `"scene"`) → `{answer, elapsed, scope}`; Q&A is persisted. 503 without a VLM |
-| POST | `/api/entities/{id}/assign` | `{person_id: string \| null}` (null = create a new person) → `Entity` |
+| POST | `/api/entities/{id}/assign` | `{person_id: string \| null}` (null = create a new person) → `Entity`. Only person entities can be linked (400 otherwise); 404 for an unknown person |
 | POST | `/api/entities/{id}/review` | `{action: "accept" \| "new" \| "reject"}` resolve a pending match → `Entity` |
 
 ### Search

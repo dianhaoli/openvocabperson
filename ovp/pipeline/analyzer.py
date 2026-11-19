@@ -30,11 +30,11 @@ from PIL import Image
 
 from .. import serialize
 from ..config import get_settings
-from ..models.detectors import COCO_CLASSES, TRACK_LOST_SECONDS, box_iou, cross_label_nms
+from ..models.detectors import COCO_CLASSES, box_iou, cross_label_nms
 from ..models.embedders import l2n
 from ..models.llm import extract_json, user
 from ..models.registry import ModelRegistry
-from ..services.identity import IdentityService
+from ..services.identity import IdentityService, presence_segments, segments_overlap
 from ..storage.db import Database, new_id
 from ..storage.files import FileStore
 from ..types import Candidate, Concept, Detection, QueryPlan
@@ -187,6 +187,16 @@ def expand_box(box: tuple, w: int, h: int, ratio: float) -> tuple[int, int, int,
 
 REID_CROPS_PER_TRACK = 8
 MAX_TRAJECTORY_POINTS = 240
+TRACK_LOST_SECONDS = 2.0  # how long ByteTrack keeps a lost track alive; longer gaps are re-joined by Re-ID stitching
+BORDER_PX = 2  # a box edge this close to the frame edge is cut off by it
+BORDER_PENALTY = 0.5  # crop quality factor per clipped side: a partly visible body makes a poor crop / Re-ID sample
+
+
+def _crop_quality(d: Detection, w: int, h: int) -> float:
+    """Confidence x size of a tracked detection, discounted for each side the frame border clips."""
+    x1, y1, x2, y2 = d.box
+    clipped = (x1 <= BORDER_PX) + (y1 <= BORDER_PX) + (x2 >= w - BORDER_PX) + (y2 >= h - BORDER_PX)
+    return d.score * math.sqrt(max(d.area, 1.0)) * BORDER_PENALTY**clipped
 
 
 @dataclass
@@ -217,7 +227,7 @@ class _Track:
         """Record one tracked detection; keeps the best crop and a few good Re-ID crops."""
         self.labels[d.label] = self.labels.get(d.label, 0) + 1
         self.hits.append((round(t, 3), tuple(round(v, 1) for v in d.box), d.score, idx))
-        q = d.score * math.sqrt(max(d.area, 1.0))
+        q = _crop_quality(d, frame.shape[1], frame.shape[0])
         if q > self.best_q:
             self.best_q, self.best_box, self.best_frame, self.best_polys = q, d.box, idx, d.polygons
             self.best_crop = _crop_bgr(frame, d.box, ratio)
@@ -235,23 +245,7 @@ def _crop_bgr(frame: np.ndarray, box: tuple, ratio: float) -> Image.Image:
 
 
 def _presence(c: Candidate) -> list[tuple[float, float]]:
-    """Time segments in which a track is actually visible (a stitched track has gaps)."""
-    times = [p[0] for p in (c.trajectory or [])]
-    if len(times) < 2:
-        start = c.t_start or 0.0
-        return [(start, c.t_end if c.t_end is not None else start)]
-    max_gap = 2.5 * float(np.median(np.diff(times)))  # tolerate a missed detection or two
-    segments = [[times[0], times[0]]]
-    for t in times[1:]:
-        if t - segments[-1][1] > max_gap:
-            segments.append([t, t])
-        else:
-            segments[-1][1] = t
-    return [(s, e) for s, e in segments]
-
-
-def _segments_overlap(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> bool:
-    return any(s1 <= e2 and s2 <= e1 for s1, e1 in a for s2, e2 in b)
+    return presence_segments(c.trajectory, c.t_start, c.t_end)
 
 
 def _is_person(d: Detection) -> bool:
@@ -539,6 +533,7 @@ class Analyzer:
 
     # ── image ─────────────────────────────────────────────────────────────────
     async def analyze_image(self, img: Image.Image, name: str, opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event] = None) -> str:
+        models = await self._models(opts, plan)  # an invalid model spec fails before anything is stored
         media_id = new_id("m")
         await self.store.save_image_original(media_id, img)
         await self.store.save_thumb(media_id, img)
@@ -548,7 +543,7 @@ class Analyzer:
         )
         emit("media_created", media=serialize.media(await self.db.get_media(media_id)))
         try:
-            await self._image_entities(media_id, img, opts, plan, emit, cancel, existing=None)
+            await self._image_entities(media_id, img, models, opts, plan, emit, cancel, existing=None)
             await self.db.update_media(media_id, status="done")
         except Cancelled:
             await self.db.update_media(media_id, status="cancelled")
@@ -572,8 +567,9 @@ class Analyzer:
         dets = await det.detect(img, prompts if plan.source != "default" or det.open_vocab else None, self._conf(opts, plan))
         return cross_label_nms(dets, self.s.nms_iou, protect=_is_person)
 
-    async def _image_entities(self, media_id: str, img: Image.Image, opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event], existing: Optional[list[Any]]) -> Counts:
-        models = await self._models(opts, plan)
+    async def _image_entities(
+        self, media_id: str, img: Image.Image, models: dict[str, Any], opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event], existing: Optional[list[Any]],
+    ) -> Counts:
         emit("stage", media_id=media_id, stage="detect", message=f"Detecting {len(plan.prompts)} prompt(s) with {models['detector'].spec}")
         t0 = time.perf_counter()
         dets = await self._detect_image(img, models, opts, plan)
@@ -725,7 +721,7 @@ class Analyzer:
             await self._save(media_id, cands, models, emit)
         n_rejected = sum(1 for c in cands if c.stage == "rejected")
         counts = {"accepted": len(cands) - n_rejected, "rejected": n_rejected, "updated": 0}
-        for key, n in (await self._apply_rechecks(rechecks, emit)).items():
+        for key, n in (await self._apply_rechecks(rechecks, models, emit)).items():
             counts[key] += n
         return counts
 
@@ -777,49 +773,101 @@ class Analyzer:
                 presence = {c.entity_id: _presence(c) for c in cands}
 
                 def conflicts(a: str, b: str) -> bool:  # two tracks visible at the same time are two people
-                    return _segments_overlap(presence[a], presence[b])
+                    return segments_overlap(presence[a], presence[b])
 
             await self.identity.assign_media(people, models["reid"].space, conflicts=conflicts)  # type: ignore[arg-type]
 
         for row in await self.db.get_entities([c.entity_id for c in cands]):  # type: ignore[misc]
             emit("entity", entity=serialize.entity(row))
 
-    async def _apply_rechecks(self, rechecks: list[tuple[_Job, Any]], emit: Emit) -> Counts:
+    async def _apply_rechecks(self, rechecks: list[tuple[_Job, Any]], models: dict[str, Any], emit: Emit) -> Counts:
         """Re-label / re-verify stored entities a scan detected again.
 
-        A stored entity matching the scan's concepts is ``accepted`` (and ``updated`` when its concept or
-        verification changed). A stored entity that only verification concepts claimed and that the VLM
-        denied counts as ``rejected`` but is left untouched: it is still a valid detection, it just does
-        not match this query. Unknown verification changes nothing.
+        * verified for the scan's concept: ``accepted``, stored with that concept as verified;
+        * claimed by a plain (unverified) concept: ``accepted`` and re-labelled, unless the entity is
+          verified for another concept, which an unverified label never replaces;
+        * denied by the VLM for the concept it is stored with: ``rejected``, and stored as rejected
+          (``verified`` false with the reason), as a new detection would be; a person sighting is
+          also unlinked from its person, since rejected entities are never identity-linked;
+        * denied for another concept: ``rejected`` but left untouched, since it is still a valid
+          detection that just does not match this query. Unknown verification changes nothing.
+
+        A stored person sighting that was rejected and is accepted again is linked to a person.
+        ``updated`` counts the stored entities that changed.
         """
         counts = {"accepted": 0, "rejected": 0, "updated": 0}
         changed_ids = []
+        unlink: list[str] = []
+        relink: list[tuple[Candidate, Any]] = []
         for j, e in rechecks:
             c = j.cand
             if c.concept is None:  # the scan's plan has no concept for this label (e.g. the default vocabulary)
                 continue
+            fields: dict[str, Any]
             if c.stage == "rejected":
                 counts["rejected"] += 1
-                continue
-            if c.verified:
-                fields: dict[str, Any] = {"concept": c.concept, "verified": True, "verify_reason": c.verify_reason}
-            elif not j.verify_only:
-                fields = {"concept": c.concept}
+                if e["concept"] != c.concept or e["stage"] == "rejected":
+                    continue
+                fields = {"verified": False, "verify_reason": c.verify_reason, "stage": "rejected"}
             else:
-                continue
-            if e["stage"] == "rejected":  # rejected for an earlier query's concept, matches this one
-                fields["stage"] = "described" if e["description"] else "detected"
-                fields.setdefault("verified", None)
-                fields.setdefault("verify_reason", None)
-            counts["accepted"] += 1
+                if c.verified:
+                    fields = {"concept": c.concept, "verified": True, "verify_reason": c.verify_reason}
+                elif j.verify_only:
+                    continue
+                elif e["concept"] == c.concept or (e["verified"] and e["stage"] != "rejected"):
+                    fields = {}  # already labelled, or verified for a concept an unverified label never replaces
+                else:  # the old verdict was about the old concept
+                    fields = {"concept": c.concept, "verified": None, "verify_reason": None}
+                if e["stage"] == "rejected":  # rejected for an earlier query's concept, matches this one
+                    fields.update(concept=c.concept, stage="described" if e["description"] else "detected")
+                    fields.setdefault("verified", None)
+                    fields.setdefault("verify_reason", None)
+                counts["accepted"] += 1
             changes = {k: v for k, v in fields.items() if e[k] != v}
             if changes:
                 await self.db.update_entity(e["id"], **changes)
                 changed_ids.append(e["id"])
+                if e["label"] == "person" and changes.get("stage") == "rejected" and (e["person_id"] or e["match_status"]):
+                    unlink.append(e["id"])
+                elif e["label"] == "person" and e["stage"] == "rejected" and "stage" in changes:
+                    relink.append((c, e))
         counts["updated"] = len(changed_ids)
+        for eid in unlink:
+            await self.identity.unlink(eid)
+        await self._relink(relink, models["reid"], emit)
         for row in await self.db.get_entities(changed_ids) if changed_ids else []:
             emit("entity", entity=serialize.entity(row))
         return counts
+
+    async def _relink(self, items: list[tuple[Candidate, Any]], reid: Any, emit: Emit) -> None:
+        """Link stored person sightings that a scan accepted again after an earlier rejection: their
+        Re-ID embedding is the stored one, else one computed from this scan's crops."""
+        if reid is None or not items:
+            return
+        people: list[tuple[str, np.ndarray]] = []
+        missing: list[tuple[str, Candidate]] = []
+        for c, e in items:
+            vec = await self.db.get_embedding(e["id"], reid.space)
+            if vec is None and c.reid_embedding is not None:
+                vec = c.reid_embedding
+            if vec is None:
+                missing.append((e["id"], c))
+            else:
+                people.append((e["id"], vec))
+        if missing:
+            try:
+                for eid, c in missing:
+                    people.append((eid, l2n((await reid.embed(c.reid_crops or [c.crop])).mean(0))))
+            except Exception as ex:
+                emit("log", level="warning", message=f"Re-ID failed: {ex}")
+        await self.db.upsert_embeddings([(eid, reid.space, v) for eid, v in people])
+        presence = {e["id"]: presence_segments(e["trajectory"], e["t_start"], e["t_end"]) for _, e in items}
+        video = any(e["t_start"] is not None for _, e in items)
+
+        def conflicts(a: str, b: str) -> bool:
+            return not video or segments_overlap(presence[a], presence[b])
+
+        await self.identity.assign_media(people, reid.space, conflicts=conflicts)
 
     # ── video ─────────────────────────────────────────────────────────────────
     async def analyze_video(
@@ -831,8 +879,9 @@ class Analyzer:
         info = await get_runtime().run_cpu(_probe_video, path)
         if info is None:
             raise RuntimeError(f"cannot decode video {name}")
+        models = await self._models(opts, plan)  # an invalid model spec fails before anything is stored
         media_id = new_id("m")
-        stored = await self.store.import_file(media_id, path, path.suffix or ".mp4", move=move)
+        stored = await self.store.import_file(media_id, path, move=move)
         await self.store.save_thumb(media_id, info.poster)
         await self.db.insert_media(
             id=media_id, kind="video", name=name, path=str(stored), thumb_path=str(self.store.thumb_path(media_id)), width=info.width, height=info.height,
@@ -840,7 +889,7 @@ class Analyzer:
         )
         emit("media_created", media=serialize.media(await self.db.get_media(media_id)))
         try:
-            await self._video_entities(media_id, stored, info.fps, info.frame_count, opts, plan, emit, cancel, existing=None)
+            await self._video_entities(media_id, stored, info.fps, info.frame_count, models, opts, plan, emit, cancel, existing=None)
             await self.db.update_media(media_id, status="done")
         except Cancelled:
             await self.db.update_media(media_id, status="cancelled")
@@ -850,10 +899,12 @@ class Analyzer:
             raise
         return media_id
 
-    async def _video_entities(self, media_id: str, path: Path, fps: float, n: int, opts: AnalyzeOptions, plan: QueryPlan, emit: Emit, cancel: Optional[threading.Event], existing: Optional[list[Any]]) -> Counts:
+    async def _video_entities(
+        self, media_id: str, path: Path, fps: float, n: int, models: dict[str, Any], opts: AnalyzeOptions, plan: QueryPlan, emit: Emit,
+        cancel: Optional[threading.Event], existing: Optional[list[Any]],
+    ) -> Counts:
         from ..runtime import get_runtime
 
-        models = await self._models(opts, plan)
         det = models["detector"]
         prompts = self._detector_supports(det, plan)
         if not prompts:
@@ -932,7 +983,7 @@ class Analyzer:
             if id(a) in merged:
                 continue
             for b in people[i + 1 :]:
-                if id(b) in merged or _segments_overlap(_presence(a), _presence(b)):
+                if id(b) in merged or segments_overlap(_presence(a), _presence(b)):
                     continue
                 if float(a.reid_embedding @ b.reid_embedding) >= th:  # type: ignore[operator]
                     a.trajectory = _thin_traj(sorted((a.trajectory or []) + (b.trajectory or [])), MAX_TRAJECTORY_POINTS)
@@ -952,11 +1003,12 @@ class Analyzer:
             m = await self.db.get_media(media_id)
             if m is None:
                 raise KeyError(media_id)
+            models = await self._models(opts, plan)
             existing = await self.db.media_entities(media_id)
             if m["kind"] == "video":
-                return await self._video_entities(media_id, Path(m["path"]), m["fps"] or 25.0, m["frame_count"] or 0, opts, plan, emit, cancel, existing)
+                return await self._video_entities(media_id, Path(m["path"]), m["fps"] or 25.0, m["frame_count"] or 0, models, opts, plan, emit, cancel, existing)
             img = await self.store.open_image(m["path"])
-            return await self._image_entities(media_id, img, opts, plan, emit, cancel, existing)
+            return await self._image_entities(media_id, img, models, opts, plan, emit, cancel, existing)
 
     def _media_lock(self, media_id: str) -> asyncio.Lock:
         lock = self._media_locks.get(media_id)

@@ -125,16 +125,17 @@ async def test_scan_adds_only_new_detections(app_ctx: Any, tmp_path: Path) -> No
 
     scan = jobs.submit_scan(None, AnalyzeOptions(query="knives, people", describe="none"))
     await jobs.wait(scan)
-    assert scan.status == "done" and scan.summary == {"scanned": 1, "media_with_hits": 1, "entities": 1}
+    assert scan.status == "done" and scan.summary == {"scanned": 1, "media_with_hits": 1, "accepted": 2, "rejected": 0, "updated": 0}  # the new knife + the stored person
     assert sorted(e["label"] for e in (await jobs._detail(mid))["entities"]) == ["knife", "person"]
 
 
-def test_collect_paths(tmp_path: Path) -> None:
+async def test_collect_paths(app_ctx: Any, tmp_path: Path) -> None:
     (tmp_path / "sub").mkdir()
     for name in ("a.jpg", "sub/b.PNG", "sub/c.mp4", "notes.txt"):
         (tmp_path / name).write_bytes(b"x")
-    items = JobManager.collect_paths([str(tmp_path), str(tmp_path / "a.jpg"), str(tmp_path / "missing.jpg")])
+    jobs: JobManager = app_ctx.jobs
+    items = await jobs.collect_paths([str(tmp_path), str(tmp_path / "a.jpg"), str(tmp_path / "missing.jpg")], restricted=False)
     assert [(i.name, i.kind, i.temporary) for i in items] == [
         ("a.jpg", "image", False), ("b.PNG", "image", False), ("c.mp4", "video", False), ("a.jpg", "image", False),
     ]
-    assert len(JobManager.collect_paths([str(tmp_path)], max_items=2)) == 2
+    assert len(await jobs.collect_paths([str(tmp_path)], max_items=2, restricted=False)) == 2

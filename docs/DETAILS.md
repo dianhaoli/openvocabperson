@@ -25,7 +25,7 @@ This file covers how each part works and how to run it. The HTTP contract is in 
 |---|---|---|
 | *(empty)* | `default` | The 80 COCO classes. The detector runs its own vocabulary, with confidence capped at 0.2 |
 | `people, dogs` | `literal` / `lexicon` | `person`, `dog` (COCO synonyms are normalised) |
-| `dangerous things` | `llm` or `lexicon` | knife, gun, scissors, fire, … plus the check "Is this a potentially dangerous object…?" |
+| `dangerous things` | `llm` or `lexicon` | knife, gun, scissors, fire, … plus the check "Is this a potentially dangerous object…?". Objects only: no person concept unless the query mentions people or a human behaviour ("armed people", "someone fighting") |
 | `menacing people` | `llm` or `lexicon` | Detect `person`, then ask the VLM "Does this person appear menacing?" (a `person_attribute` concept) |
 
 `expand` controls when the LLM is used:
@@ -40,9 +40,10 @@ The LLM is the configured LLM, or the VLM when no LLM is set. Plans are cached p
 
 `Analyzer.analyze_image` in `ovp/pipeline/analyzer.py`:
 
-1. **Store.** The original (EXIF-rotated, saved as JPEG) and a thumbnail are written, and a `media` row is created with status `processing`.
-2. **Detect.** The detector runs with the plan's prompts. Closed-set detectors (YOLO11) only receive the prompts that are COCO classes. If the query needs open vocabulary and the default detector is closed-set, the analyzer switches automatically to an open-vocabulary one: an already loaded one first, then YOLOE, YOLO-World, and finally VLM grounding (`vlm:<vlm spec>`: its boxes are only as precise as the VLM; Gemini and Qwen-VL are trained for grounding, OpenAI models give coarse boxes). This does not happen when a detector was requested explicitly. Cross-prompt NMS (`OVP_NMS_IOU`) then removes duplicate boxes from overlapping prompts. Person boxes are protected from being suppressed by object boxes, so a person holding a bag keeps both.
+1. **Store.** The original (EXIF-rotated, saved as JPEG) and a thumbnail are written, and a `media` row is created with status `processing`. Stored files never keep the client's file suffix: images are `.jpg`, videos keep a known video suffix (`.mp4`, `.mov`, `.mkv`, …) or get `.mp4`. Per-request model specs were already validated (400) before this step, so a bad spec leaves no media behind.
+2. **Detect.** The detector runs with the plan's prompts. Closed-set detectors (YOLO11) only receive the prompts that are COCO classes. If the query needs open vocabulary and the default detector is closed-set, the analyzer switches automatically to an open-vocabulary one: an already loaded one first, then YOLOE, YOLO-World, and finally VLM grounding (`vlm:<vlm spec>`: its boxes are only as precise as the VLM; Gemini and Qwen-VL are trained for grounding, OpenAI models give coarse boxes). This does not happen when a detector was requested explicitly. **Threshold:** a `conf` in the options is used exactly; without one the threshold is recall-oriented, min(`OVP_CONF`, 0.2) for the default vocabulary and min(`OVP_CONF`, 0.15) for text queries (open-vocabulary prompts score low, and VLM verification filters the extra candidates). Cross-prompt NMS (`OVP_NMS_IOU`) then removes duplicate boxes from overlapping prompts. Person boxes are protected from being suppressed by object boxes, so a person holding a bag keeps both.
 3. **Route.** Each detection becomes a candidate crop, padded by `OVP_EXPAND_RATIO`.
+   - The candidate gets the concept that claims its label (a plain concept first, else a verification concept); a verified "yes" can re-assign it to the concept that was confirmed. Persons claimed by a `person_attribute` concept ("menacing people") and rejected candidates keep that concept, so you can see which query they were checked against.
    - Concepts with `verify` get VLM questions.
    - `describe` selects which crops get described: `persons`, `all` or `none`.
    - Persons below `OVP_LOW_CONF` are kept as `low_confidence`, with no description and no Re-ID.
@@ -69,7 +70,7 @@ Entity `stage` values:
 `Analyzer.analyze_video`:
 
 - **Sampling.** Frames are decoded on a background reader thread at `min(native fps, OVP_VIDEO_FPS)`, up to `OVP_MAX_FRAMES` frames. Longer videos are sampled more sparsely.
-- **Tracking.** The detector tracks with ByteTrack across the sampled frames. This needs a YOLO, YOLOE or YOLO-World detector; VLM and HF detectors cannot track. Each track keeps:
+- **Tracking.** The detector runs on each sampled frame and the analyzer links the boxes with ByteTrack, so any detector can process video (YOLO, YOLOE, YOLO-World, OWLv2, Grounding DINO, VLM boxes). A track lost for more than 2 s is closed; longer gaps are re-joined by stitching. Each track keeps:
   - the majority label
   - a thinned trajectory (`[t, x1, y1, x2, y2]`, at most 240 points)
   - the best-quality crop and its frame index
@@ -79,11 +80,13 @@ Entity `stage` values:
 - **Processing.** The tracks then go through the same crop processing as images: one entity per track, with `t_start`, `t_end`, `frame_index` and `trajectory`.
 - **Cancellation.** It is checked inside the tracking loop.
 
-A library scan (`POST /api/scan`, the agent's `find_in_library`) re-runs detection with a new query over stored media. It only adds entities that do not overlap existing ones (same label, IoU > 0.7, or the same time span for tracks).
+A library scan (`POST /api/scan`, the agent's `find_in_library`) re-runs detection with a new query over stored `done` media. Detections that do not overlap a stored entity (same label, IoU > 0.7, or the same time span for tracks) are stored as new entities. Stored entities detected again are re-checked instead: verified for the scan's concept → stored as verified with that concept; claimed by a plain concept → re-labelled, unless they are verified for another concept; denied by the VLM for the concept they are stored with → stored as `rejected`, and a rejected person sighting is unlinked from its person (so it leaves `sighting_count` and the person's sightings); a stored rejected person sighting that a scan accepts again is linked to a person again (matched by Re-ID like a new one). The `detections` event of a scan counts only the new detections; the job summary counts both (`accepted`, `rejected`, `updated`). Scans of one media item run one at a time.
 
 ## Identity (Re-ID clusters)
 
-`ovp/services/identity.py`. Each person cluster stores a centroid (mean Re-ID embedding) in its Re-ID space, such as `reid:osnet:osnet_x1_0`. pgvector computes it with `AVG` and recomputes it whenever membership changes, including on deletes and merges.
+`ovp/services/identity.py`. Each person cluster stores a centroid (mean Re-ID embedding) in its Re-ID space: `reid:osnet:<model>` (e.g. `reid:osnet:osnet_x1_0`), `reid:clip:<model>` (e.g. `reid:clip:ViT-B-32`) or `reid:color:v2`. pgvector computes it with `AVG` and recomputes it whenever membership changes, including on deletes and merges.
+
+**Re-ID space migration.** Vectors of different spaces are not comparable. After a Re-ID model switch, or an upgrade from a version that stored the older `reid:clip` / `reid:color` spaces, new sightings would never match the known people. `reembed_orphaned` therefore re-embeds every person sighting that has Re-ID vectors only in other spaces from its stored crop, moves the persons to the active space and recomputes their centroids. Sightings whose crop file is gone are counted as `missing`. The server runs it in the background after the model warm-up; `python -m ovp reembed` runs it on demand. Old vectors are kept, so switching back is free.
 
 **Linking one media item.** All sightings of one media item are matched together, under a process-wide lock so that concurrent uploads cannot create duplicate clusters:
 
@@ -97,11 +100,11 @@ A library scan (`POST /api/scan`, the agent's `find_in_library`) re-runs detecti
 |---|---|---|
 | OSNet | 0.75 | 0.60 |
 | CLIP | 0.88 | 0.80 |
-| Colour histogram | 0.93 | 0.86 |
+| Colour descriptor (`reid:color:v2`) | 0.87 | 0.78 |
 
 `OVP_REID_MATCH` and `OVP_REID_REVIEW` override them.
 
-**Review.** `POST /api/entities/{id}/review` takes `accept` (link to the suggestion), `new` (create a cluster) or `reject` (unlink). `assign` sets the person by hand (`manual`).
+**Review.** `POST /api/entities/{id}/review` takes `accept` (link to the suggestion), `new` (create a cluster) or `reject` (unlink). `assign` sets the person by hand (`manual`); only person entities can be linked (400 otherwise).
 
 **Re-cluster.** `POST /api/persons/recluster` runs centroid-linkage agglomerative clustering over all sightings, with a cannot-link constraint inside the same media. Above 4000 sightings it switches to single-pass leader clustering. Named, watch-listed and manually confirmed clusters are anchors: they keep their sightings and absorb similar clusters. Existing cluster ids are reused where possible.
 
@@ -137,8 +140,9 @@ All answers are stored in the `qa` table.
 - **Every analysis is a job**: uploads, server paths, library scans, CLI runs and agent tool calls. Upload handlers spool files to `OVP_STORAGE_DIR/tmp` and return at once, and the job runs on its own. Use `?wait=true` to block until it finishes.
 - **Concurrency.** Up to `OVP_JOB_CONCURRENCY` jobs run at once, and up to `OVP_MEDIA_CONCURRENCY` media items per job. Local models are still serialized on the device thread, while cloud VLM calls overlap.
 - **Events.** They are kept per job, up to 5 000 (the final `job_done` always). A late SSE subscriber (`GET /api/jobs/{id}/events`) gets a replay first. That is how the UI reattaches to running jobs after a reload. Finished jobs beyond the newest 20 keep only `job_done`, and a subscriber that falls 2 000 events behind is disconnected (it can reconnect and replay).
-- **Cancellation** is cooperative: it is checked between stages and between video frames. The media being processed is stored with status `cancelled` and hidden from the library; items that did not finish are not counted in `progress.done`.
-- **Summary.** A finished analyze job reports `{media, entities, failed}`; a scan reports `{scanned, media_with_hits, accepted, rejected, updated}` (`accepted`: entities that match the query, newly stored or already stored; `rejected`: candidates the VLM verification denied; `updated`: stored entities whose concept or verification the scan changed).
+- **Cancellation** is cooperative: it is checked between stages and between video frames. The media being processed is stored with status `cancelled`; items that did not finish are not counted in `progress.done`.
+- **Failed and cancelled media.** Media rows that a failed or cancelled item leaves behind (status `error` / `cancelled`) are listed in the job's `failed_media_ids`. They are hidden from the default library listing; `GET /api/media?status=error,cancelled` (the UI's Library status filter) lists them so they can be deleted.
+- **Summary.** A finished analyze job reports `{media, entities, failed}` (`entities` counts accepted entities only, as `Media.entity_count` does); a scan reports `{scanned, media_with_hits, accepted, rejected, updated}` (`accepted`: entities that match the query, newly stored or already stored; `rejected`: candidates the VLM verification denied; `updated`: stored entities whose concept or verification the scan changed).
 - **Memory.** Jobs live in memory only and are lost on restart; the newest 100 finished jobs are kept. Their results (media and entities) are in PostgreSQL. On startup, media left in `processing` by a previous run are marked `error`, and the upload spool is emptied. On shutdown, running jobs are cancelled and awaited (up to 10 s) before the database closes.
 - **Server paths.** `POST /api/analyze/paths` and the agent's `analyze_paths` only read inside `OVP_IMPORT_ROOTS` (resolved, so symlinks cannot escape; symlinks inside a walked folder are skipped). Without it they return 403. The CLI reads any path.
 
@@ -165,6 +169,10 @@ All answers are stored in the `qa` table.
 ## Model registry and runtime
 
 **Specs.** `ovp/models/registry.py` resolves `provider:model` specs into instances. It builds each one lazily, caches it, and warms it up (`ensure`) under a per-model lock.
+
+**Per-request specs** (`detector`, `segmenter`, `vlm`, `llm` in the analyze options, the agent's `llm`) go through `registry.resolve` when the request arrives, and an invalid one is a 400 before anything is stored. Validation is lexical: `..` is refused; local weights must lie in the working directory or `OVP_WEIGHTS_DIR`, and never in `OVP_STORAGE_DIR`, where uploaded files live (also through symlinks); weight files need a `.pt`, `.pth`, `.ts`, `.onnx`, `.engine`, `.safetensors` or `.bin` suffix, since `.pt` files are pickles. The configured defaults are trusted as written.
+
+**Model cache.** The defaults stay loaded. At most 4 other models (per-request specs) are kept besides them; when a fifth is loaded, the least recently used one is unloaded. A job still holding an evicted local model keeps working, because it reloads lazily.
 
 **Failures.** A model that fails to load, for example because its weights cannot be downloaded, is recorded with a short reason. It then shows up as unavailable in `GET /api/models` instead of failing requests. `PATCH /api/config` clears that error and retries.
 
@@ -209,6 +217,7 @@ Files live under `OVP_STORAGE_DIR`: `media/` for originals, `thumbs/`, `crops/`,
 | `serve [--host --port --reload --log-level]` | Runs uvicorn with `ovp.api.app:app` |
 | `analyze PATH... [--query Q] [--describe persons\|all\|none] [--segment] [--expand/--verify auto\|true\|false] [--detector/--segmenter/--vlm/--llm SPEC] [--conf] [--video-fps] [--max-frames] [--no-reid] [--quiet] [--json]` | Analyzes files and folders (folders recursively) as one job. Progress goes to stderr. The result is a table or `{job, media: MediaDetail[]}` |
 | `search [TEXT] [--image FILE] [--limit] [--label L]... [--kind] [--media ID] [--person ID] [--json]` | Hybrid search. JSON output has the same shape as `POST /api/search` |
+| `reembed [--json] [-v]` | Re-embeds person sightings of older Re-ID spaces with the active Re-ID model (see [Identity](#identity-re-id-clusters)); prints the counts |
 | `models [--check] [--json]` | Shows providers, availability and defaults. `--check` loads every default model. This command needs no database |
 
 Everything that libraries print, including C-level output, is redirected to stderr, so stdout holds only the result. Exit codes:
@@ -275,7 +284,8 @@ The tests use fake models (`tests/fakes.py`) against a real PostgreSQL. Cloud pr
 | YOLOE / YOLO-World unavailable: "pip install git+https://github.com/ultralytics/CLIP.git" | The CLIP text encoder package is missing. Without it, `auto` falls back to closed-set YOLO11 |
 | `vlm: false` in `/api/health` and no descriptions | No VLM is configured. Set a provider key, `OVP_COMPAT_BASE_URL`, or use `qwen:` on a GPU |
 | Agent returns 503 | No LLM is configured. Set a key, or `OVP_LLM=compat:<model>` |
-| "detector … cannot track video" | Videos need a YOLO, YOLOE or YOLO-World detector |
+| Analyze returns 400 "local weights must be inside OVP_WEIGHTS_DIR or the working directory" (or "must be a .pt/… file") | A per-request spec points outside the allowed folders, into `OVP_STORAGE_DIR`, or at a file without a weights suffix. Move the weights into `OVP_WEIGHTS_DIR` |
+| Known people are no longer matched after an upgrade or a Re-ID model switch | Their sightings are in another Re-ID space. The server re-embeds them in the background after start-up (see the log); run `python -m ovp reembed` to do it now. Sightings whose crop files were deleted cannot be moved |
 | Persons never matched across uploads / `reid: color` | OSNet could not load. `torchreid` also needs `scipy` and `tensorboard` to import (both in requirements.txt), and its weights come from Google Drive. Install `torchreid gdown scipy tensorboard` and make sure the download works, or accept the CLIP or colour fallback with its stricter thresholds |
 | Too many `pending` reviews, or different people merged | Tune `OVP_REID_MATCH` / `OVP_REID_REVIEW`, then run `POST /api/persons/recluster` |
 | Some crops not described | More than `OVP_MAX_VLM_CROPS` candidates in one media item. A `log` warning says how many were skipped |
@@ -284,6 +294,6 @@ The tests use fake models (`tests/fakes.py`) against a real PostgreSQL. Cloud pr
 | "Analyze server paths" or the agent's `analyze_paths` fails with 403 | Server-side imports are off. Set `OVP_IMPORT_ROOTS` to the folders the server may read, or upload the files instead |
 | Upload fails with 413 | The request is larger than `OVP_MAX_UPLOAD_MB` (all files together). Raise it, or upload in smaller batches |
 | The UI on another origin gets CORS errors | Add its origin to `OVP_CORS_ORIGINS` (the UI served by the API itself and the Vite dev proxy need no entry) |
-| Library shows a media item as `processing` forever | The server stopped mid-analysis. The next start marks it `error` (hidden from the library); delete it or analyze the file again |
+| Library shows a media item as `processing` forever | The server stopped mid-analysis. The next start marks it `error`; find it under Library ▸ Status ▸ Failed (`GET /api/media?status=error`), delete it or analyze the file again |
 | UI shows "The React UI is not built" | Run `cd frontend && npm ci && npm run build`, or set `OVP_FRONTEND_DIST` |
 | `cannot connect to PostgreSQL` | Check `DATABASE_URL`. The database also needs the `vector` extension, which the server creates if it has the rights to |

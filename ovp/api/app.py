@@ -24,9 +24,10 @@ from .. import __version__, serialize
 from ..config import get_settings
 from ..context import AppContext, create_context, get_context
 from ..jobs import InputItem, PathNotAllowed
-from ..models.registry import ModelUnavailable, normalize_spec
+from ..models.registry import ModelUnavailable
 from ..pipeline.analyzer import AnalyzeOptions
 from ..runtime import get_runtime
+from ..storage.db import MEDIA_STATUSES
 from ..storage.files import FileStore, media_kind
 
 log = logging.getLogger("ovp.api")
@@ -45,15 +46,15 @@ async def lifespan(app: FastAPI):
     if interrupted:
         log.warning("marked %d media interrupted by the previous run as 'error'", interrupted)
     ctx.jobs.purge_tmp()
-    if get_settings().load_models_on_startup:
-        # load models in the background: the API (library, search, history) is usable immediately
-        ctx.warmup_task = asyncio.create_task(ctx.warmup())
-    else:
-        ctx.ready = True
+    preload = get_settings().load_models_on_startup
+    ctx.ready = not preload
+    # load models and migrate old Re-ID spaces in the background: the API (library, search,
+    # history) is usable immediately
+    ctx.startup_task = asyncio.create_task(ctx.startup(preload))
     log.info("OpenVocab Vision API up · device=%s · defaults=%s", ctx.registry.device, ctx.registry.defaults)
     yield
-    if ctx.warmup_task:
-        ctx.warmup_task.cancel()
+    if ctx.startup_task:
+        ctx.startup_task.cancel()
     await ctx.jobs.shutdown(timeout=10)  # running jobs stop before the models and the pool close
     await ctx.registry.aclose()
     await ctx.db.close()
@@ -184,7 +185,12 @@ async def plan(body: PlanRequest) -> dict[str, Any]:
     return p.to_dict()
 
 
+SPEC_OPTIONS = ("detector", "segmenter", "vlm", "llm")  # per-request model specs in AnalyzeOptions
+
+
 def parse_options(raw: Optional[str | dict]) -> AnalyzeOptions:
+    """AnalyzeOptions from a JSON string or object. Model specs are validated here (HTTP 400),
+    before a job starts or any media row is created."""
     if raw is None or raw == "":
         return AnalyzeOptions()
     if isinstance(raw, str):
@@ -195,9 +201,18 @@ def parse_options(raw: Optional[str | dict]) -> AnalyzeOptions:
     if not isinstance(raw, dict):
         raise HTTPException(400, "options must be a JSON object")
     try:
-        return AnalyzeOptions.from_dict(raw)
+        opts = AnalyzeOptions.from_dict(raw)
     except TypeError as e:
         raise HTTPException(400, str(e))
+    for role in SPEC_OPTIONS:
+        spec = getattr(opts, role)
+        if spec is not None and not isinstance(spec, str):
+            raise HTTPException(400, f"options.{role} must be a model spec string")
+        try:
+            ctx().registry.resolve(role, spec)
+        except ModelUnavailable as e:
+            raise HTTPException(400, str(e)) from e
+    return opts
 
 
 async def job_payload(job: Any) -> dict[str, Any]:
@@ -222,7 +237,7 @@ async def analyze(
             kind = media_kind(f.filename or "", f.content_type)
             if kind is None:
                 raise HTTPException(400, f"unsupported file type: {f.filename}")
-            path = c.jobs.tmp_path(f.filename or ("upload.mp4" if kind == "video" else "upload.jpg"))
+            path = c.jobs.tmp_path(f.filename or "", kind)
             items.append(InputItem(path, f.filename or path.name, kind))
             with open(path, "wb") as out:
                 while chunk := await f.read(1 << 20):
@@ -251,13 +266,14 @@ class PathsRequest(BaseModel):
 @app.post("/api/analyze/paths")
 async def analyze_paths(body: PathsRequest, wait: bool = Query(False)) -> dict[str, Any]:
     c = ctx()
+    opts = parse_options(body.options)
     try:
         items = await c.jobs.collect_paths(body.paths)
     except PathNotAllowed as e:
         raise HTTPException(403, str(e)) from e
     if not items:
         raise HTTPException(400, "no images or videos found at the given paths")
-    job = c.jobs.submit_analyze(items, parse_options(body.options))
+    job = c.jobs.submit_analyze(items, opts)
     if wait:
         await c.jobs.wait(job)
         return await job_payload(job)
@@ -318,10 +334,16 @@ async def cancel_job(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/media")
-async def list_media(limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0), kind: Optional[str] = None) -> dict[str, Any]:
+async def list_media(
+    limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0), kind: Optional[str] = None, status: str = "done,processing",
+) -> dict[str, Any]:
     c = ctx()
-    rows = await c.db.list_media(limit, offset, kind)
-    return {"media": [serialize.media(r) for r in rows], "total": await c.db.count_media(kind)}
+    statuses = sorted({s.strip() for s in status.split(",") if s.strip()})
+    bad = [s for s in statuses if s not in MEDIA_STATUSES]
+    if bad or not statuses:
+        raise HTTPException(400, f"status must be a comma list of {', '.join(MEDIA_STATUSES)}")
+    rows = await c.db.list_media(limit, offset, kind, statuses)
+    return {"media": [serialize.media(r) for r in rows], "total": await c.db.count_media(kind, statuses)}
 
 
 async def _media(media_id: str) -> Any:
@@ -449,10 +471,12 @@ class AssignRequest(BaseModel):
 @app.post("/api/entities/{entity_id}/assign")
 async def assign_entity(entity_id: str, body: AssignRequest) -> dict[str, Any]:
     c = ctx()
-    await _entity(entity_id)
-    if body.person_id and await c.db.get_person(body.person_id) is None:
+    if (await _entity(entity_id))["label"] != "person":
+        raise HTTPException(400, "only person entities can be linked to a person")
+    try:
+        await c.identity.assign(entity_id, body.person_id)
+    except KeyError:
         raise HTTPException(404, "person not found")
-    await c.identity.assign(entity_id, body.person_id)
     return serialize.entity(await _entity(entity_id))
 
 
@@ -627,7 +651,7 @@ class ChatRequest(BaseModel):
 async def agent_chat(body: ChatRequest) -> StreamingResponse:
     c = ctx()
     try:
-        spec = normalize_spec("llm", body.llm, get_settings()) if body.llm else None
+        spec = c.registry.resolve("llm", body.llm) if body.llm else None
     except ModelUnavailable as e:
         raise HTTPException(400, str(e)) from e
     llm = await c.registry.ensure("llm", spec)

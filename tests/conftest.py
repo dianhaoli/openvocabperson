@@ -1,9 +1,10 @@
 """Shared fixtures.
 
-Tests run against a real PostgreSQL + pgvector database (``OVP_TEST_DATABASE_URL``, default
-``postgresql://postgres@localhost:5432/ovp_test``) with fake models. The schema is rebuilt once
-per session and every table is truncated before each test. Database tests are skipped when the
-server is unreachable.
+Tests run against a real PostgreSQL + pgvector server (``OVP_TEST_DATABASE_URL``, default
+``postgresql://postgres@localhost:5432/ovp_test``) with fake models. Each run creates its own
+database, named after the URL's database plus the process id (``ovp_test_<pid>``), so concurrent
+runs cannot truncate each other's data; it is dropped at the end. Every table is truncated before
+each test. Database tests are skipped when the server is unreachable.
 """
 
 from __future__ import annotations
@@ -14,7 +15,9 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import urlsplit, urlunsplit
 
-TEST_DB_URL = os.environ.get("OVP_TEST_DATABASE_URL", "postgresql://postgres@localhost:5432/ovp_test")
+_BASE_URL = urlsplit(os.environ.get("OVP_TEST_DATABASE_URL", "postgresql://postgres@localhost:5432/ovp_test"))
+TEST_DB_NAME = f"{_BASE_URL.path.lstrip('/') or 'ovp_test'}_{os.getpid()}"  # per run: prefix other test databases with it
+TEST_DB_URL = urlunsplit(_BASE_URL._replace(path=f"/{TEST_DB_NAME}"))
 _STORAGE = Path(tempfile.mkdtemp(prefix="ovp_test_storage_"))
 
 # Settings are read lazily from the environment: pin them before any ``ovp`` import.
@@ -84,13 +87,14 @@ async def drop_database(name: str) -> None:
 @pytest.fixture(scope="session")
 async def database() -> AsyncIterator[Database]:
     try:
-        url = await recreate_database(urlsplit(TEST_DB_URL).path.lstrip("/"))
+        url = await recreate_database(TEST_DB_NAME)
     except (OSError, asyncpg.PostgresError) as e:
         pytest.skip(f"PostgreSQL unavailable at {TEST_DB_URL}: {e}")
     database = Database(url)
     await database.connect()
     yield database
     await database.close()
+    await drop_database(TEST_DB_NAME)
 
 
 @pytest.fixture

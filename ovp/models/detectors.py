@@ -14,8 +14,6 @@ All local inference runs on the device thread (see ``runtime.py``).
 from __future__ import annotations
 
 import logging
-import math
-import tempfile
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -112,38 +110,10 @@ def _ul_device() -> str:
     return "0" if d == "cuda" else d
 
 
-TRACK_LOST_SECONDS = 2.0  # how long ByteTrack keeps a lost track alive; longer gaps are re-joined by Re-ID stitching
-
-
-def _bytetrack_config(sample_fps: float, conf: float) -> tuple[str, float]:
-    """A ByteTrack config for the *sampled* frame rate and detection threshold.
-
-    Ultralytics' defaults assume every frame of a ~30 fps video (track_buffer=30 frames ≈ 1 s) and a
-    fixed 0.25 track threshold. At 2 fps sampling the default would keep lost tracks for 15 s and
-    hand a vanished person's ID to whoever appears near the predicted box. Returns the YAML path and
-    the (lower) detector confidence that feeds ByteTrack's second, low-score association stage.
-    """
-    buffer = max(2, math.ceil(TRACK_LOST_SECONDS * sample_fps))
-    low = round(max(0.05, conf * 0.4), 3)
-    conf = round(conf, 3)
-    path = Path(tempfile.gettempdir()) / "ovp-trackers" / f"bytetrack-b{buffer}-c{conf}.yaml"
-    if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(f".{threading.get_ident()}.tmp")
-        tmp.write_text(
-            "tracker_type: bytetrack\n"
-            f"track_high_thresh: {conf}\ntrack_low_thresh: {low}\nnew_track_thresh: {conf}\n"
-            f"track_buffer: {buffer}\nmatch_thresh: 0.8\nfuse_score: True\n"
-        )
-        tmp.replace(path)
-    return str(path), low
-
-
 class Detector:
     kind = "base"
     open_vocab = False
     supports_masks = False
-    supports_tracking = False
     local = True
 
     def __init__(self, weights: str):
@@ -161,7 +131,7 @@ class Detector:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Ultralytics family (YOLO / YOLOE / YOLO-World): detection, masks, tracking
+# Ultralytics family (YOLO / YOLOE / YOLO-World): detection and masks
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -169,8 +139,6 @@ PE_CACHE_SIZE = 2048  # YOLOE prompt embeddings kept in memory (a few KB each)
 
 
 class UltralyticsDetector(Detector):
-    supports_tracking = True
-
     def __init__(self, kind: str, weights: str, weights_dir: Path, max_det: int = 100):
         super().__init__(weights)
         self.kind = kind
@@ -250,14 +218,13 @@ class UltralyticsDetector(Detector):
             self._pe_cache.popitem(last=False)
         return torch.stack([self._pe_cache[n] for n in names])[None]
 
-    def _parse(self, r: Any, allowed: Optional[set[str]], track: bool = False) -> list[Detection]:
+    def _parse(self, r: Any, allowed: Optional[set[str]]) -> list[Detection]:
         dets: list[Detection] = []
         if r.boxes is None or len(r.boxes) == 0:
             return dets
         boxes = r.boxes.xyxy.cpu().numpy()
         confs = r.boxes.conf.cpu().numpy()
         clss = r.boxes.cls.cpu().numpy().astype(int)
-        ids = r.boxes.id.cpu().numpy().astype(int) if (track and r.boxes.id is not None) else None
         polys = r.masks.xy if (r.masks is not None) else None
         for i in range(len(boxes)):
             label = r.names[int(clss[i])]
@@ -267,7 +234,6 @@ class UltralyticsDetector(Detector):
                 box=tuple(float(v) for v in boxes[i]),  # type: ignore[arg-type]
                 score=float(confs[i]),
                 label=label,
-                track_id=int(ids[i]) if ids is not None else None,
             )
             if polys is not None and i < len(polys) and len(polys[i]) >= 3:
                 d.polygons = simplify_polygons([polys[i]])
@@ -290,41 +256,6 @@ class UltralyticsDetector(Detector):
 
     async def detect(self, image: Image.Image, prompts: Optional[list[str]], conf: float) -> list[Detection]:
         return await get_runtime().run_model(self._detect_sync, image, prompts, conf)
-
-    def track_frames_sync(
-        self,
-        frames: Iterable[tuple[int, float, np.ndarray]],
-        prompts: Optional[list[str]],
-        conf: float,
-        on_frame: Callable[[int, float, np.ndarray, list[Detection]], None],
-        should_stop: Callable[[], bool] = lambda: False,
-        sample_fps: float = 30.0,
-    ) -> None:
-        """Run ByteTrack over sampled BGR frames. ``on_frame`` gets every frame's tracked detections.
-
-        The tracker is re-created on the first frame of every call (``persist=False``), so no
-        state leaks between videos, and the shared predictor stays usable for plain ``predict``.
-        """
-        with self._lock:
-            allowed = self._set_vocab(prompts)
-            if allowed is not None and not allowed:
-                return
-            model = self._load()
-            classes = self._class_ids(allowed)
-            tracker, low_conf = _bytetrack_config(sample_fps, conf)
-            try:
-                for i, (idx, t, frame) in enumerate(frames):
-                    if should_stop():
-                        break
-                    r = model.track(
-                        frame, persist=i > 0, conf=low_conf, iou=0.5, max_det=self.max_det, classes=classes,
-                        tracker=tracker, device=_ul_device(), verbose=False,
-                    )[0]
-                    on_frame(idx, t, frame, self._parse(r, allowed, track=True))
-            finally:
-                predictor = getattr(model, "predictor", None)
-                if predictor is not None:
-                    predictor.trackers = []  # drop the finished video's track state (frames, Kalman filters)
 
     async def warmup(self) -> None:
         await get_runtime().run_model(self._detect_sync, Image.new("RGB", (64, 64)), None, 0.5)

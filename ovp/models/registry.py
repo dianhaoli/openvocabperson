@@ -76,28 +76,57 @@ TEXT_EMBEDDER_PROVIDERS = ("openai", "gemini", "ollama", "compat", "st", "clip")
 REID_KINDS = ("osnet", "clip", "color")
 
 
+WEIGHT_SUFFIXES = (".pt", ".pth", ".ts", ".onnx", ".engine", ".safetensors", ".bin")
+
+
 def _allowed_roots(s: Settings) -> list[Path]:
     return [Path(os.path.abspath(Path.cwd())), Path(os.path.abspath(s.weights_dir.expanduser()))]
 
 
+def _inside(path: Path, root: Path) -> bool:
+    return path == root or path.is_relative_to(root)
+
+
+def _in_storage(path: Path, s: Settings) -> bool:
+    """Whether ``path`` (also through symlinks) lies in the media storage, which holds uploaded files."""
+    store = Path(os.path.abspath(s.storage_dir.expanduser()))
+    return _inside(path, store) or _inside(path.resolve(), store.resolve())
+
+
+def _check_local(role: str, spec: str, path: Path, s: Settings, require_suffix: bool) -> None:
+    """Weights on disk must be a known weights format (or a model folder) and never stored media."""
+    if _in_storage(path, s):
+        raise InvalidSpec(role, spec, "model weights cannot be loaded from the media storage")
+    if path.is_dir():
+        return
+    if path.suffix.lower() not in WEIGHT_SUFFIXES and (require_suffix or path.exists()):
+        raise InvalidSpec(role, spec, f"model weights must be a {'/'.join(WEIGHT_SUFFIXES)} file or a model folder")
+
+
 def _check_weights(role: str, spec: str, weights: str, s: Settings, repo_id: bool = False) -> str:
     """Canonical weights reference, or ``InvalidSpec``. Paths are compared lexically (``..`` is
-    refused outright), so weights symlinked into an allowed folder keep working."""
+    refused outright), so weights symlinked into an allowed folder keep working; the media storage
+    is never an allowed folder, and weights files need a known suffix (a ``.pt`` is a pickle)."""
     if not weights:
         return weights
     parts = weights.replace("\\", "/").split("/")
     if ".." in parts:
         raise InvalidSpec(role, spec, "'..' is not allowed in model weights")
+    cwd, wdir = _allowed_roots(s)
     if _FILE_NAME.match(weights) and weights != ".":
+        # resolved against the working directory, then OVP_WEIGHTS_DIR (see the loaders); a name
+        # that is not on disk is downloaded (Ultralytics) or looked up on the Hub (repo-id kinds)
+        for local in (cwd / weights, wdir / weights):
+            _check_local(role, spec, local, s, require_suffix=False)
+        if not repo_id and Path(weights).suffix.lower() not in WEIGHT_SUFFIXES:
+            raise InvalidSpec(role, spec, f"model weights must be a {'/'.join(WEIGHT_SUFFIXES)} file")
         return weights
-    if repo_id and _REPO_ID.match(weights) and "." not in parts:
+    if repo_id and _REPO_ID.match(weights) and "." not in parts and not Path(weights).exists():
         return weights
     path = Path(os.path.abspath(Path(weights).expanduser()))
-    roots = _allowed_roots(s)
-    if not any(path == r or path.is_relative_to(r) for r in roots):
+    if not any(_inside(path, r) for r in (cwd, wdir)):
         raise InvalidSpec(role, spec, "local weights must be inside OVP_WEIGHTS_DIR or the working directory")
-    cwd, wdir = roots
-    # a plain file name resolves to the working directory first, then OVP_WEIGHTS_DIR (see the loaders)
+    _check_local(role, spec, path, s, require_suffix=not repo_id)
     if path.parent == cwd or (path.parent == wdir and not (cwd / path.name).exists()):
         return path.name
     return str(path)
@@ -560,7 +589,7 @@ class ModelRegistry:
             "clip": ok("embedder"),
             "text_search": ok("text_embedder"),
             "reid": self.reid_kind(),
-            "video": _has("cv2") and det.split(":")[0] in ("yoloe", "yolo-world", "yolo"),
+            "video": _has("cv2") and _has("ultralytics") and ok("detector"),  # any detector; ByteTrack comes with ultralytics
         }
 
     def report(self) -> dict[str, Any]:

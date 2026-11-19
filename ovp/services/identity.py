@@ -8,6 +8,7 @@ Fixes vs. the original implementation
 * centroids are recomputed with pgvector ``AVG`` whenever membership changes (incl. deletes)
 * thresholds depend on the Re-ID backend (OSNet / CLIP / colour histogram)
 * ``recluster`` performs constrained average-linkage clustering over all sightings
+* ``reembed_orphaned`` moves sightings and persons of an older Re-ID space into the active one
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -22,6 +24,7 @@ import numpy as np
 from ..config import Thresholds, get_settings
 from ..models.embedders import l2n
 from ..storage.db import Database
+from ..storage.files import FileStore
 
 log = logging.getLogger("ovp.identity")
 
@@ -200,7 +203,10 @@ class IdentityService:
         return results
 
     async def assign(self, entity_id: str, person_id: Optional[str]) -> None:
+        """Manually link a sighting; raises KeyError if ``person_id`` no longer exists."""
         async with self.lock:
+            if person_id is not None and await self.db.get_person(person_id) is None:
+                raise KeyError(person_id)
             if person_id is None:
                 space = await self._entity_space(entity_id)
                 vec = await self.db.get_embedding(entity_id, space) if space else None
@@ -218,10 +224,14 @@ class IdentityService:
         elif action == "new":
             await self.assign(entity_id, None)
         elif action == "reject":
-            async with self.lock:
-                await self.db.link_entity(entity_id, None, None, None)
+            await self.unlink(entity_id)
         else:
             raise ValueError(f"unknown action {action!r}")
+
+    async def unlink(self, entity_id: str) -> None:
+        """Detach a sighting from its person (and its suggestion); the person's counts are refreshed."""
+        async with self.lock:
+            await self.db.link_entity(entity_id, None, None, None)
 
     async def merge(self, keep: str, other: str) -> bool:
         """Merge person ``other`` into ``keep`` (serialised with matching, so a concurrent
@@ -298,3 +308,60 @@ class IdentityService:
             changed = await self.db.apply_clustering(assignments, new_clusters, space)
             total = len({*assignments.values(), *named}) + len(new_clusters)
             return {"persons": total, "changed": changed, "sightings": len(rows)}
+
+
+REEMBED_BATCH = 32
+
+
+async def reembed_orphaned(db: Database, store: FileStore, reid: Any) -> dict[str, int]:
+    """Bring person sightings and persons of another Re-ID space into ``reid.space``.
+
+    Re-ID vectors of different models (or of an older descriptor version, e.g. ``reid:color`` vs
+    ``reid:color:v2``) are not comparable, so after an upgrade or a model switch new sightings would
+    never match the known people. Sightings that have a Re-ID vector only in other spaces are
+    re-embedded from their stored crop; persons are then moved to the active space and their
+    centroids recomputed from it. The old vectors are kept, so switching back needs no re-embedding.
+    Returns ``{"sightings": re-embedded, "missing": sightings without a readable crop, "persons": moved}``.
+    """
+    space = reid.space
+    assert db.pool
+    rows = await db.pool.fetch(
+        """
+        SELECT DISTINCT e.id, e.crop_path FROM entities e JOIN embeddings b ON b.entity_id = e.id
+        WHERE e.label = 'person' AND b.space LIKE 'reid:%' AND b.space <> $1
+          AND NOT EXISTS (SELECT 1 FROM embeddings x WHERE x.entity_id = e.id AND x.space = $1)
+        ORDER BY e.id
+        """,
+        space,
+    )
+    done = missing = 0
+    for i in range(0, len(rows), REEMBED_BATCH):
+        ids, crops = [], []
+        for r in rows[i : i + REEMBED_BATCH]:
+            try:
+                crops.append(await store.open_image(Path(r["crop_path"])))
+                ids.append(r["id"])
+            except (OSError, TypeError, ValueError):  # no crop path, or the file is gone / unreadable
+                missing += 1
+        if ids:
+            vecs = await reid.embed(crops)
+            await db.upsert_embeddings([(eid, space, l2n(v)) for eid, v in zip(ids, vecs)])
+            done += len(ids)
+    pids = [
+        r["id"]
+        for r in await db.pool.fetch(
+            """
+            SELECT DISTINCT p.id FROM persons p JOIN entities e ON e.person_id = p.id
+            JOIN embeddings b ON b.entity_id = e.id AND b.space = $1
+            WHERE p.space IS DISTINCT FROM $1
+            """,
+            space,
+        )
+    ]
+    if pids:
+        await db.pool.execute("UPDATE persons SET space = $1 WHERE id = ANY($2::text[])", space, pids)
+        for pid in pids:
+            await db.refresh_person(pid)
+    if done or missing or pids:
+        log.info("Re-ID space %s: %d sighting(s) re-embedded, %d without crop, %d person(s) moved", space, done, missing, len(pids))
+    return {"sightings": done, "missing": missing, "persons": len(pids)}

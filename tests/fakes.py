@@ -19,7 +19,8 @@ import numpy as np
 from PIL import Image
 
 from ovp.models.embedders import l2n
-from ovp.models.registry import ROLES
+from ovp.config import get_settings
+from ovp.models.registry import ROLES, normalize_spec
 from ovp.types import Detection
 
 Color = tuple[int, int, int]
@@ -62,7 +63,6 @@ class FakeDetector:
     spec = "fake:detector"
     open_vocab = True
     supports_masks = False
-    supports_tracking = False
 
     def __init__(self, palette: Optional[dict[Color, str]] = None, score: float = 0.9):
         self.palette = palette or DEFAULT_PALETTE
@@ -178,6 +178,14 @@ class FakeRegistry:
         self.models: dict[str, Any] = {role: models.get(role) for role in ROLES}
         self.defaults = {role: (m.spec if m is not None else "none") for role, m in self.models.items()}
         self.errors: dict[str, str] = {}
+
+    def resolve(self, role: str, spec: Optional[str] = None) -> str:
+        """Like ``ModelRegistry.resolve``: the default for None/""/"auto", else a validated spec."""
+        if spec is None or spec.strip() in ("", "auto"):
+            return self.defaults[role]
+        if spec.strip() == self.defaults[role]:
+            return self.defaults[role]
+        return normalize_spec(role, spec, get_settings())
 
     def get(self, role: str, spec: Optional[str] = None) -> Any:
         return self.models[role]

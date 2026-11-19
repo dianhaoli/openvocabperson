@@ -115,7 +115,10 @@ function reduceEvent(state: JobTrackerState, evt: JobEvent): JobTrackerState {
         .sort((a, b) => b[1] - a[1])
         .map(([l, c]) => `${l}×${c}`)
         .join(', ');
-      return addLog(state, 'info', `${evt.count} detection(s)${labels ? `: ${labels}` : ''}`, evt.ts);
+      // A scan only reports detections not already stored; stored ones are re-checked silently and
+      // show up in the job summary (accepted / updated / rejected).
+      const noun = state.job?.kind === 'scan' ? 'new detection(s)' : 'detection(s)';
+      return addLog(state, 'info', `${evt.count} ${noun}${labels ? `: ${labels}` : ''}`, evt.ts);
     }
     case 'entity':
       return state;

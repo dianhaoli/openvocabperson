@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { api } from '../../api/client';
 import { useActions, useAppState } from '../../context/hooks';
 import { TERMINAL_STATUSES, type JobTrackerState } from '../../hooks/useJobTracker';
 import type { JobStatus } from '../../types';
@@ -30,8 +31,10 @@ interface Props {
 
 export function JobPanel({ state, onCancel, onDismiss }: Props) {
   const { currentMediaId } = useAppState();
-  const { openMedia, toastError } = useActions();
+  const { openMedia, toastError, toast, removeMedia, bumpLibrary } = useActions();
   const [cancelling, setCancelling] = useState(false);
+  const [deletedIds, setDeletedIds] = useState<string[]>([]);
+  const [deletingLeftovers, setDeletingLeftovers] = useState(false);
   const [showLog, setShowLog] = useState(true);
   const logRef = useRef<HTMLDivElement>(null);
 
@@ -53,6 +56,26 @@ export function JobPanel({ state, onCancel, onDismiss }: Props) {
         : state.job
           ? jobSummaryText(state.job)
           : '';
+
+  // Media rows that failed / cancelled items left behind; hidden from the default library listing.
+  const leftovers = terminal ? (state.job?.failed_media_ids ?? []).filter((id) => !deletedIds.includes(id)) : [];
+
+  const deleteLeftovers = async () => {
+    setDeletingLeftovers(true);
+    try {
+      for (const id of leftovers) {
+        await api.deleteMedia(id);
+        removeMedia(id);
+        setDeletedIds((prev) => [...prev, id]);
+      }
+      bumpLibrary();
+      toast(`Deleted ${leftovers.length} leftover media`, 'success');
+    } catch (err) {
+      toastError(err, 'Delete failed');
+    } finally {
+      setDeletingLeftovers(false);
+    }
+  };
 
   const cancel = async () => {
     setCancelling(true);
@@ -102,6 +125,17 @@ export function JobPanel({ state, onCancel, onDismiss }: Props) {
           )}
         </div>
       </div>
+
+      {leftovers.length > 0 && (
+        <div className="flex items-center gap-2 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-[11px] text-text-muted">
+          <span className="flex-1">
+            {leftovers.length} media left failed/cancelled (hidden from the library; see Library ▸ Status ▸ Failed / Cancelled)
+          </span>
+          <Button size="xs" variant="secondary" onClick={() => void deleteLeftovers()} loading={deletingLeftovers}>
+            Delete
+          </Button>
+        </div>
+      )}
 
       {state.plan && (
         <details className="text-xs">

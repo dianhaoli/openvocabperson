@@ -12,6 +12,7 @@ import type {
   Media,
   MediaDetail,
   MediaKind,
+  MediaStatus,
   ModelsInfo,
   Person,
   PersonDetail,
@@ -233,8 +234,14 @@ export const api = {
   cancelJob: (id: string) => request<{ job: Job }>(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
 
   // Media & entities
-  listMedia: (params: { limit?: number; offset?: number; kind?: MediaKind | null }, signal?: AbortSignal) =>
-    request<{ media: Media[]; total: number }>('/api/media', { query: params, signal }),
+  listMedia: (
+    params: { limit?: number; offset?: number; kind?: MediaKind | null; status?: MediaStatus[] },
+    signal?: AbortSignal,
+  ) =>
+    request<{ media: Media[]; total: number }>('/api/media', {
+      query: { ...params, status: params.status?.length ? params.status.join(',') : undefined },
+      signal,
+    }),
   media: (id: string, signal?: AbortSignal) => request<MediaDetail>(`/api/media/${encodeURIComponent(id)}`, { signal }),
   deleteMedia: (id: string) => request<unknown>(`/api/media/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   askMedia: (id: string, question: string) =>

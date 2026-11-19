@@ -227,7 +227,8 @@ async def test_hidden_statuses_and_interrupted_media(client: httpx.AsyncClient, 
         await db.update_media(ids[status], status=status)
     listing = (await client.get("/api/media")).json()
     assert {m["id"] for m in listing["media"]} == {ids["done"], ids["processing"]}
-    assert listing["total"] == 1
+    assert listing["total"] == 2
+    assert (await client.get("/api/media", params={"status": "done"})).json()["total"] == 1
     assert (await client.get("/api/stats")).json()["media"] == 1
     assert await db.all_media_ids() == [ids["done"]]
     assert await db.fail_interrupted_media() == 1

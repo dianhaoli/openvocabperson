@@ -69,12 +69,13 @@ class Thresholds:
     review: float
 
 
-# Sensible defaults per Re-ID backend. OSNet features are discriminative; the colour
-# histogram fallback needs much tighter thresholds to avoid merging different people.
+# Sensible defaults per Re-ID backend. OSNet features are discriminative; CLIP and the colour
+# descriptor (``reid:color:v2``, see ``ColorReID``: same person >= 0.85, typically >= 0.91, different
+# people <= 0.82 on the measured photos/videos) need tighter match thresholds.
 REID_THRESHOLDS: dict[str, Thresholds] = {
     "osnet": Thresholds(match=0.75, review=0.60),
     "clip": Thresholds(match=0.88, review=0.80),
-    "color": Thresholds(match=0.93, review=0.86),
+    "color": Thresholds(match=0.87, review=0.78),
 }
 
 

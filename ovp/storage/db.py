@@ -74,6 +74,20 @@ SELECT m.*,
 FROM media m
 """
 
+MEDIA_STATUSES = ("done", "processing", "error", "cancelled")  # statuses the library listing can filter on
+DEFAULT_MEDIA_STATUSES = ("done", "processing")
+
+
+def _media_filter(kind: Optional[str], statuses: Sequence[str], alias: str = "") -> tuple[str, list[Any]]:
+    """The WHERE clause (and its arguments) shared by ``list_media`` and ``count_media``."""
+    args: list[Any] = [list(statuses)]
+    where = f"{alias}status = ANY($1::text[])"
+    if kind:
+        args.append(kind)
+        where += f" AND {alias}kind = $2"
+    return where, args
+
+
 PERSON_SELECT = """
 SELECT p.*,
   (SELECT COUNT(DISTINCT e.media_id) FROM entities e WHERE e.person_id = p.id) AS media_count,
@@ -324,27 +338,23 @@ class Database:
         assert self.pool
         return await self.pool.fetch(MEDIA_SELECT + " WHERE m.id = ANY($1::text[])", list(ids))
 
-    # Library listings, counts, stats and scans cover finished media only ('pending', 'error' and
-    # 'cancelled' rows are hidden); list_media also shows media still being analysed.
-    async def list_media(self, limit: int = 50, offset: int = 0, kind: Optional[str] = None, ids: Optional[Sequence[str]] = None) -> list[asyncpg.Record]:
-        where, args = ["m.status IN ('done', 'processing')"], []
-        if kind:
-            args.append(kind)
-            where.append(f"m.kind = ${len(args)}")
-        if ids is not None:
-            args.append(list(ids))
-            where.append(f"m.id = ANY(${len(args)}::text[])")
+    # Stats and scans cover finished media only. The library listing shows media that are done or
+    # still being analysed by default; failed ('error') and 'cancelled' rows are listed on request.
+    async def list_media(
+        self, limit: int = 50, offset: int = 0, kind: Optional[str] = None, statuses: Sequence[str] = DEFAULT_MEDIA_STATUSES,
+    ) -> list[asyncpg.Record]:
+        where, args = _media_filter(kind, statuses, "m.")
         args += [limit, offset]
         assert self.pool
         return await self.pool.fetch(
-            MEDIA_SELECT + f" WHERE {' AND '.join(where)} ORDER BY m.created_at DESC LIMIT ${len(args) - 1} OFFSET ${len(args)}", *args
+            MEDIA_SELECT + f" WHERE {where} ORDER BY m.created_at DESC LIMIT ${len(args) - 1} OFFSET ${len(args)}", *args
         )
 
-    async def count_media(self, kind: Optional[str] = None) -> int:
+    async def count_media(self, kind: Optional[str] = None, statuses: Sequence[str] = DEFAULT_MEDIA_STATUSES) -> int:
+        """The number of media ``list_media`` pages through with the same filters."""
+        where, args = _media_filter(kind, statuses)
         assert self.pool
-        if kind:
-            return await self.pool.fetchval("SELECT COUNT(*) FROM media WHERE kind = $1 AND status = 'done'", kind)
-        return await self.pool.fetchval("SELECT COUNT(*) FROM media WHERE status = 'done'")
+        return await self.pool.fetchval(f"SELECT COUNT(*) FROM media WHERE {where}", *args)
 
     async def all_media_ids(self, kind: Optional[str] = None, limit: Optional[int] = None) -> list[str]:
         assert self.pool

@@ -19,7 +19,6 @@ import shutil
 import threading
 import time
 import traceback
-import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Optional, Sequence
@@ -28,7 +27,7 @@ from . import serialize
 from .config import get_settings
 from .pipeline.analyzer import AnalyzeOptions, Analyzer, Cancelled
 from .storage.db import Database, new_id
-from .storage.files import FileStore, media_kind
+from .storage.files import IMAGE_EXT, VIDEO_EXT, FileStore, media_kind
 
 log = logging.getLogger("ovp.jobs")
 
@@ -58,6 +57,7 @@ class Job:
     status: str = "queued"
     progress: dict[str, Any] = field(default_factory=lambda: {"done": 0, "total": 0, "stage": None, "message": None})
     media_ids: list[str] = field(default_factory=list)
+    failed_media_ids: list[str] = field(default_factory=list)  # media rows left 'error'/'cancelled'
     error: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
@@ -75,6 +75,7 @@ class Job:
             "status": self.status,
             "progress": dict(self.progress),
             "media_ids": list(self.media_ids),
+            "failed_media_ids": list(self.failed_media_ids),
             "error": self.error,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
@@ -95,7 +96,6 @@ class JobManager:
         s = get_settings()
         self._sem = asyncio.Semaphore(s.job_concurrency)
         self.media_concurrency = s.media_concurrency
-        self._media_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self.tmp_dir = store.root / "tmp"
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -264,15 +264,24 @@ class JobManager:
                 if job.cancel.is_set():
                     return
                 emit("media_started", index=i, total=len(items), name=it.name, kind=it.kind)
+                created: list[str] = []
+
+                def item_emit(type: str, **data: Any) -> None:
+                    if type == "media_created":
+                        created.append(data["media"]["id"])
+                    emit(type, **data)
+
                 try:
                     if it.kind == "video":
-                        mid = await self.analyzer.analyze_video(it.path, it.name, opts, plan, emit, job.cancel, move=it.temporary)
+                        mid = await self.analyzer.analyze_video(it.path, it.name, opts, plan, item_emit, job.cancel, move=it.temporary)
                     else:
                         img = await self.store.open_image(it.path)
-                        mid = await self.analyzer.analyze_image(img, it.name, opts, plan, emit, job.cancel)
+                        mid = await self.analyzer.analyze_image(img, it.name, opts, plan, item_emit, job.cancel)
                 except Cancelled:
+                    job.failed_media_ids += created  # hidden from the library listing, still deletable by id
                     raise
                 except Exception as e:
+                    job.failed_media_ids += created
                     counts["failed"] += 1
                     log.error("analysis of %s failed: %s", it.name, traceback.format_exc())
                     emit("log", level="error", message=f"{it.name}: {e}")
@@ -280,7 +289,8 @@ class JobManager:
                     return
                 job.media_ids.append(mid)
                 detail = await self._detail(mid)
-                counts["entities"] += len(detail["entities"]) if detail else 0
+                # accepted entities only: rejected candidates are stored but not counted (as in entity_count)
+                counts["entities"] += sum(e["stage"] != "rejected" for e in detail["entities"]) if detail else 0
                 emit("media_done", media=detail)
                 advance()
 
@@ -310,9 +320,7 @@ class JobManager:
                     return
                 emit("media_started", index=i, total=len(ids), name=mid, kind=None)
                 try:
-                    # two jobs scanning one media at once would both store the same new entities
-                    async with self._media_lock(mid):
-                        res = await self.analyzer.scan_media(mid, opts, plan, emit, job.cancel)
+                    res = await self.analyzer.scan_media(mid, opts, plan, emit, job.cancel)  # serialised per media by the analyzer
                     for k in found:
                         found[k] += res[k]
                     if res["accepted"]:
@@ -332,12 +340,6 @@ class JobManager:
                 raise r
         job.summary = {"scanned": len(ids), "media_with_hits": len(job.media_ids), **found}
 
-    def _media_lock(self, media_id: str) -> asyncio.Lock:
-        lock = self._media_locks.get(media_id)
-        if lock is None:
-            lock = self._media_locks[media_id] = asyncio.Lock()
-        return lock
-
     async def _detail(self, media_id: str) -> Optional[dict[str, Any]]:
         m = await self.db.get_media(media_id)
         if m is None:
@@ -355,8 +357,15 @@ class JobManager:
         return [serialize.media_detail(media[mid], entities.get(mid, [])) for mid in media_ids if mid in media]
 
     # ── inputs ────────────────────────────────────────────────────────────────
-    def tmp_path(self, name: str) -> Path:
-        suffix = Path(name).suffix.lower()[:8]
+    def tmp_path(self, name: str, kind: Optional[str] = None) -> Path:
+        """A fresh spool path for an upload of ``kind`` (default: guessed from ``name``). The suffix
+        comes from a whitelist (the client's suffix only when it is a known media extension), so
+        an upload can never become, e.g., a ``.pt`` file that a model spec could load."""
+        suffix = Path(name).suffix.lower()
+        if (kind or media_kind(name)) == "video":
+            suffix = suffix if suffix in VIDEO_EXT else ".mp4"
+        else:
+            suffix = suffix if suffix in IMAGE_EXT else ".jpg"
         return self.tmp_dir / f"{new_id('u')}{suffix}"
 
     async def collect_paths(self, paths: list[str], max_items: int = 5000, restricted: bool = True) -> list[InputItem]:

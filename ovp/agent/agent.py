@@ -247,7 +247,7 @@ class Agent:
             missing = [i for i in (keep_id, other_id) if await db.get_person(i) is None]
             if missing:
                 return _fail(f"person(s) not found: {', '.join(missing)}")
-            if not await db.merge_persons(keep_id, other_id):
+            if not await self.ctx.identity.merge(keep_id, other_id):  # serialised with identity matching
                 return _fail("merge failed")
             return await person_out(keep_id, f"merged {other_id} into {keep_id}")
 
@@ -264,9 +264,7 @@ class Agent:
         @t("find_person_sightings", "Find where a person appears (photos/videos and sightings), by person id or by name.", {"person_id": S, "name": S})
         async def find_person_sightings(person_id: Optional[str] = None, name: Optional[str] = None) -> ToolOutput:
             if not person_id and name:
-                rows, _ = await db.list_persons(False, name, 10, 0)
-                exact = [r for r in rows if (r["label"] or "").casefold() == name.casefold()]
-                matches = exact or rows
+                matches = await db.find_persons_by_label(name) or (await db.list_persons(False, name, 10, 0))[0]
                 if not matches:
                     return _fail(f"no person named {name!r}")
                 if len(matches) > 1:
