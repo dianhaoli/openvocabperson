@@ -107,7 +107,7 @@ Summary of a finished `scan` job:
  "rejected": 3,           // candidates the VLM verification denied (new ones are stored with stage "rejected")
  "updated": 2}            // stored entities whose concept / verification the scan changed
 ```
-A cancelled or failed job has no summary (`{}`).
+A cancelled job has no summary (`{}`).
 
 ### AnalyzeOptions
 All fields optional.

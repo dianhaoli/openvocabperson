@@ -306,8 +306,10 @@ class ColorReID(ReIDModel):
     * square-rooted (Hellinger) and mean-centred: all-positive histograms give every pair a high
       cosine, centring spreads them so thresholds can separate people.
 
-    Tuned on person crops of photos and videos made from them (image vs. video of the same
-    person >= 0.90, different people <= 0.85; see ``REID_THRESHOLDS["color"]``)."""
+    Measured on bus.jpg/zidane.jpg and videos made from them (rescaled, mirrored, zoomed, re-encoded):
+    the same person in the photo and a video >= 0.88 while the whole body is in view (0.77-0.84
+    when a zoom crops the legs), different people <= 0.82 even in matching dark suits; hence
+    ``REID_THRESHOLDS["color"]`` match 0.87 / review 0.78."""
 
     kind = "color"
     STRIPES = 6

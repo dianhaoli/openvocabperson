@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef } from 'react';
 import { api, errorMessage, isAbortError } from '../api/client';
 import type { Job, JobEvent, JobStatus, Media, MediaDetail, Plan } from '../types';
+import { jobSummaryText } from '../utils/format';
 
 export interface LogEntry {
   id: number;
@@ -137,7 +138,7 @@ function reduceEvent(state: JobTrackerState, evt: JobEvent): JobTrackerState {
           ? `Job failed: ${evt.job.error ?? 'unknown error'}`
           : evt.job.status === 'cancelled'
             ? 'Job cancelled'
-            : 'Job finished';
+            : ['Job finished', jobSummaryText(evt.job)].filter(Boolean).join(': ');
       return addLog({ ...next, streaming: false, stage: null }, level, msg, evt.ts);
     }
     default:
